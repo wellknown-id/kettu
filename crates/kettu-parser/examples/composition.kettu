@@ -1,0 +1,49 @@
+// World Composition Example
+// Demonstrates interfaces with shared types
+
+package example:composed;
+
+/// Types shared across interfaces
+interface shared-types {
+    record request {
+        method: s32,
+        path: s32,
+    }
+
+    record response {
+        status: u16,
+        body: s32,
+    }
+
+    enum log-level {
+        debug,
+        info,
+        warn,
+        error,
+    }
+}
+
+/// HTTP handling interface
+interface http-handler {
+    /// Handle an incoming HTTP request (method and path as codes)
+    handle: func(method-code: s32, path-code: s32) -> u16 {
+        200;
+    }
+}
+
+/// CLI interface
+interface cli {
+    run: func(argc: s32) -> s32 {
+        argc;
+    }
+}
+
+/// HTTP server world
+world http-server {
+    export http-handler;
+}
+
+/// CLI application world
+world cli-app {
+    export cli;
+}

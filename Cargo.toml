@@ -1,0 +1,40 @@
+[workspace]
+members = [
+    "crates/kettu-parser",
+    "crates/kettu-checker",
+    "crates/kettu-codegen",
+    "crates/kettu-lsp",
+    "crates/kettu-cli",
+    "crates/kettu-wasm",
+]
+default-members = [
+    "crates/kettu-parser",
+    "crates/kettu-checker",
+    "crates/kettu-codegen",
+    "crates/kettu-lsp",
+    "crates/kettu-cli",
+    "crates/kettu-wasm",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Kettu Contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/wellknown-id/kettu"
+rust-version = "1.85"
+
+[workspace.dependencies]
+ariadne = "0.4"
+clap = { version = "4.5", features = ["derive", "cargo"] }
+rust-sitter = { git = "https://github.com/benbenbenbenbenben/krust-sitter" }
+rust-sitter-tool = { git = "https://github.com/benbenbenbenbenben/krust-sitter" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.43", features = ["full"] }
+tower-lsp = "0.20"
+wasm-encoder = "0.245.1"
+wasmparser = "0.245.1"
+wit-component = "0.245.1"
+wit-parser = "0.245.1"

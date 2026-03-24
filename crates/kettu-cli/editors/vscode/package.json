@@ -1,0 +1,76 @@
+{
+    "name": "kettu",
+    "displayName": "Kettu",
+    "description": "Language support for Kettu (.kettu) and WIT (.wit) files",
+    "version": "0.1.0",
+    "publisher": "kettu",
+    "engines": {
+        "vscode": "^1.75.0"
+    },
+    "categories": [
+        "Programming Languages"
+    ],
+    "activationEvents": [],
+    "main": "./extension.js",
+    "contributes": {
+        "languages": [
+            {
+                "id": "kettu",
+                "aliases": ["Kettu", "kettu"],
+                "extensions": [".kettu"],
+                "icon": {
+                    "light": "./icons/kettu-file.svg",
+                    "dark": "./icons/kettu-file.svg"
+                },
+                "configuration": "./language-configuration.json"
+            },
+            {
+                "id": "wit",
+                "aliases": ["WIT", "wit"],
+                "extensions": [".wit"],
+                "configuration": "./wit-language-configuration.json"
+            }
+        ],
+        "grammars": [
+            {
+                "language": "kettu",
+                "scopeName": "source.kettu",
+                "path": "./syntaxes/kettu.tmLanguage.json"
+            },
+            {
+                "language": "wit",
+                "scopeName": "source.wit",
+                "path": "./syntaxes/wit.tmLanguage.json"
+            }
+        ],
+        "iconThemes": [
+            {
+                "id": "kettu-icons",
+                "label": "Kettu Icons",
+                "path": "./kettu-icon-theme.json"
+            }
+        ],
+        "configuration": {
+            "type": "object",
+            "title": "Kettu",
+            "properties": {
+                "kettu.serverPath": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Path to kettu binary. Leave empty to use PATH."
+                }
+            }
+        }
+    },
+    "scripts": {
+        "vscode:prepublish": "echo 'Ready to publish'",
+        "test": "node ./tests/textmate-regex-tests.js"
+    },
+    "devDependencies": {
+        "@types/vscode": "^1.75.0",
+        "vscode-languageclient": "^9.0.1"
+    },
+    "dependencies": {
+        "vscode-languageclient": "^9.0.1"
+    }
+}

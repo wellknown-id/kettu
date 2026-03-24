@@ -1,0 +1,15 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch Kettu Extension Dev Host (Clean)",
+            "type": "extensionHost",
+            "request": "launch",
+            "args": [
+                "--disable-extensions",
+                "--extensionDevelopmentPath=${workspaceFolder}/crates/kettu-cli/editors/vscode"
+            ],
+            "preLaunchTask": "Build Kettu"
+        }
+    ]
+}

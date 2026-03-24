@@ -1,0 +1,15 @@
+[package]
+name = "kettu-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+kettu-parser = { path = "../kettu-parser" }
+kettu-checker = { path = "../kettu-checker" }
+kettu-codegen = { path = "../kettu-codegen" }

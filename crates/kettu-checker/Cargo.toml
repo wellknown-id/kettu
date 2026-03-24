@@ -1,0 +1,12 @@
+[package]
+name = "kettu-checker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kettu-parser = { path = "../kettu-parser" }
+
+[lib]
+doctest = false

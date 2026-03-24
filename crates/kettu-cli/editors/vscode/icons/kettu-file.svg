@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- Fox ears -->
+  <polygon points="4,2 8,10 1,9" fill="#E87F24" stroke="#B85C00" stroke-width="0.5"/>
+  <polygon points="5,3 7.5,9 2.5,8.5" fill="#FFB74D"/>
+  <polygon points="20,2 16,10 23,9" fill="#E87F24" stroke="#B85C00" stroke-width="0.5"/>
+  <polygon points="19,3 16.5,9 21.5,8.5" fill="#FFB74D"/>
+  <!-- Fox face -->
+  <ellipse cx="12" cy="14" rx="8.5" ry="8" fill="#E87F24" stroke="#B85C00" stroke-width="0.5"/>
+  <!-- White cheeks/muzzle -->
+  <ellipse cx="12" cy="16" rx="5" ry="4.5" fill="#FFF3E0"/>
+  <!-- Eyes -->
+  <ellipse cx="9" cy="12" rx="1.1" ry="1.3" fill="#1a1a2e"/>
+  <circle cx="9.3" cy="11.6" r="0.4" fill="white" opacity="0.8"/>
+  <ellipse cx="15" cy="12" rx="1.1" ry="1.3" fill="#1a1a2e"/>
+  <circle cx="15.3" cy="11.6" r="0.4" fill="white" opacity="0.8"/>
+  <!-- Nose -->
+  <ellipse cx="12" cy="15.5" rx="1.5" ry="1" fill="#1a1a2e"/>
+  <!-- Mouth -->
+  <path d="M12 16.5 Q10.5 18 10 17.5" stroke="#1a1a2e" stroke-width="0.5" fill="none" stroke-linecap="round"/>
+  <path d="M12 16.5 Q13.5 18 14 17.5" stroke="#1a1a2e" stroke-width="0.5" fill="none" stroke-linecap="round"/>
+</svg>

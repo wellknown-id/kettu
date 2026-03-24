@@ -1,0 +1,16 @@
+[package]
+name = "kettu-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kettu-parser = { path = "../kettu-parser" }
+kettu-checker = { path = "../kettu-checker" }
+kettu-codegen = { path = "../kettu-codegen" }
+tower-lsp.workspace = true
+tokio.workspace = true
+
+[lib]
+doctest = false

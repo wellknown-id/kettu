@@ -1,0 +1,10 @@
+{
+  "iconDefinitions": {
+    "kettu": {
+      "iconPath": "./icons/kettu-file.svg"
+    }
+  },
+  "fileExtensions": {
+    "kettu": "kettu"
+  }
+}

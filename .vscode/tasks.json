@@ -1,0 +1,19 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Kettu",
+            "type": "shell",
+            "command": "cargo",
+            "args": ["build", "--bin", "kettu"],
+            "options": {
+                "cwd": "${workspaceFolder}/crates/kettu-cli"
+            },
+            "problemMatcher": ["$rustc"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ]
+}

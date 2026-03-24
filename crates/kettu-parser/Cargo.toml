@@ -1,0 +1,25 @@
+[package]
+name = "kettu-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rust-sitter.workspace = true
+ariadne.workspace = true
+serde = { workspace = true, optional = true }
+
+[build-dependencies]
+rust-sitter-tool.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lib]
+doctest = false
