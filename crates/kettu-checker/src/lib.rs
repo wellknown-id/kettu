@@ -234,12 +234,16 @@ impl Checker {
     // ========================================================================
 
     fn collect_definitions(&mut self, file: &WitFile) {
-        for item in &file.items {
+        self.collect_items(&file.items);
+    }
+
+    fn collect_items(&mut self, items: &[TopLevelItem]) {
+        for item in items {
             match item {
                 TopLevelItem::Interface(iface) => self.collect_interface(iface),
                 TopLevelItem::World(world) => self.collect_world(world),
                 TopLevelItem::Use(_) => {} // Handled in validation
-                TopLevelItem::NestedPackage(_) => {} // TODO: Handle nested packages
+                TopLevelItem::NestedPackage(pkg) => self.collect_items(&pkg.items),
             }
         }
     }
@@ -376,12 +380,16 @@ impl Checker {
     // ========================================================================
 
     fn validate_file(&mut self, file: &WitFile) {
-        for item in &file.items {
+        self.validate_items(&file.items);
+    }
+
+    fn validate_items(&mut self, items: &[TopLevelItem]) {
+        for item in items {
             match item {
                 TopLevelItem::Interface(iface) => self.validate_interface(iface),
                 TopLevelItem::World(world) => self.validate_world(world),
                 TopLevelItem::Use(use_stmt) => self.validate_top_level_use(use_stmt),
-                TopLevelItem::NestedPackage(_) => {} // TODO: Handle nested packages
+                TopLevelItem::NestedPackage(pkg) => self.validate_items(&pkg.items),
             }
         }
     }
@@ -3161,5 +3169,25 @@ mod tests {
             .filter(|d| d.severity == Severity::Error)
             .collect();
         assert!(errors.is_empty(), "Should have no errors: {:?}", errors);
+    }
+
+    #[test]
+    fn test_nested_package_error() {
+        let source = r#"
+            package local:test;
+
+            package nested:pkg {
+                interface foo {
+                    bar: func(x: unknown-type);
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+
+        assert!(!diags.is_empty(), "Should have diagnostics for unknown-type in nested package");
+        assert!(diags.iter().any(|d| d.code == DiagnosticCode::UnknownType));
     }
 }
