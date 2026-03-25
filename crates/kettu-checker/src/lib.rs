@@ -2098,6 +2098,7 @@ fn typedef_to_kind(kind: &TypeDefKind) -> TypeKind {
     }
 }
 
+/// Convert a package path into a human-readable string for diagnostics.
 fn package_path_to_string(path: &PackagePath) -> String {
     let namespace = path
         .namespace
@@ -2110,11 +2111,18 @@ fn package_path_to_string(path: &PackagePath) -> String {
         .map(|id| id.name.as_str())
         .collect::<Vec<_>>();
 
-    let mut result = if namespace.is_empty() {
-        String::new()
-    } else {
-        format!("{}:", namespace.join(":"))
-    };
+    let namespace_len: usize =
+        namespace.iter().map(|s| s.len()).sum::<usize>() + namespace.len().saturating_sub(1);
+    let name_len: usize =
+        name.iter().map(|s| s.len()).sum::<usize>() + name.len().saturating_sub(1);
+
+    // Reserve extra space for separators and optional version info.
+    let mut result = String::with_capacity(namespace_len + name_len + 16);
+
+    if !namespace.is_empty() {
+        result.push_str(&namespace.join(":"));
+        result.push(':');
+    }
 
     result.push_str(&name.join("/"));
 
