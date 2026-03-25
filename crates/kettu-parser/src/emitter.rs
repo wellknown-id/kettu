@@ -143,12 +143,48 @@ impl<'a> WitEmitter<'a> {
     }
 
     fn emit_top_level_item(&mut self, item: &TopLevelItem) {
+        self.write_indent();
         match item {
             TopLevelItem::Interface(iface) => self.emit_interface(iface),
             TopLevelItem::World(world) => self.emit_world(world),
             TopLevelItem::Use(use_stmt) => self.emit_top_level_use(use_stmt),
-            TopLevelItem::NestedPackage(_) => {} // TODO: handle nested packages
+            TopLevelItem::NestedPackage(pkg) => self.emit_nested_package(pkg),
         }
+    }
+
+    fn emit_nested_package(&mut self, pkg: &NestedPackage) {
+        self.write("package ");
+
+        // namespace:name format
+        let namespace: Vec<_> = pkg.path.namespace.iter().map(|i| i.name.as_str()).collect();
+        let name: Vec<_> = pkg.path.name.iter().map(|i| i.name.as_str()).collect();
+
+        if !namespace.is_empty() {
+            self.write(&namespace.join(":"));
+            self.write(":");
+        }
+        self.write(&name.join("/"));
+
+        if let Some(version) = &pkg.path.version {
+            self.write("@");
+            self.emit_version(version);
+        }
+
+        self.write(" {");
+        self.newline();
+        self.indent += 1;
+
+        for (i, item) in pkg.items.iter().enumerate() {
+            if i > 0 {
+                self.newline();
+            }
+            self.emit_top_level_item(item);
+        }
+
+        self.indent -= 1;
+        self.write_indent();
+        self.write("}");
+        self.newline();
     }
 
     fn emit_interface(&mut self, iface: &Interface) {
@@ -1040,5 +1076,64 @@ mod tests {
             output.contains("add: func"),
             "Should emit non-generic function"
         );
+    }
+
+    #[test]
+    fn test_emit_nested_package() {
+        // We bypass the parser here because kettu-parser's grammar might not support
+        // parsing nested packages yet, but we are testing AST emission.
+        let mut ast = WitFile {
+            package: Some(PackageDecl {
+                path: PackagePath {
+                    namespace: vec![Id::new("local", 0..0)],
+                    name: vec![Id::new("demo", 0..0)],
+                    version: None,
+                },
+                span: 0..0,
+            }),
+            items: vec![],
+        };
+
+        let nested = NestedPackage {
+            path: PackagePath {
+                namespace: vec![Id::new("local", 0..0)],
+                name: vec![Id::new("nested", 0..0)],
+                version: Some(Version {
+                    major: 1,
+                    minor: 0,
+                    patch: 0,
+                    prerelease: None,
+                    span: 0..0,
+                }),
+            },
+            items: vec![TopLevelItem::Interface(Interface {
+                gates: vec![],
+                name: Id::new("my-iface", 0..0),
+                items: vec![InterfaceItem::Func(Func {
+                    gates: vec![],
+                    name: Id::new("run", 0..0),
+                    type_params: vec![],
+                    is_async: false,
+                    params: vec![],
+                    result: None,
+                    body: None,
+                    span: 0..0,
+                })],
+                span: 0..0,
+            })],
+            span: 0..0,
+        };
+
+        ast.items.push(TopLevelItem::NestedPackage(nested));
+
+        let output = emit_wit(&ast);
+        println!("Output: {}", output);
+
+        assert!(output.contains("package local:demo;"));
+        assert!(output.contains("package local:nested@1.0.0 {"));
+        assert!(output.contains("    interface my-iface {"));
+        assert!(output.contains("        run: func();"));
+        assert!(output.contains("    }"));
+        assert!(output.contains("}"));
     }
 }
