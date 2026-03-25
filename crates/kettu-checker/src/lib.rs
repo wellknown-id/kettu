@@ -235,11 +235,19 @@ impl Checker {
 
     fn collect_definitions(&mut self, file: &WitFile) {
         for item in &file.items {
-            match item {
-                TopLevelItem::Interface(iface) => self.collect_interface(iface),
-                TopLevelItem::World(world) => self.collect_world(world),
-                TopLevelItem::Use(_) => {} // Handled in validation
-                TopLevelItem::NestedPackage(_) => {} // TODO: Handle nested packages
+            self.collect_top_level_item(item);
+        }
+    }
+
+    fn collect_top_level_item(&mut self, item: &TopLevelItem) {
+        match item {
+            TopLevelItem::Interface(iface) => self.collect_interface(iface),
+            TopLevelItem::World(world) => self.collect_world(world),
+            TopLevelItem::Use(_) => {} // Handled in validation
+            TopLevelItem::NestedPackage(pkg) => {
+                for nested_item in &pkg.items {
+                    self.collect_top_level_item(nested_item);
+                }
             }
         }
     }
@@ -377,11 +385,19 @@ impl Checker {
 
     fn validate_file(&mut self, file: &WitFile) {
         for item in &file.items {
-            match item {
-                TopLevelItem::Interface(iface) => self.validate_interface(iface),
-                TopLevelItem::World(world) => self.validate_world(world),
-                TopLevelItem::Use(use_stmt) => self.validate_top_level_use(use_stmt),
-                TopLevelItem::NestedPackage(_) => {} // TODO: Handle nested packages
+            self.validate_top_level_item(item);
+        }
+    }
+
+    fn validate_top_level_item(&mut self, item: &TopLevelItem) {
+        match item {
+            TopLevelItem::Interface(iface) => self.validate_interface(iface),
+            TopLevelItem::World(world) => self.validate_world(world),
+            TopLevelItem::Use(use_stmt) => self.validate_top_level_use(use_stmt),
+            TopLevelItem::NestedPackage(pkg) => {
+                for nested_item in &pkg.items {
+                    self.validate_top_level_item(nested_item);
+                }
             }
         }
     }
