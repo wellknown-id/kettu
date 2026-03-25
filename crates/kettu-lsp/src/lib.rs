@@ -338,9 +338,9 @@ fn strip_comments_preserve_layout(
     let mut bytes = source.as_bytes().to_vec();
 
     for range in comment_ranges {
-        for idx in range.clone() {
-            if bytes[idx] != b'\n' {
-                bytes[idx] = b' ';
+        for byte in &mut bytes[range.start..range.end] {
+            if *byte != b'\n' {
+                *byte = b' ';
             }
         }
     }
