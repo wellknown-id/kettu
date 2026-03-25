@@ -274,25 +274,37 @@ impl<'a> ModuleCompiler<'a> {
         let initial_heap_offset = self.string_offset;
 
         // Phase 4: Compile lambda bodies
-        let lambda_bodies_clone = self.lambda_bodies.clone();
         let mut compiled_lambdas: Vec<Function> = Vec::new();
-        for (_, _, captures, params, body) in &lambda_bodies_clone {
-            let mut locals = HashMap::new();
-            // Captures come first as hidden parameters
-            for (i, capture) in captures.iter().enumerate() {
-                locals.insert(capture.name.clone(), i as u32);
+        let mut all_lambda_bodies = Vec::new();
+
+        // Loop while there are lambdas to compile (handling nested lambdas discovered during compilation)
+        while !self.lambda_bodies.is_empty() {
+            let current_lambdas = std::mem::take(&mut self.lambda_bodies);
+
+            for lambda in current_lambdas {
+                let (_, _, captures, params, body) = &lambda;
+                let mut locals = HashMap::new();
+                // Captures come first as hidden parameters
+                for (i, capture) in captures.iter().enumerate() {
+                    locals.insert(capture.name.clone(), i as u32);
+                }
+                // Then regular parameters
+                let capture_count = captures.len();
+                for (i, param) in params.iter().enumerate() {
+                    locals.insert(param.name.clone(), (capture_count + i) as u32);
+                }
+                let locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();
+                let mut func = Function::new(vec![]);
+                self.compile_expr_with_locals(&mut func, body, &locals, &locals_types)?;
+                func.instruction(&Instruction::End);
+                compiled_lambdas.push(func);
+
+                all_lambda_bodies.push(lambda);
             }
-            // Then regular parameters
-            let capture_count = captures.len();
-            for (i, param) in params.iter().enumerate() {
-                locals.insert(param.name.clone(), (capture_count + i) as u32);
-            }
-            let locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();
-            let mut func = Function::new(vec![]);
-            self.compile_expr_with_locals(&mut func, body, &locals, &locals_types)?;
-            func.instruction(&Instruction::End);
-            compiled_lambdas.push(func);
         }
+
+        // Restore all lambda bodies for later phases (e.g., TypeSection, FunctionSection)
+        self.lambda_bodies = all_lambda_bodies;
         let has_lambdas = !compiled_lambdas.is_empty();
 
         // Phase 4b: Compile async callback bodies
