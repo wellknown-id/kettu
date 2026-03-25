@@ -44,7 +44,7 @@ fn load_imported_asts(
 
 #[derive(Parser)]
 #[command(name = "kettu")]
-#[command(about = "Kettu - A WASM-first programming language", long_about = None)]
+#[command(version, about = "Kettu - A WASM-first programming language", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

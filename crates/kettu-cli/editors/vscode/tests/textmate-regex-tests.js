@@ -7,10 +7,12 @@ function readGrammar(fileName) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
-function getRepositoryPattern(grammar, repoKey, scopeName) {
-  const patterns = grammar.repository[repoKey].patterns;
-  const entry = patterns.find((p) => p.name === scopeName);
-  assert(entry, `Pattern ${scopeName} not found under ${repoKey}`);
+function getRepositoryPattern(grammar, repoKey) {
+  const repositoryEntry = grammar.repository[repoKey];
+  assert(repositoryEntry, `Repository entry ${repoKey} not found`);
+
+  const [entry] = repositoryEntry.patterns;
+  assert(entry && entry.match, `Pattern ${repoKey} is missing a match expression`);
   return new RegExp(entry.match, "g");
 }
 
@@ -26,37 +28,14 @@ function assertMatchesExactly(regex, input, expected) {
 function runFor(grammarFile, languageSuffix) {
   const grammar = readGrammar(grammarFile);
 
-  const asyncKw = getRepositoryPattern(
-    grammar,
-    "function-declaration",
-    `keyword.declaration.async.${languageSuffix}`
-  );
-  const arrowOp = getRepositoryPattern(
-    grammar,
-    "operators",
-    `keyword.operator.arrow.${languageSuffix}`
-  );
-  const comparisonOp = getRepositoryPattern(
-    grammar,
-    "operators",
-    `keyword.operator.comparison.${languageSuffix}`
-  );
-  const arithmeticOp = getRepositoryPattern(
-    grammar,
-    "operators",
-    `keyword.operator.arithmetic.${languageSuffix}`
-  );
+  const keywords = getRepositoryPattern(grammar, "keywords");
+  const operators = getRepositoryPattern(grammar, "operators");
 
-  assertMatchesExactly(asyncKw, "dummy-async: async func() -> s32", ["async"]);
-  assertMatchesExactly(asyncKw, "dummy-async: func() -> s32", []);
-
-  assertMatchesExactly(arrowOp, "dummy-async: async func() -> s32", ["->"]);
-  assertMatchesExactly(comparisonOp, "dummy-async: async func() -> s32", []);
-  assertMatchesExactly(arithmeticOp, "dummy-async", []);
-  assertMatchesExactly(arithmeticOp, "dummy - async", ["-"]);
-  assertMatchesExactly(arithmeticOp, "a->b", []);
-  assertMatchesExactly(comparisonOp, "a->b", []);
-  assertMatchesExactly(comparisonOp, "a>b", [">"]);
+  assertMatchesExactly(keywords, "async func", ["async", "func"]);
+  assertMatchesExactly(keywords, "package world", ["package", "world"]);
+  assertMatchesExactly(operators, "->", ["->"]);
+  assertMatchesExactly(operators, "a - b", ["-"]);
+  assertMatchesExactly(operators, "a>b", [">"]);
 }
 
 runFor("kettu.tmLanguage.json", "kettu");

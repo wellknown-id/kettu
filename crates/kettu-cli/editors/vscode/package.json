@@ -63,7 +63,7 @@
         }
     },
     "scripts": {
-        "vscode:prepublish": "echo 'Ready to publish'",
+        "vscode:prepublish": "node ./scripts/prepare-bundle.js",
         "test": "node ./tests/textmate-regex-tests.js"
     },
     "devDependencies": {

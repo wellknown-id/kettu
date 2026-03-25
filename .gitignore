@@ -1,4 +1,5 @@
 /target/
 node_modules/
+crates/kettu-cli/editors/vscode/bin/
 *.vsix
 .DS_Store

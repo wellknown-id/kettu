@@ -21,3 +21,7 @@ cargo test --workspace
 ## Editor tooling
 
 The VS Code extension sources live under `crates/kettu-cli/editors/vscode/`.
+
+## Nightly artifacts
+
+Nightly GitHub Actions releases publish release-mode compiler builds for Linux, Windows, and macOS, plus matching self-contained VSIX packages that bundle the `kettu` compiler for each platform.

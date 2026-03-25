@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6.3.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/kettu-cli/editors/vscode/package-lock.json
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run Rust workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Install VS Code extension dependencies
+        working-directory: crates/kettu-cli/editors/vscode
+        run: npm ci
+
+      - name: Run VS Code extension tests
+        working-directory: crates/kettu-cli/editors/vscode
+        run: npm test

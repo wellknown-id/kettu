@@ -1,0 +1,186 @@
+name: Nightly Release
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      release_title: ${{ steps.meta.outputs.release_title }}
+      nightly_version: ${{ steps.meta.outputs.nightly_version }}
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6.0.2
+
+      - name: Compute nightly metadata
+        id: meta
+        run: |
+          base_version="$(node -p "require('./crates/kettu-cli/editors/vscode/package.json').version")"
+          stamp="$(date -u +%Y%m%d)"
+          iso_date="$(date -u +%Y-%m-%d)"
+          echo "release_tag=nightly-${iso_date}" >> "$GITHUB_OUTPUT"
+          echo "release_title=Nightly ${iso_date}" >> "$GITHUB_OUTPUT"
+          echo "nightly_version=${base_version}-nightly.${stamp}" >> "$GITHUB_OUTPUT"
+
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6.3.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/kettu-cli/editors/vscode/package-lock.json
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run Rust workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Install VS Code extension dependencies
+        working-directory: crates/kettu-cli/editors/vscode
+        run: npm ci
+
+      - name: Run VS Code extension tests
+        working-directory: crates/kettu-cli/editors/vscode
+        run: npm test
+
+  create_release:
+    runs-on: ubuntu-latest
+    needs: [metadata, validate]
+
+    steps:
+      - name: Ensure nightly release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          RELEASE_TITLE: ${{ needs.metadata.outputs.release_title }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --title "$RELEASE_TITLE" \
+              --prerelease \
+              --notes "Automated nightly compiler and VS Code extension build."
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TITLE" \
+              --prerelease \
+              --notes "Automated nightly compiler and VS Code extension build."
+          fi
+
+  build:
+    needs: [metadata, create_release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            vscode_target: linux-x64
+            binary_name: kettu
+            archive_name: kettu-linux-x64.tar.gz
+          - os: windows-latest
+            vscode_target: win32-x64
+            binary_name: kettu.exe
+            archive_name: kettu-win32-x64.zip
+          - os: macos-13
+            vscode_target: darwin-x64
+            binary_name: kettu
+            archive_name: kettu-darwin-x64.tar.gz
+          - os: macos-14
+            vscode_target: darwin-arm64
+            binary_name: kettu
+            archive_name: kettu-darwin-arm64.tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6.3.0
+        with:
+          node-version: 24
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build release compiler
+        shell: bash
+        run: cargo build --locked --release --bin kettu
+
+      - name: Stage self-contained VSIX
+        shell: bash
+        env:
+          NIGHTLY_VERSION: ${{ needs.metadata.outputs.nightly_version }}
+          VSCODE_TARGET: ${{ matrix.vscode_target }}
+        run: |
+          stage_dir="$(mktemp -d)"
+          cp -R crates/kettu-cli/editors/vscode/. "$stage_dir/"
+          cd "$stage_dir"
+          npm ci
+
+          server_path="$GITHUB_WORKSPACE/target/release/${{ matrix.binary_name }}"
+          KETTU_SERVER_PATH="$server_path" \
+          KETTU_TARGET_PLATFORM="$VSCODE_TARGET" \
+          npm run vscode:prepublish
+
+          node - <<'NODE'
+          const fs = require('fs');
+          const pkgPath = 'package.json';
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+          pkg.version = process.env.NIGHTLY_VERSION;
+          fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 4)}\n`);
+          NODE
+
+          npx --yes @vscode/vsce package \
+            --target "$VSCODE_TARGET" \
+            --out "$RUNNER_TEMP/kettu-${NIGHTLY_VERSION}-${VSCODE_TARGET}.vsix"
+
+      - name: Package compiler archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          archive_root="$RUNNER_TEMP/${{ matrix.vscode_target }}"
+          mkdir -p "$archive_root"
+          cp "target/release/${{ matrix.binary_name }}" "$archive_root/${{ matrix.binary_name }}"
+          tar -C "$archive_root" -czf "$RUNNER_TEMP/${{ matrix.archive_name }}" "${{ matrix.binary_name }}"
+
+      - name: Package compiler archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archiveRoot = Join-Path $env:RUNNER_TEMP '${{ matrix.vscode_target }}'
+          New-Item -ItemType Directory -Force -Path $archiveRoot | Out-Null
+          Copy-Item "target/release/${{ matrix.binary_name }}" (Join-Path $archiveRoot '${{ matrix.binary_name }}')
+          Compress-Archive -Path (Join-Path $archiveRoot '${{ matrix.binary_name }}') -DestinationPath (Join-Path $env:RUNNER_TEMP '${{ matrix.archive_name }}') -Force
+
+      - name: Upload nightly assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          NIGHTLY_VERSION: ${{ needs.metadata.outputs.nightly_version }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            "$RUNNER_TEMP/${{ matrix.archive_name }}" \
+            "$RUNNER_TEMP/kettu-${NIGHTLY_VERSION}-${{ matrix.vscode_target }}.vsix" \
+            --clobber

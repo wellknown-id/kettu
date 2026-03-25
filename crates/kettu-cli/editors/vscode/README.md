@@ -24,9 +24,14 @@ ln -s "$(pwd)" ~/.vscode/extensions/kettu
 ```bash
 npm install -g @vscode/vsce
 cd editors/vscode
-vsce package
+npm run vscode:prepublish
+vsce package --target linux-x64
 code --install-extension kettu-0.1.0.vsix
 ```
+
+`npm run vscode:prepublish` now stages a platform-specific `kettu` compiler under `bin/<target-platform>/`, so the packaged VSIX is self-contained by default.
+
+Nightly releases attach platform-specific VSIX files and compiler archives for Linux, Windows, and macOS.
 
 ## Configuration
 

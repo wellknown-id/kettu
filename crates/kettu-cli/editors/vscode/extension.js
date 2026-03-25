@@ -10,9 +10,31 @@ let coverageFullDecorationType;
 let coveragePartialDecorationType;
 let coverageNoneDecorationType;
 
+function executableName(targetPlatform) {
+    if (targetPlatform) {
+        return targetPlatform.startsWith('win32-') ? 'kettu.exe' : 'kettu';
+    }
+
+    return process.platform === 'win32' ? 'kettu.exe' : 'kettu';
+}
+
+function bundledTargetPlatform() {
+    const byHost = {
+        'darwin-arm64': 'darwin-arm64',
+        'darwin-x64': 'darwin-x64',
+        'linux-arm64': 'linux-arm64',
+        'linux-x64': 'linux-x64',
+        'win32-arm64': 'win32-arm64',
+        'win32-x64': 'win32-x64',
+    };
+
+    return byHost[`${process.platform}-${process.arch}`];
+}
+
 function findServerPath(extensionPath) {
     const config = vscode.workspace.getConfiguration('kettu');
     const configPath = config.get('serverPath');
+    const binaryName = executableName(bundledTargetPlatform());
 
     // 1. Use configured path if set
     if (configPath && configPath.length > 0) {
@@ -20,41 +42,48 @@ function findServerPath(extensionPath) {
         return configPath;
     }
 
+    const targetPlatform = bundledTargetPlatform();
+    if (targetPlatform) {
+        const bundledPath = path.join(extensionPath, 'bin', targetPlatform, executableName(targetPlatform));
+        if (fs.existsSync(bundledPath)) {
+            console.log('Kettu LSP: using bundled compiler');
+            return bundledPath;
+        }
+    }
+
     // 2. Try relative to extension (for development - extension is in editors/vscode)
-    const kettuRoot = path.resolve(extensionPath, '..', '..');
-    const debugFromExt = path.join(kettuRoot, 'target', 'debug', 'kettu');
-    const releaseFromExt = path.join(kettuRoot, 'target', 'release', 'kettu');
+    const crateRoot = path.resolve(extensionPath, '..', '..');
+    const workspaceRoot = path.resolve(extensionPath, '..', '..', '..', '..');
+    const debugFromCrate = path.join(crateRoot, 'target', 'debug', binaryName);
+    const releaseFromCrate = path.join(crateRoot, 'target', 'release', binaryName);
+    const debugFromWorkspace = path.join(workspaceRoot, 'target', 'debug', binaryName);
+    const releaseFromWorkspace = path.join(workspaceRoot, 'target', 'release', binaryName);
 
     // Prefer debug for development (faster builds, debug symbols)
-    if (fs.existsSync(debugFromExt)) {
+    if (fs.existsSync(debugFromCrate)) {
         console.log('Kettu LSP: found debug binary relative to extension');
-        return debugFromExt;
+        return debugFromCrate;
     }
-    if (fs.existsSync(releaseFromExt)) {
+    if (fs.existsSync(releaseFromCrate)) {
         console.log('Kettu LSP: found release binary relative to extension');
-        return releaseFromExt;
+        return releaseFromCrate;
     }
 
-    // 2b. Try workspace root (for cargo workspace builds - binary is in root target/)
-    const workspaceRoot = path.resolve(extensionPath, '..', '..', '..');
-    const debugFromRoot = path.join(workspaceRoot, 'target', 'debug', 'kettu');
-    const releaseFromRoot = path.join(workspaceRoot, 'target', 'release', 'kettu');
-
-    if (fs.existsSync(debugFromRoot)) {
+    if (fs.existsSync(debugFromWorkspace)) {
         console.log('Kettu LSP: found debug binary in workspace root');
-        return debugFromRoot;
+        return debugFromWorkspace;
     }
-    if (fs.existsSync(releaseFromRoot)) {
+    if (fs.existsSync(releaseFromWorkspace)) {
         console.log('Kettu LSP: found release binary in workspace root');
-        return releaseFromRoot;
+        return releaseFromWorkspace;
     }
 
     // 3. Try to find in workspace (cargo build output)
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (workspaceFolders) {
         for (const folder of workspaceFolders) {
-            const releasePath = path.join(folder.uri.fsPath, 'target', 'release', 'kettu');
-            const debugPath = path.join(folder.uri.fsPath, 'target', 'debug', 'kettu');
+            const releasePath = path.join(folder.uri.fsPath, 'target', 'release', binaryName);
+            const debugPath = path.join(folder.uri.fsPath, 'target', 'debug', binaryName);
 
             if (fs.existsSync(releasePath)) {
                 console.log('Kettu LSP: found release binary in workspace');
