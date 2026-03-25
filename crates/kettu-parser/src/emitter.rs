@@ -147,8 +147,40 @@ impl<'a> WitEmitter<'a> {
             TopLevelItem::Interface(iface) => self.emit_interface(iface),
             TopLevelItem::World(world) => self.emit_world(world),
             TopLevelItem::Use(use_stmt) => self.emit_top_level_use(use_stmt),
-            TopLevelItem::NestedPackage(_) => {} // TODO: handle nested packages
+            TopLevelItem::NestedPackage(pkg) => self.emit_nested_package(pkg),
         }
+    }
+
+    fn emit_nested_package(&mut self, pkg: &NestedPackage) {
+        self.write("package ");
+
+        // namespace:name format
+        let namespace: Vec<_> = pkg.path.namespace.iter().map(|i| i.name.as_str()).collect();
+        let name: Vec<_> = pkg.path.name.iter().map(|i| i.name.as_str()).collect();
+
+        if !namespace.is_empty() {
+            self.write(&namespace.join(":"));
+            self.write(":");
+        }
+        self.write(&name.join("/"));
+
+        if let Some(version) = &pkg.path.version {
+            self.write("@");
+            self.emit_version(version);
+        }
+
+        self.write(" {");
+        self.newline();
+        self.indent += 1;
+
+        for item in &pkg.items {
+            self.emit_top_level_item(item);
+        }
+
+        self.indent -= 1;
+        self.write_indent();
+        self.write("}");
+        self.newline();
     }
 
     fn emit_interface(&mut self, iface: &Interface) {
@@ -1040,5 +1072,63 @@ mod tests {
             output.contains("add: func"),
             "Should emit non-generic function"
         );
+    }
+
+    #[test]
+    fn test_emit_nested_package() {
+        // Since the current parser grammar doesn't fully support parsing nested packages
+        // we construct the AST manually for the emitter test.
+        let mut ast = WitFile {
+            package: Some(PackageDecl {
+                path: PackagePath {
+                    namespace: vec![Id::new("local", 0..5)],
+                    name: vec![Id::new("demo", 6..10)],
+                    version: None,
+                },
+                span: 0..10,
+            }),
+            items: vec![],
+        };
+
+        let nested_pkg = NestedPackage {
+            path: PackagePath {
+                namespace: vec![Id::new("nested", 0..6)],
+                name: vec![Id::new("demo", 7..11)],
+                version: None,
+            },
+            items: vec![
+                TopLevelItem::Interface(Interface {
+                    gates: vec![],
+                    name: Id::new("host", 0..4),
+                    items: vec![
+                        InterfaceItem::Func(Func {
+                            gates: vec![],
+                            name: Id::new("log", 0..3),
+                            type_params: vec![],
+                            is_async: false,
+                            params: vec![
+                                Param {
+                                    name: Id::new("msg", 0..3),
+                                    ty: Ty::Primitive(PrimitiveTy::String, 0..6),
+                                }
+                            ],
+                            result: None,
+                            body: None,
+                            span: 0..20,
+                        })
+                    ],
+                    span: 0..30,
+                })
+            ],
+            span: 0..50,
+        };
+
+        ast.items.push(TopLevelItem::NestedPackage(nested_pkg));
+
+        let output = emit_wit(&ast);
+
+        assert!(output.contains("package nested:demo {"));
+        assert!(output.contains("interface host {"));
+        assert!(output.contains("log: func(msg: string);"));
     }
 }
