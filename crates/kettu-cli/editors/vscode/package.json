@@ -3,7 +3,12 @@
     "displayName": "Kettu",
     "description": "Language support for Kettu (.kettu) and WIT (.wit) files",
     "version": "0.1.0",
+    "license": "Apache-2.0",
     "publisher": "kettu",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/wellknown-id/kettu.git"
+    },
     "engines": {
         "vscode": "^1.75.0"
     },
