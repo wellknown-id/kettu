@@ -239,7 +239,18 @@ impl Checker {
                 TopLevelItem::Interface(iface) => self.collect_interface(iface),
                 TopLevelItem::World(world) => self.collect_world(world),
                 TopLevelItem::Use(_) => {} // Handled in validation
-                TopLevelItem::NestedPackage(_) => {} // TODO: Handle nested packages
+                TopLevelItem::NestedPackage(nested) => self.collect_nested_package(nested),
+            }
+        }
+    }
+
+    fn collect_nested_package(&mut self, pkg: &NestedPackage) {
+        for item in &pkg.items {
+            match item {
+                TopLevelItem::Interface(iface) => self.collect_interface(iface),
+                TopLevelItem::World(world) => self.collect_world(world),
+                TopLevelItem::Use(_) => {} // Handled in validation
+                TopLevelItem::NestedPackage(nested) => self.collect_nested_package(nested),
             }
         }
     }
@@ -381,7 +392,18 @@ impl Checker {
                 TopLevelItem::Interface(iface) => self.validate_interface(iface),
                 TopLevelItem::World(world) => self.validate_world(world),
                 TopLevelItem::Use(use_stmt) => self.validate_top_level_use(use_stmt),
-                TopLevelItem::NestedPackage(_) => {} // TODO: Handle nested packages
+                TopLevelItem::NestedPackage(nested) => self.validate_nested_package(nested),
+            }
+        }
+    }
+
+    fn validate_nested_package(&mut self, pkg: &NestedPackage) {
+        for item in &pkg.items {
+            match item {
+                TopLevelItem::Interface(iface) => self.validate_interface(iface),
+                TopLevelItem::World(world) => self.validate_world(world),
+                TopLevelItem::Use(use_stmt) => self.validate_top_level_use(use_stmt),
+                TopLevelItem::NestedPackage(nested) => self.validate_nested_package(nested),
             }
         }
     }
@@ -2096,6 +2118,32 @@ fn typedef_to_kind(kind: &TypeDefKind) -> TypeKind {
 mod tests {
     use super::*;
     use kettu_parser::parse_file;
+
+    #[test]
+    fn test_nested_package_handling() {
+        let source = r#"
+            package local:test;
+
+            package foo:bar {
+                interface inner {
+                    record data {
+                        value: u32,
+                    }
+                    process: func(d: data) -> string;
+                }
+
+                world nested-world {
+                    import inner;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+
+        assert!(diags.is_empty(), "Should have no errors: {:?}", diags);
+    }
 
     #[test]
     fn test_unknown_type_error() {
