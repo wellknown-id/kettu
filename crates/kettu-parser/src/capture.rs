@@ -81,8 +81,8 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
                 // Patterns may bind new variables
                 let mut arm_scope = scope.clone();
                 collect_pattern_bindings(&arm.pattern, &mut arm_scope);
-                for stmt in &mut arm.body.clone() {
-                    analyze_statement(&mut stmt.clone(), &arm_scope);
+                for stmt in &mut arm.body {
+                    analyze_statement(stmt, &arm_scope);
                 }
             }
         }
