@@ -591,6 +591,193 @@ mod tests {
         }
     }
 
+    // ================================================================
+    // New AST coverage tests
+    // ================================================================
+
+    #[test]
+    fn test_gates_parse() {
+        let src = "
+        @since(version = 1.0.0)
+        @unstable(feature = foo)
+        @deprecated(version = 2.0.0)
+        @test
+        interface i {}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected interface"),
+        };
+        assert_eq!(iface.gates.len(), 4);
+        assert!(matches!(iface.gates[0], crate::ast::Gate::Since { .. }));
+        assert!(matches!(iface.gates[1], crate::ast::Gate::Unstable { .. }));
+        assert!(matches!(iface.gates[2], crate::ast::Gate::Deprecated { .. }));
+        assert!(matches!(iface.gates[3], crate::ast::Gate::Test));
+    }
+
+    #[test]
+    fn test_world_items_parse() {
+        let src = "
+        world w {
+            import i: func();
+            import pkg:ns/iface;
+            export e: func();
+            export other-iface;
+            include other-world;
+            use some-iface.{type-a};
+        }";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let world = match &ast.items[0] {
+            crate::ast::TopLevelItem::World(w) => w,
+            _ => panic!("expected world"),
+        };
+        assert_eq!(world.items.len(), 6);
+        assert!(matches!(
+            world.items[0],
+            crate::ast::WorldItem::Import(crate::ast::ImportExport {
+                kind: crate::ast::ImportExportKind::Func(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            world.items[1],
+            crate::ast::WorldItem::Import(crate::ast::ImportExport {
+                kind: crate::ast::ImportExportKind::Path(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            world.items[2],
+            crate::ast::WorldItem::Export(crate::ast::ImportExport {
+                kind: crate::ast::ImportExportKind::Func(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            world.items[3],
+            crate::ast::WorldItem::Export(crate::ast::ImportExport {
+                kind: crate::ast::ImportExportKind::Path(_),
+                ..
+            })
+        ));
+        assert!(matches!(world.items[4], crate::ast::WorldItem::Include(_)));
+        assert!(matches!(world.items[5], crate::ast::WorldItem::Use(_)));
+    }
+
+    #[test]
+    fn test_typedefs_parse() {
+        let src = "
+        interface i {
+            enum e { a, b }
+            flags f { x, y }
+            type alias = u32;
+            resource r {
+                constructor(v: u32);
+                static s: func() -> u32;
+                m: func();
+            }
+        }";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected interface"),
+        };
+        assert_eq!(iface.items.len(), 4);
+        match &iface.items[0] {
+            crate::ast::InterfaceItem::TypeDef(td) => {
+                assert!(matches!(td.kind, crate::ast::TypeDefKind::Enum { .. }))
+            }
+            _ => panic!("expected enum"),
+        }
+        match &iface.items[1] {
+            crate::ast::InterfaceItem::TypeDef(td) => {
+                assert!(matches!(td.kind, crate::ast::TypeDefKind::Flags { .. }))
+            }
+            _ => panic!("expected flags"),
+        }
+        match &iface.items[2] {
+            crate::ast::InterfaceItem::TypeDef(td) => {
+                assert!(matches!(td.kind, crate::ast::TypeDefKind::Alias { .. }))
+            }
+            _ => panic!("expected alias"),
+        }
+        match &iface.items[3] {
+            crate::ast::InterfaceItem::TypeDef(td) => match &td.kind {
+                crate::ast::TypeDefKind::Resource { methods, .. } => {
+                    assert_eq!(methods.len(), 3);
+                    assert!(matches!(methods[0], crate::ast::ResourceMethod::Constructor { .. }));
+                    assert!(matches!(methods[1], crate::ast::ResourceMethod::Static(_)));
+                    assert!(matches!(methods[2], crate::ast::ResourceMethod::Method(_)));
+                }
+                _ => panic!("expected resource"),
+            },
+            _ => panic!("expected typedef"),
+        }
+    }
+
+    #[test]
+    fn test_complex_expressions_parse() {
+        let src = "
+        interface i {
+            f: func() {
+                assert true;
+                let x = await some_future;
+                let y = !false;
+                let s = str-len(\"hi\");
+                let eq = str-eq(\"a\", \"b\");
+                let l = list-len([1]);
+                let p = list-push([1], 2);
+                if true { return; } else { return; };
+                while true { break; };
+                for i in 1 to 10 { continue; };
+            }
+        }";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected interface"),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!("expected func"),
+        };
+        let body = func.body.as_ref().unwrap();
+        assert_eq!(body.statements.len(), 10);
+        // Quick check of some types
+        assert!(matches!(
+            &body.statements[0],
+            crate::ast::Statement::Expr(crate::ast::Expr::Assert(..))
+        ));
+        assert!(matches!(
+            &body.statements[1],
+            crate::ast::Statement::Let {
+                value: crate::ast::Expr::Await { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &body.statements[7],
+            crate::ast::Statement::Expr(crate::ast::Expr::If { .. })
+        ));
+    }
+
+    #[test]
+    fn test_malformed_gates_parse_error() {
+        let src = "
+        @since(v = 1.0.0)
+        interface i {}";
+        let (_ast, errors) = parse(src);
+        assert!(!errors.is_empty(), "expected errors for malformed gate");
+    }
+
     #[test]
     fn test_comment_tree_sitter_sexp() {
         // Parse directly with tree-sitter to see the raw S-expression
