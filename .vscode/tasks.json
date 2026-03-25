@@ -5,9 +5,15 @@
             "label": "Build Kettu",
             "type": "shell",
             "command": "cargo",
-            "args": ["build", "--bin", "kettu"],
+            "args": [
+                "build",
+                "--bin",
+                "kettu",
+                "--manifest-path",
+                "${workspaceFolder}/crates/kettu-cli/Cargo.toml"
+            ],
             "options": {
-                "cwd": "${workspaceFolder}/crates/kettu-cli"
+                "cwd": "${workspaceFolder}"
             },
             "problemMatcher": ["$rustc"],
             "group": {

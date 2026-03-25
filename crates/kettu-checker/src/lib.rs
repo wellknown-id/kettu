@@ -89,6 +89,7 @@ pub enum DiagnosticCode {
     InvalidUse,
     InvalidImport,
     InvalidExport,
+    NestedPackageUnsupported,
     // Expression type errors
     TypeMismatch,
     UnknownVariable,
@@ -239,7 +240,7 @@ impl Checker {
                 TopLevelItem::Interface(iface) => self.collect_interface(iface),
                 TopLevelItem::World(world) => self.collect_world(world),
                 TopLevelItem::Use(_) => {} // Handled in validation
-                TopLevelItem::NestedPackage(_) => {} // TODO: Handle nested packages
+                TopLevelItem::NestedPackage(_) => {} // Nested packages are validated separately
             }
         }
     }
@@ -381,7 +382,16 @@ impl Checker {
                 TopLevelItem::Interface(iface) => self.validate_interface(iface),
                 TopLevelItem::World(world) => self.validate_world(world),
                 TopLevelItem::Use(use_stmt) => self.validate_top_level_use(use_stmt),
-                TopLevelItem::NestedPackage(_) => {} // TODO: Handle nested packages
+                TopLevelItem::NestedPackage(pkg) => {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!(
+                            "Nested packages are not supported (found '{}')",
+                            package_path_to_string(&pkg.path)
+                        ),
+                        pkg.span.clone(),
+                        DiagnosticCode::NestedPackageUnsupported,
+                    ));
+                }
             }
         }
     }
@@ -2088,6 +2098,41 @@ fn typedef_to_kind(kind: &TypeDefKind) -> TypeKind {
     }
 }
 
+fn package_path_to_string(path: &PackagePath) -> String {
+    let namespace = path
+        .namespace
+        .iter()
+        .map(|id| id.name.as_str())
+        .collect::<Vec<_>>();
+    let name = path
+        .name
+        .iter()
+        .map(|id| id.name.as_str())
+        .collect::<Vec<_>>();
+
+    let mut result = if namespace.is_empty() {
+        String::new()
+    } else {
+        format!("{}:", namespace.join(":"))
+    };
+
+    result.push_str(&name.join("/"));
+
+    if let Some(version) = &path.version {
+        result.push('@');
+        result.push_str(&format!(
+            "{}.{}.{}",
+            version.major, version.minor, version.patch
+        ));
+        if let Some(prerelease) = &version.prerelease {
+            result.push('-');
+            result.push_str(prerelease);
+        }
+    }
+
+    result
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2153,6 +2198,51 @@ mod tests {
 
         assert!(!diags.is_empty(), "Should have duplicate error");
         assert_eq!(diags[0].code, DiagnosticCode::DuplicateDefinition);
+    }
+
+    #[test]
+    fn test_nested_packages_reported() {
+        let span = 0..1;
+        let root = WitFile {
+            package: Some(PackageDecl {
+                path: PackagePath {
+                    namespace: vec![Id::new("local", span.clone())],
+                    name: vec![Id::new("root", span.clone())],
+                    version: None,
+                },
+                span: span.clone(),
+            }),
+            items: vec![TopLevelItem::NestedPackage(NestedPackage {
+                path: PackagePath {
+                    namespace: vec![Id::new("nested", span.clone())],
+                    name: vec![Id::new("demo", span.clone())],
+                    version: Some(Version {
+                        major: 1,
+                        minor: 2,
+                        patch: 3,
+                        prerelease: None,
+                        span: span.clone(),
+                    }),
+                },
+                items: vec![],
+                span: span.clone(),
+            })],
+        };
+
+        let diags = check(&root);
+
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+
+        assert!(
+            errors
+                .iter()
+                .any(|d| d.code == DiagnosticCode::NestedPackageUnsupported),
+            "Should flag nested packages as unsupported: {:?}",
+            errors
+        );
     }
 
     #[test]
