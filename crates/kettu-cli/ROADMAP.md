@@ -80,7 +80,7 @@
 - [x] Shared memory codegen (`--threads` flag)
 - [x] WASM threads proposal integration (shared memory, atomics, `thread-spawn` import)
 - [x] Ergonomic atomic syntax (Phase 13e — see below)
-- [ ] `thread.join` / `thread.await`
+- [x] `thread.join(tid)` — blocks until spawned thread completes (atomic wait/notify protocol)
 
 ### Phase 13e: Ergonomic Atomics ✓
 

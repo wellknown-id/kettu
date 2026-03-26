@@ -884,6 +884,12 @@ fn expr_with_span(cst: &grammar::Expr, outer_span: Range<usize>) -> ast::Expr {
             span: outer_span,
         },
 
+        // Thread join
+        grammar::Expr::ThreadJoin(t) => ast::Expr::ThreadJoin {
+            tid: Box::new(sexpr(&t.tid)),
+            span: outer_span,
+        },
+
         // Atomic block sugar
         grammar::Expr::AtomicBlock(a) => ast::Expr::AtomicBlock {
             body: a.body.iter().map(spanned_stmt).collect(),

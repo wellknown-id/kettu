@@ -764,4 +764,54 @@ mod tests {
         assert!(matches!(&body.statements[0], crate::ast::Statement::SharedLet { .. }));
         assert!(matches!(&body.statements[1], crate::ast::Statement::Expr(crate::ast::Expr::AtomicBlock { .. })));
     }
+
+    // ================================================================
+    // Phase 13f: Thread join parsing
+    // ================================================================
+
+    #[test]
+    fn test_thread_join_parse() {
+        let src = "interface i {\n  f: func() {\n    let tid = spawn { 1; };\n    thread.join(tid);\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected Interface"),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!("expected Func"),
+        };
+        let body = func.body.as_ref().expect("should have body");
+        assert_eq!(body.statements.len(), 2);
+        match &body.statements[1] {
+            crate::ast::Statement::Expr(crate::ast::Expr::ThreadJoin { .. }) => {}
+            other => panic!("expected ThreadJoin, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_thread_join_standalone() {
+        let src = "interface i {\n  f: func() {\n    let tid = spawn { 42; };\n    let result = thread.join(tid);\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[1] {
+            crate::ast::Statement::Let { name, value } => {
+                assert_eq!(name.name, "result");
+                assert!(matches!(value, crate::ast::Expr::ThreadJoin { .. }));
+            }
+            _ => panic!("expected let binding with thread.join"),
+        }
+    }
 }

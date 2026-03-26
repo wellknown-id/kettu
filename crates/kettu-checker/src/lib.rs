@@ -1877,6 +1877,17 @@ impl Checker {
                 }
                 CheckedType::ThreadId
             }
+            Expr::ThreadJoin { tid, span } => {
+                let tid_ty = self.check_expr(tid);
+                if tid_ty != CheckedType::ThreadId {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("thread.join requires a thread-id, got {:?}", tid_ty),
+                        span.clone(),
+                        DiagnosticCode::TypeMismatch,
+                    ));
+                }
+                CheckedType::I32
+            }
             Expr::AtomicBlock { body, .. } => {
                 for s in body {
                     self.validate_statement(s);
@@ -3347,5 +3358,66 @@ mod tests {
         let diags = check(&ast);
         let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
         assert!(errors.is_empty(), "empty atomic block should type-check: {:?}", errors);
+    }
+
+    #[test]
+    fn test_thread_join_type_checks() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                go: func() -> s32 {
+                    let tid = spawn { 1; };
+                    thread.join(tid);
+                    0;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
+        assert!(errors.is_empty(), "thread.join(tid) should type-check: {:?}", errors);
+    }
+
+    #[test]
+    fn test_thread_join_rejects_non_thread_id() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                go: func() -> s32 {
+                    thread.join(42);
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
+        assert!(!errors.is_empty(), "thread.join(42) should be rejected — requires ThreadId");
+    }
+
+    #[test]
+    fn test_spawn_join_combined() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                go: func() -> s32 {
+                    shared let counter = 0;
+                    let tid = spawn {
+                        atomic { 1; };
+                    };
+                    thread.join(tid);
+                    0;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
+        assert!(errors.is_empty(), "spawn + join + shared let should type-check: {:?}", errors);
     }
 }

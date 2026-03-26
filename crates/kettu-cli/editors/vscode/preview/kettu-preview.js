@@ -5,7 +5,7 @@
     { regex: /\/\*[\s\S]*?\*\//g, cls: 'kettu-comment' },
     { regex: /"[^"]*"/g, cls: 'kettu-string' },
     { regex: /@|@since|@unstable|@deprecated|@test/g, cls: 'kettu-decorator' },
-    { regex: /(?<![a-zA-Z0-9_-])(?:package|use|as|version|feature|interface|record|variant|enum|flags|type|resource|constructor|static|func|bool|char|string|list|option|result|tuple|future|stream|async|let|shared|return|break|continue|true|false|assert|await|if|else|while|for|in|to|downto|step|match|_|map|filter|reduce|some|none|ok|err|atomic|load|store|add|sub|cmpxchg|wait|notify|spawn|world|import|export|include)(?![a-zA-Z0-9_-])/g, cls: 'kettu-keyword' },
+    { regex: /(?<![a-zA-Z0-9_-])(?:package|use|as|version|feature|interface|record|variant|enum|flags|type|resource|constructor|static|func|bool|char|string|list|option|result|tuple|future|stream|async|let|shared|return|break|continue|true|false|assert|await|if|else|while|for|in|to|downto|step|match|_|map|filter|reduce|some|none|ok|err|atomic|load|store|add|sub|cmpxchg|wait|notify|spawn|thread|join|world|import|export|include)(?![a-zA-Z0-9_-])/g, cls: 'kettu-keyword' },
     { regex: /[0-9]+/g, cls: 'kettu-number' },
   ];
 

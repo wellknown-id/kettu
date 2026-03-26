@@ -992,6 +992,9 @@ pub enum Expr {
     // Thread spawning
     Spawn(SpawnExpr),
 
+    // Thread join
+    ThreadJoin(ThreadJoinExpr),
+
     // Atomic block sugar
     AtomicBlock(AtomicBlockExpr),
 }
@@ -1544,6 +1547,21 @@ pub struct SpawnExpr {
     pub body: Vec<Spanned<Stmt>>,
     #[leaf("}")]
     _rb: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct ThreadJoinExpr {
+    #[leaf("thread")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("join")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub tid: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
 }
 
 #[derive(Debug, Clone, PartialEq, Rule)]

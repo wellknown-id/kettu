@@ -221,6 +221,9 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
                 analyze_statement(stmt, scope);
             }
         }
+        Expr::ThreadJoin { tid, .. } => {
+            analyze_captures(tid, scope);
+        }
         Expr::AtomicBlock { body, .. } => {
             for stmt in body {
                 analyze_statement(stmt, scope);
@@ -449,6 +452,9 @@ fn collect_free_variables(expr: &Expr, bound: &HashSet<String>, free: &mut HashS
             for stmt in body {
                 collect_free_in_statement(stmt, bound, free);
             }
+        }
+        Expr::ThreadJoin { tid, .. } => {
+            collect_free_variables(tid, bound, free);
         }
         Expr::AtomicBlock { body, .. } => {
             for stmt in body {

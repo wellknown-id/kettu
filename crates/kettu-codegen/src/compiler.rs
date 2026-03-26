@@ -1328,7 +1328,8 @@ impl<'a> ModuleCompiler<'a> {
                 // Leaf expressions - no sub-expressions
                 Expr::AtomicLoad { .. } | Expr::AtomicStore { .. } | Expr::AtomicAdd { .. }
                 | Expr::AtomicSub { .. } | Expr::AtomicCmpxchg { .. }
-                | Expr::AtomicWait { .. } | Expr::AtomicNotify { .. } => 0,
+                | Expr::AtomicWait { .. } | Expr::AtomicNotify { .. }
+                | Expr::ThreadJoin { .. } => 0,
                 Expr::Spawn { body, .. } | Expr::AtomicBlock { body, .. } => {
                     body.iter().map(count_in_stmt).sum()
                 }
@@ -2440,7 +2441,8 @@ impl<'a> ModuleCompiler<'a> {
             Expr::AtomicLoad { .. } | Expr::AtomicStore { .. } | Expr::AtomicAdd { .. }
             | Expr::AtomicSub { .. } | Expr::AtomicCmpxchg { .. }
             | Expr::AtomicWait { .. } | Expr::AtomicNotify { .. }
-            | Expr::Spawn { .. } | Expr::AtomicBlock { .. } => {
+            | Expr::Spawn { .. } | Expr::AtomicBlock { .. }
+            | Expr::ThreadJoin { .. } => {
                 function.instruction(&Instruction::I32Const(0));
             }
         }
@@ -4557,6 +4559,18 @@ impl<'a> ModuleCompiler<'a> {
                 }
             }
             Expr::Spawn { body, .. } => {
+                // Allocate a done-flag in shared memory (4-byte aligned)
+                let flag_offset = self.string_offset;
+                self.string_offset += 4;
+                // Initialize flag to 0 (not done)
+                function.instruction(&Instruction::I32Const(flag_offset as i32));
+                function.instruction(&Instruction::I32Const(0));
+                function.instruction(&Instruction::I32AtomicStore(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+
                 let spawn_id = self.next_spawn_id;
                 self.next_spawn_id += 1;
                 let func_idx = 0u32;
@@ -4564,6 +4578,25 @@ impl<'a> ModuleCompiler<'a> {
                 let thread_spawn_idx = self.ensure_thread_spawn_import();
                 function.instruction(&Instruction::I32Const(spawn_id as i32));
                 function.instruction(&Instruction::Call(thread_spawn_idx));
+                function.instruction(&Instruction::Drop); // discard thread-spawn return
+
+                // Push flag_offset as the tid (used by thread.join)
+                function.instruction(&Instruction::I32Const(flag_offset as i32));
+            }
+            Expr::ThreadJoin { tid, .. } => {
+                // Compile tid expression (produces flag_offset)
+                self.compile_expr_with_locals(function, tid, locals, locals_types)?;
+                // memory.atomic.wait32(flag_offset, expected=0, timeout=-1)
+                // Blocks until flag != 0 (i.e., until spawned thread sets it to 1)
+                function.instruction(&Instruction::I32Const(0)); // expected value
+                function.instruction(&Instruction::I64Const(-1)); // infinite timeout
+                function.instruction(&Instruction::MemoryAtomicWait32(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+                function.instruction(&Instruction::Drop); // discard wait result
+                function.instruction(&Instruction::I32Const(0)); // push unit result
             }
             Expr::AtomicLoad { addr, .. } => {
                 self.compile_expr_with_locals(function, addr, locals, locals_types)?;
@@ -4799,6 +4832,53 @@ mod tests {
 
         let options = CompileOptions::default();
         let wasm = compile_module(&ast, &options).expect("shared let + atomic should compile");
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+    }
+
+    #[test]
+    fn test_compile_thread_join() {
+        let source = r#"
+            package local:test;
+
+            interface effects {
+                go: func() -> s32 {
+                    let tid = spawn { 1; };
+                    thread.join(tid);
+                    0;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions { threads: true, ..Default::default() };
+        let wasm = compile_module(&ast, &options).expect("thread.join should compile");
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+    }
+
+    #[test]
+    fn test_compile_spawn_join_full() {
+        let source = r#"
+            package local:test;
+
+            interface effects {
+                go: func() -> s32 {
+                    shared let counter = 0;
+                    let tid = spawn {
+                        atomic { 1; };
+                    };
+                    thread.join(tid);
+                    0;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions { threads: true, ..Default::default() };
+        let wasm = compile_module(&ast, &options).expect("full spawn+join should compile");
         assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
     }
 }

@@ -466,6 +466,8 @@ pub enum Expr {
     AtomicNotify { addr: Box<Expr>, count: Box<Expr>, span: Span },
     /// Spawn: `spawn { body }` - runs body on a new thread
     Spawn { body: Vec<Statement>, span: Span },
+    /// Thread join: `thread.join(tid)` - blocks until spawned thread completes
+    ThreadJoin { tid: Box<Expr>, span: Span },
     /// Atomic block: `atomic { stmts }` - sugar for atomic operations on shared vars
     AtomicBlock { body: Vec<Statement>, span: Span },
 }
