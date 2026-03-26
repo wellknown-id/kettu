@@ -1,0 +1,115 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  build-binaries:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: kettu-linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: kettu-macos-aarch64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            name: kettu-macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: kettu-windows-x86_64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust Target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build Binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename Binary
+        run: |
+          mv target/${{ matrix.target }}/release/kettu${{ contains(matrix.os, 'windows') && '.exe' || '' }} target/${{ matrix.target }}/release/${{ matrix.name }}
+
+      - name: Upload Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.name }}
+
+  build-vsix:
+    name: Build VSIX
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: crates/kettu-cli/editors/vscode/bin
+
+      - name: Prepare Binaries
+        run: |
+          # The download-artifact action creates subdirectories for each artifact.
+          # We need to flatten them into the bin/ directory.
+          cd crates/kettu-cli/editors/vscode/bin
+          find . -mindepth 2 -type f -exec mv {} . \;
+          find . -type d -empty -delete
+          chmod +x kettu-*
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install Dependencies
+        working-directory: crates/kettu-cli/editors/vscode
+        run: npm ci
+
+      - name: Package VSIX
+        working-directory: crates/kettu-cli/editors/vscode
+        run: npx @vscode/vsce package -o kettu-nightly.vsix
+
+      - name: Upload VSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: kettu-vsix
+          path: crates/kettu-cli/editors/vscode/kettu-nightly.vsix
+
+  release:
+    name: Create Nightly Release
+    needs: [build-binaries, build-vsix]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare Assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f -exec cp {} release-assets/ \;
+          ls -la release-assets/
+
+      - name: Publish Nightly Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: nightly
+          name: Nightly Release
+          prerelease: true
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
