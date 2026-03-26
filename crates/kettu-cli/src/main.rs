@@ -488,13 +488,13 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
             .unwrap_or(false);
 
         if !has_body {
-            println!("  ✗ {} (no body) — {}#L{}", name, file_display, line);
+            println!("  ✗ {} (no body) — {}:{}", name, file_display, line);
             failed += 1;
             continue;
         }
 
         if !returns_bool {
-            println!("  ✗ {} (must return bool) — {}#L{}", name, file_display, line);
+            println!("  ✗ {} (must return bool) — {}:{}", name, file_display, line);
             failed += 1;
             continue;
         }
@@ -506,7 +506,7 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
         let instance = match Instance::new(&mut store, &module, &[]) {
             Ok(i) => i,
             Err(e) => {
-                println!("  ✗ {} (instantiation failed: {}) — {}#L{}", name, e, file_display, line);
+                println!("  ✗ {} (instantiation failed: {}) — {}:{}", name, e, file_display, line);
                 failed += 1;
                 continue;
             }
@@ -535,7 +535,7 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
                     .map(|e| e.name().to_string())
                     .filter(|n| n != "memory" && n != "cabi_realloc" && n != "cabi_arena_reset")
                     .collect();
-                println!("  ✗ {} (not found in exports) ({:.1?}) — {}#L{}", name, elapsed, file_display, line);
+                println!("  ✗ {} (not found in exports) ({:.1?}) — {}:{}", name, elapsed, file_display, line);
                 if !func_exports.is_empty() {
                     println!("    available: {}", func_exports.join(", "));
                 }
@@ -548,7 +548,7 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
             Ok(f) => f,
             Err(e) => {
                 let elapsed = start.elapsed();
-                println!("  ✗ {} (signature mismatch: {}) ({:.1?}) — {}#L{}", name, e, elapsed, file_display, line);
+                println!("  ✗ {} (signature mismatch: {}) ({:.1?}) — {}:{}", name, e, elapsed, file_display, line);
                 failed += 1;
                 continue;
             }
@@ -562,13 +562,13 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
                     println!("  ✓ {} ({:.1?})", name, elapsed);
                     passed += 1;
                 } else {
-                    println!("  ✗ {} (returned false) ({:.1?}) — {}#L{}", name, elapsed, file_display, line);
+                    println!("  ✗ {} (returned false) ({:.1?}) — {}:{}", name, elapsed, file_display, line);
                     failed += 1;
                 }
             }
             Err(e) => {
                 let elapsed = start.elapsed();
-                println!("  ✗ {} (execution error: {}) ({:.1?}) — {}#L{}", name, e, elapsed, file_display, line);
+                println!("  ✗ {} (execution error: {}) ({:.1?}) — {}:{}", name, e, elapsed, file_display, line);
                 failed += 1;
             }
         }
