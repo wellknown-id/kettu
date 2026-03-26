@@ -111,6 +111,14 @@ Foundation (C): `shared<dtype>` with method syntax. Sugar (B): `shared let` + `a
 - [x] SIMD-friendly loops: `simd for v in list { body }` — vectorized v128 load/store
 - [x] WASM SIMD proposal integration — ~200 instruction mappings
 
+### Phase 15: Auto-Vectorization
+
+- [ ] Loop analysis — detect induction variables, trip counts, memory access patterns
+- [ ] Dependence analysis — prove iterations are independent (no loop-carried deps)
+- [ ] Cost model — decide if vectorization is profitable
+- [ ] Automatic rewrite of scalar `for item in list` loops to SIMD when safe
+- [ ] Scalar epilogue generation for remainders
+
 [^1]: Syntactic sugar for atomic operations:
 
 ```kettu
