@@ -16,14 +16,14 @@ interface greeter {
 
 ### Types
 
-| Kettu | WIT | WASM |
-|-------|-----|------|
-| `s32` | `s32` | `i32` |
-| `u32` | `u32` | `i32` |
-| `s64` | `s64` | `i64` |
-| `bool` | `bool` | `i32` |
-| `string` | `string` | `i32` (ptr+len) |
-| `option<T>` | `option<T>` | discriminant + payload |
+| Kettu          | WIT            | WASM                   |
+| -------------- | -------------- | ---------------------- |
+| `s32`          | `s32`          | `i32`                  |
+| `u32`          | `u32`          | `i32`                  |
+| `s64`          | `s64`          | `i64`                  |
+| `bool`         | `bool`         | `i32`                  |
+| `string`       | `string`       | `i32` (ptr+len)        |
+| `option<T>`    | `option<T>`    | discriminant + payload |
 | `result<T, E>` | `result<T, E>` | discriminant + payload |
 
 ### Variables and Assignments

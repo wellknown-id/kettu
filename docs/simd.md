@@ -4,14 +4,14 @@ Kettu provides full WebAssembly SIMD support through an ergonomic `interpretatio
 
 ## Type Interpretations
 
-| Interpretation | Element Type | Lanes |
-|---------------|-------------|-------|
-| `i8x16` | 8-bit integer | 16 |
-| `i16x8` | 16-bit integer | 8 |
-| `i32x4` | 32-bit integer | 4 |
-| `i64x2` | 64-bit integer | 2 |
-| `f32x4` | 32-bit float | 4 |
-| `f64x2` | 64-bit float | 2 |
+| Interpretation | Element Type   | Lanes |
+| -------------- | -------------- | ----- |
+| `i8x16`        | 8-bit integer  | 16    |
+| `i16x8`        | 16-bit integer | 8     |
+| `i32x4`        | 32-bit integer | 4     |
+| `i64x2`        | 64-bit integer | 2     |
+| `f32x4`        | 32-bit float   | 4     |
+| `f64x2`        | 64-bit float   | 2     |
 
 Additionally, `v128` is available for type-agnostic bitwise operations.
 
