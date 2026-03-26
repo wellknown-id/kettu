@@ -1,0 +1,23 @@
+{
+    "fileTypes": [],
+    "injectionSelector": "L:text.html.markdown",
+    "patterns": [
+        {
+            "begin": "(^|\\G)(\\s*)(```)(kettu)\\s*$",
+            "beginCaptures": {
+                "3": { "name": "punctuation.definition.markdown" },
+                "4": { "name": "fenced_code.block.language.markdown" }
+            },
+            "end": "(^|\\G)(\\2)(```)\\s*$",
+            "endCaptures": {
+                "3": { "name": "punctuation.definition.markdown" }
+            },
+            "name": "markup.fenced_code.block.markdown",
+            "contentName": "meta.embedded.block.kettu",
+            "patterns": [
+                { "include": "source.kettu" }
+            ]
+        }
+    ],
+    "scopeName": "markdown.kettu.codeblock"
+}

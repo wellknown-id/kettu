@@ -41,6 +41,22 @@
                 "language": "wit",
                 "scopeName": "source.wit",
                 "path": "./syntaxes/wit.tmLanguage.json"
+            },
+            {
+                "scopeName": "markdown.kettu.codeblock",
+                "path": "./syntaxes/kettu-markdown-injection.json",
+                "injectTo": ["text.html.markdown"],
+                "embeddedLanguages": {
+                    "meta.embedded.block.kettu": "kettu"
+                }
+            },
+            {
+                "scopeName": "markdown.wit.codeblock",
+                "path": "./syntaxes/wit-markdown-injection.json",
+                "injectTo": ["text.html.markdown"],
+                "embeddedLanguages": {
+                    "meta.embedded.block.wit": "wit"
+                }
             }
         ],
         "iconThemes": [
