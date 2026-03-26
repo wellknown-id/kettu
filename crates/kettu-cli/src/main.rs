@@ -500,14 +500,44 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
             }
         };
 
-        // Get the test function (use original name - exports are kebab-case)
-        let test_func = match instance.get_typed_func::<(), i32>(&mut store, name) {
-            Ok(f) => f,
-            Err(_) => {
-                // Not found - might not be exported or wrong signature
+        // Get the test function — exports may use qualified names (ns:pkg/iface#func)
+        // so search for an export ending with #name, falling back to bare name
+        let export_name = {
+            let mut found = None;
+            for export in instance.exports(&mut store) {
+                let ename = export.name();
+                if ename == *name || ename.ends_with(&format!("#{}", name)) {
+                    found = Some(ename.to_string());
+                    break;
+                }
+            }
+            found
+        };
+
+        let export_name = match export_name {
+            Some(n) => n,
+            None => {
                 let elapsed = start.elapsed();
-                println!("  ⚠ {} (not exported, skipping) ({:.1?})", name, elapsed);
-                passed += 1; // Count as passed if it compiled
+                let func_exports: Vec<String> = instance
+                    .exports(&mut store)
+                    .map(|e| e.name().to_string())
+                    .filter(|n| n != "memory" && n != "cabi_realloc" && n != "cabi_arena_reset")
+                    .collect();
+                println!("  ✗ {} (not found in exports) ({:.1?})", name, elapsed);
+                if !func_exports.is_empty() {
+                    println!("    available: {}", func_exports.join(", "));
+                }
+                failed += 1;
+                continue;
+            }
+        };
+
+        let test_func = match instance.get_typed_func::<(), i32>(&mut store, &export_name) {
+            Ok(f) => f,
+            Err(e) => {
+                let elapsed = start.elapsed();
+                println!("  ✗ {} (signature mismatch: {}) ({:.1?})", name, e, elapsed);
+                failed += 1;
                 continue;
             }
         };
