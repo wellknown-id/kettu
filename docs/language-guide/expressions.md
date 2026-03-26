@@ -44,22 +44,30 @@ a && b  // And (skips b if a is false)
 a || b  // Or (skips b if a is true)
 ```
 
-## If Expressions
+## If / Else
 
-If is an expression that returns a value:
+Conditional branching:
 
 ```kettu
-let max = if a > b { a } else { b };
-
-let sign = if x > 0 { 1 } else { 0 - 1 };
+if x > 0 {
+    return x;
+} else {
+    return 0;
+};
 ```
 
-Can also be used as statements:
+Nested conditionals:
 
 ```kettu
-if condition {
-    do_something();
-}
+if x > 20 {
+    return 3;
+} else {
+    if x > 10 {
+        return 2;
+    } else {
+        return 1;
+    };
+};
 ```
 
 ## Function Calls
