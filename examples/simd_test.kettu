@@ -1,0 +1,93 @@
+// SIMD Tests
+// End-to-end tests for SIMD operations
+
+package local:simd;
+
+interface simd-tests {
+    @test
+    test-splat-extract: func() -> bool {
+        let v = i32x4.splat(42);
+        let lane0 = i32x4.extract_lane(v, 0);
+        lane0 == 42;
+    }
+
+    @test
+    test-add: func() -> bool {
+        let a = i32x4.splat(10);
+        let b = i32x4.splat(20);
+        let c = i32x4.add(a, b);
+        let result = i32x4.extract_lane(c, 0);
+        result == 30;
+    }
+
+    @test
+    test-sub: func() -> bool {
+        let a = i32x4.splat(50);
+        let b = i32x4.splat(15);
+        let c = i32x4.sub(a, b);
+        let result = i32x4.extract_lane(c, 0);
+        result == 35;
+    }
+
+    @test
+    test-mul: func() -> bool {
+        let a = i32x4.splat(6);
+        let b = i32x4.splat(7);
+        let c = i32x4.mul(a, b);
+        let result = i32x4.extract_lane(c, 0);
+        result == 42;
+    }
+
+    @test
+    test-bitwise-and: func() -> bool {
+        let a = i32x4.splat(255);
+        let b = i32x4.splat(15);
+        let c = v128.and(a, b);
+        let result = i32x4.extract_lane(c, 0);
+        result == 15;
+    }
+
+    @test
+    test-bitwise-or: func() -> bool {
+        let a = i32x4.splat(240);
+        let b = i32x4.splat(15);
+        let c = v128.or(a, b);
+        let result = i32x4.extract_lane(c, 0);
+        result == 255;
+    }
+
+    @test
+    test-neg: func() -> bool {
+        let v = i32x4.splat(42);
+        let n = i32x4.neg(v);
+        // neg(42) + 42 should equal 0
+        let sum = i32x4.add(n, v);
+        let result = i32x4.extract_lane(sum, 0);
+        result == 0;
+    }
+
+    @test
+    test-eq: func() -> bool {
+        let a = i32x4.splat(10);
+        let b = i32x4.splat(10);
+        let mask = i32x4.eq(a, b);
+        // eq produces all-1s mask for matching lanes, so all_true should return 1
+        let result = i32x4.all_true(mask);
+        result == 1;
+    }
+
+    @test
+    test-all-true: func() -> bool {
+        let v = i32x4.splat(1);
+        let result = i32x4.all_true(v);
+        result == 1;
+    }
+
+    @test
+    test-replace-lane: func() -> bool {
+        let v = i32x4.splat(0);
+        let v2 = i32x4.replace_lane(v, 2, 99);
+        let result = i32x4.extract_lane(v2, 2);
+        result == 99;
+    }
+}

@@ -1514,6 +1514,8 @@ impl<'a> ModuleCompiler<'a> {
             locals.insert(param.name.name.clone(), i as u32);
         }
 
+        let mut v128_locals = std::collections::HashSet::new();
+
         // Count let bindings and for loop variables in the body
         if let Some(ref body) = func.body {
             fn collect_locals_from_expr(
@@ -1521,6 +1523,7 @@ impl<'a> ModuleCompiler<'a> {
                 params_len: usize,
                 locals: &mut HashMap<String, u32>,
                 let_count: &mut u32,
+                v128_locals: &mut std::collections::HashSet<u32>,
             ) {
                 match expr {
                     Expr::For { variable, body, .. } => {
@@ -1529,7 +1532,7 @@ impl<'a> ModuleCompiler<'a> {
                         *let_count += 1;
                         // Scan body statements
                         for stmt in body {
-                            collect_locals_from_stmt(stmt, params_len, locals, let_count);
+                            collect_locals_from_stmt(stmt, params_len, locals, let_count, v128_locals);
                         }
                     }
                     Expr::ForEach { variable, body, .. } => {
@@ -1540,12 +1543,25 @@ impl<'a> ModuleCompiler<'a> {
                         *let_count += 2;
                         // Scan body statements
                         for stmt in body {
-                            collect_locals_from_stmt(stmt, params_len, locals, let_count);
+                            collect_locals_from_stmt(stmt, params_len, locals, let_count, v128_locals);
+                        }
+                    }
+                    Expr::SimdForEach { variable, body, .. } => {
+                        // SIMD for-each loop variable (v128 type)
+                        let idx = params_len as u32 + *let_count;
+                        locals.insert(variable.name.clone(), idx);
+                        v128_locals.insert(idx);
+                        *let_count += 1;
+                        // Need temp locals: list_ptr, idx, end (3 more)
+                        *let_count += 3;
+                        // Scan body statements
+                        for stmt in body {
+                            collect_locals_from_stmt(stmt, params_len, locals, let_count, v128_locals);
                         }
                     }
                     Expr::While { body, .. } => {
                         for stmt in body {
-                            collect_locals_from_stmt(stmt, params_len, locals, let_count);
+                            collect_locals_from_stmt(stmt, params_len, locals, let_count, v128_locals);
                         }
                     }
                     Expr::If {
@@ -1554,11 +1570,11 @@ impl<'a> ModuleCompiler<'a> {
                         ..
                     } => {
                         for stmt in then_branch {
-                            collect_locals_from_stmt(stmt, params_len, locals, let_count);
+                            collect_locals_from_stmt(stmt, params_len, locals, let_count, v128_locals);
                         }
                         if let Some(else_stmts) = else_branch {
                             for stmt in else_stmts {
-                                collect_locals_from_stmt(stmt, params_len, locals, let_count);
+                                collect_locals_from_stmt(stmt, params_len, locals, let_count, v128_locals);
                             }
                         }
                     }
@@ -1574,18 +1590,18 @@ impl<'a> ModuleCompiler<'a> {
                         // Map needs 5 temp locals: src_ptr, len, dest_ptr, i, elem
                         *let_count += 5;
                         // Also collect from the list expression
-                        collect_locals_from_expr(list, params_len, locals, let_count);
+                        collect_locals_from_expr(list, params_len, locals, let_count, v128_locals);
                         // And from the lambda body
                         if let Expr::Lambda { body, .. } = lambda.as_ref() {
-                            collect_locals_from_expr(body, params_len, locals, let_count);
+                            collect_locals_from_expr(body, params_len, locals, let_count, v128_locals);
                         }
                     }
                     Expr::Filter { list, lambda, .. } => {
                         // Filter needs 6 temp locals: src_ptr, len, dest_ptr, i, j, elem
                         *let_count += 6;
-                        collect_locals_from_expr(list, params_len, locals, let_count);
+                        collect_locals_from_expr(list, params_len, locals, let_count, v128_locals);
                         if let Expr::Lambda { body, .. } = lambda.as_ref() {
-                            collect_locals_from_expr(body, params_len, locals, let_count);
+                            collect_locals_from_expr(body, params_len, locals, let_count, v128_locals);
                         }
                     }
                     Expr::Reduce {
@@ -1593,10 +1609,10 @@ impl<'a> ModuleCompiler<'a> {
                     } => {
                         // Reduce needs 5 temp locals: src_ptr, len, i, acc, elem
                         *let_count += 5;
-                        collect_locals_from_expr(list, params_len, locals, let_count);
-                        collect_locals_from_expr(init, params_len, locals, let_count);
+                        collect_locals_from_expr(list, params_len, locals, let_count, v128_locals);
+                        collect_locals_from_expr(init, params_len, locals, let_count, v128_locals);
                         if let Expr::Lambda { body, .. } = lambda.as_ref() {
-                            collect_locals_from_expr(body, params_len, locals, let_count);
+                            collect_locals_from_expr(body, params_len, locals, let_count, v128_locals);
                         }
                     }
                     _ => {}
@@ -1608,39 +1624,68 @@ impl<'a> ModuleCompiler<'a> {
                 params_len: usize,
                 locals: &mut HashMap<String, u32>,
                 let_count: &mut u32,
+                v128_locals: &mut std::collections::HashSet<u32>,
             ) {
                 match stmt {
                     Statement::Let { name, value } => {
-                        locals.insert(name.name.clone(), params_len as u32 + *let_count);
+                        let idx = params_len as u32 + *let_count;
+                        locals.insert(name.name.clone(), idx);
+                        if expr_is_v128(value) {
+                            v128_locals.insert(idx);
+                        }
                         *let_count += 1;
-                        collect_locals_from_expr(value, params_len, locals, let_count);
+                        collect_locals_from_expr(value, params_len, locals, let_count, v128_locals);
                     }
                     Statement::Expr(e) => {
-                        collect_locals_from_expr(e, params_len, locals, let_count);
+                        collect_locals_from_expr(e, params_len, locals, let_count, v128_locals);
                     }
                     Statement::Assign { value, .. } | Statement::CompoundAssign { value, .. } => {
-                        collect_locals_from_expr(value, params_len, locals, let_count);
+                        collect_locals_from_expr(value, params_len, locals, let_count, v128_locals);
                     }
                     Statement::SharedLet { name, initial_value } => {
                         locals.insert(name.name.clone(), params_len as u32 + *let_count);
                         *let_count += 1;
-                        collect_locals_from_expr(initial_value, params_len, locals, let_count);
+                        collect_locals_from_expr(initial_value, params_len, locals, let_count, v128_locals);
                     }
                     _ => {}
                 }
             }
 
+            /// Check if an expression produces a v128 SIMD value
+            fn expr_is_v128(expr: &Expr) -> bool {
+                match expr {
+                    Expr::SimdOp { op, .. } => {
+                        // Most SIMD ops return v128; extract_lane/tests return i32
+                        !matches!(op, SimdOp::ExtractLane | SimdOp::AnyTrue | SimdOp::AllTrue | SimdOp::Bitmask)
+                    }
+                    Expr::Ident(_id) => {
+                        // If it's referencing a known v128 variable, it's v128
+                        // We can't easily tell here, so be conservative
+                        false
+                    }
+                    _ => false,
+                }
+            }
+
+
             for stmt in &body.statements {
-                collect_locals_from_stmt(stmt, func.params.len(), &mut locals, &mut let_count);
+                collect_locals_from_stmt(stmt, func.params.len(), &mut locals, &mut let_count, &mut v128_locals);
             }
         }
 
-        // Declare locals (all i32 for now)
+        // Declare locals with correct types (v128 for SIMD, i32 for everything else)
         // +1 for temp record pointer
         // +3 for match expressions (scrutinee + binding + spare)
         let extra_locals = 4;
         let local_types: Vec<_> = (0..let_count + extra_locals)
-            .map(|_| (1, ValType::I32))
+            .map(|i| {
+                let idx = func.params.len() as u32 + i;
+                if v128_locals.contains(&idx) {
+                    (1, ValType::V128)
+                } else {
+                    (1, ValType::I32)
+                }
+            })
             .collect();
         let mut function = Function::new(local_types);
 
