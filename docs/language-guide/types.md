@@ -114,3 +114,16 @@ result<s32>        // No error value
 list<u8>
 tuple<s32, string, bool>
 ```
+
+## SIMD Type
+
+The `v128` type holds 128-bit SIMD vectors:
+
+```kettu
+let v = i32x4.splat(42);        // 4 packed i32s
+let sum = i32x4.add(a, b);      // vector addition
+let lane = i32x4.extract_lane(v, 0);  // extract scalar
+```
+
+See [SIMD](../simd.md) for the full operation list.
+

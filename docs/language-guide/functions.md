@@ -64,8 +64,26 @@ max: func(a: s32, b: s32) -> s32 {
 
 ## Async Functions
 
-Mark functions as async:
+Mark functions as async for WASI Preview 3:
 
 ```kettu
 fetch: async func(url: string) -> string;
+
+// With body
+process: async func(data: string) -> string {
+    let result = await transform(data);
+    result;
+}
 ```
+
+See [WASI Preview 3](../wasip3.md) for details on async/await.
+
+## Lambdas & Closures
+
+See [Closures & HOFs](./closures.md) for anonymous functions and higher-order patterns:
+
+```kettu
+let double = |x| x * 2;
+let arr = map([1, 2, 3], |x| x + 1);
+```
+
