@@ -20,7 +20,21 @@ function findServerPath(extensionPath) {
         return configPath;
     }
 
-    // 2. Try relative to extension (for development - extension is in editors/vscode)
+    // 2. Try bundled binaries (for self-contained VSIX)
+    let bundledBinary = 'kettu-linux-x86_64';
+    if (process.platform === 'win32') {
+        bundledBinary = 'kettu-windows-x86_64.exe';
+    } else if (process.platform === 'darwin') {
+        bundledBinary = process.arch === 'arm64' ? 'kettu-macos-aarch64' : 'kettu-macos-x86_64';
+    }
+
+    const bundledPath = path.join(extensionPath, 'bin', bundledBinary);
+    if (fs.existsSync(bundledPath)) {
+        console.log(`Kettu LSP: found bundled binary at ${bundledPath}`);
+        return bundledPath;
+    }
+
+    // 3. Try relative to extension (for development - extension is in editors/vscode)
     const kettuRoot = path.resolve(extensionPath, '..', '..');
     const debugFromExt = path.join(kettuRoot, 'target', 'debug', 'kettu');
     const releaseFromExt = path.join(kettuRoot, 'target', 'release', 'kettu');
@@ -35,7 +49,7 @@ function findServerPath(extensionPath) {
         return releaseFromExt;
     }
 
-    // 2b. Try workspace root (for cargo workspace builds - binary is in root target/)
+    // 3b. Try workspace root (for cargo workspace builds - binary is in root target/)
     const workspaceRoot = path.resolve(extensionPath, '..', '..', '..');
     const debugFromRoot = path.join(workspaceRoot, 'target', 'debug', 'kettu');
     const releaseFromRoot = path.join(workspaceRoot, 'target', 'release', 'kettu');
