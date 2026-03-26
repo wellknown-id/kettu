@@ -4,6 +4,9 @@
   "scopeName": "source.kettu",
   "patterns": [
     {
+      "include": "#comments"
+    },
+    {
       "include": "#keywords"
     },
     {
@@ -39,69 +42,9 @@
       ]
     },
     {
-      "begin": "<",
-      "end": ">",
-      "name": "meta.block.angle.kettu",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "<",
-      "end": ">",
-      "name": "meta.block.angle.kettu",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "<",
-      "end": ">",
-      "name": "meta.block.angle.kettu",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "\\(",
-      "end": "\\)",
-      "name": "meta.block.paren.kettu",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
       "begin": "\\{",
       "end": "\\}",
       "name": "meta.block.brace.kettu",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "\\(",
-      "end": "\\)",
-      "name": "meta.block.paren.kettu",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "\\(",
-      "end": "\\)",
-      "name": "meta.block.paren.kettu",
       "patterns": [
         {
           "include": "$self"
@@ -117,19 +60,22 @@
           "include": "$self"
         }
       ]
-    },
-    {
-      "begin": "\\{",
-      "end": "\\}",
-      "name": "meta.block.brace.kettu",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
     }
   ],
   "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "match": "//.*$",
+          "name": "comment.line.double-slash.kettu"
+        },
+        {
+          "begin": "/\\*",
+          "end": "\\*/",
+          "name": "comment.block.kettu"
+        }
+      ]
+    },
     "keywords": {
       "patterns": [
         {

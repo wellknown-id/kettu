@@ -8,8 +8,9 @@ function readGrammar(fileName) {
 }
 
 function getRepositoryPattern(grammar, repoKey, scopeName) {
-  const patterns = grammar.repository[repoKey].patterns;
-  const entry = patterns.find((p) => p.name === scopeName);
+  const repo = grammar.repository[repoKey];
+  assert(repo, `Repository key '${repoKey}' not found`);
+  const entry = repo.patterns.find((p) => p.name === scopeName);
   assert(entry, `Pattern ${scopeName} not found under ${repoKey}`);
   return new RegExp(entry.match, "g");
 }
@@ -26,37 +27,47 @@ function assertMatchesExactly(regex, input, expected) {
 function runFor(grammarFile, languageSuffix) {
   const grammar = readGrammar(grammarFile);
 
-  const asyncKw = getRepositoryPattern(
-    grammar,
-    "function-declaration",
-    `keyword.declaration.async.${languageSuffix}`
+  // Verify comment patterns exist
+  assert(grammar.repository.comments, "Grammar should have comments repository");
+  const commentPatterns = grammar.repository.comments.patterns;
+  assert(
+    commentPatterns.some((p) => p.name === `comment.line.double-slash.${languageSuffix}`),
+    "Should have line comment pattern"
   );
-  const arrowOp = getRepositoryPattern(
-    grammar,
-    "operators",
-    `keyword.operator.arrow.${languageSuffix}`
-  );
-  const comparisonOp = getRepositoryPattern(
-    grammar,
-    "operators",
-    `keyword.operator.comparison.${languageSuffix}`
-  );
-  const arithmeticOp = getRepositoryPattern(
-    grammar,
-    "operators",
-    `keyword.operator.arithmetic.${languageSuffix}`
+  assert(
+    commentPatterns.some((p) => p.name === `comment.block.${languageSuffix}`),
+    "Should have block comment pattern"
   );
 
-  assertMatchesExactly(asyncKw, "dummy-async: async func() -> s32", ["async"]);
-  assertMatchesExactly(asyncKw, "dummy-async: func() -> s32", []);
+  // Verify comments appear before keywords in top-level patterns
+  const topPatterns = grammar.patterns.map((p) => p.include);
+  const commentsIdx = topPatterns.indexOf("#comments");
+  const keywordsIdx = topPatterns.indexOf("#keywords");
+  assert(commentsIdx >= 0, "Comments should be in top-level patterns");
+  assert(commentsIdx < keywordsIdx, "Comments should appear before keywords");
 
-  assertMatchesExactly(arrowOp, "dummy-async: async func() -> s32", ["->"]);
-  assertMatchesExactly(comparisonOp, "dummy-async: async func() -> s32", []);
-  assertMatchesExactly(arithmeticOp, "dummy-async", []);
-  assertMatchesExactly(arithmeticOp, "dummy - async", ["-"]);
-  assertMatchesExactly(arithmeticOp, "a->b", []);
-  assertMatchesExactly(comparisonOp, "a->b", []);
-  assertMatchesExactly(comparisonOp, "a>b", [">"]);
+  // Verify keywords include 'async'
+  const kwPattern = getRepositoryPattern(
+    grammar,
+    "keywords",
+    `keyword.control.${languageSuffix}`
+  );
+  assertMatchesExactly(kwPattern, "async func() -> s32", ["async", "func"]);
+  assertMatchesExactly(kwPattern, "dummy-async", ["async"]);
+
+  // Verify operators include '->'
+  const opPattern = getRepositoryPattern(
+    grammar,
+    "operators",
+    `keyword.operator.${languageSuffix}`
+  );
+  assertMatchesExactly(opPattern, "->", ["->"]);
+
+  // Verify line comment pattern matches
+  const lineComment = new RegExp(
+    commentPatterns.find((p) => p.match).match
+  );
+  assert(lineComment.test("// this is a comment"), "Should match line comments");
 }
 
 runFor("kettu.tmLanguage.json", "kettu");

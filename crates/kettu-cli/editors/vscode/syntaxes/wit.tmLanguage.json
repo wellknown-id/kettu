@@ -4,6 +4,9 @@
   "scopeName": "source.wit",
   "patterns": [
     {
+      "include": "#comments"
+    },
+    {
       "include": "#keywords"
     },
     {
@@ -39,69 +42,9 @@
       ]
     },
     {
-      "begin": "<",
-      "end": ">",
-      "name": "meta.block.angle.wit",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "<",
-      "end": ">",
-      "name": "meta.block.angle.wit",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "<",
-      "end": ">",
-      "name": "meta.block.angle.wit",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "\\(",
-      "end": "\\)",
-      "name": "meta.block.paren.wit",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
       "begin": "\\{",
       "end": "\\}",
       "name": "meta.block.brace.wit",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "\\(",
-      "end": "\\)",
-      "name": "meta.block.paren.wit",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "\\(",
-      "end": "\\)",
-      "name": "meta.block.paren.wit",
       "patterns": [
         {
           "include": "$self"
@@ -117,19 +60,22 @@
           "include": "$self"
         }
       ]
-    },
-    {
-      "begin": "\\{",
-      "end": "\\}",
-      "name": "meta.block.brace.wit",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
     }
   ],
   "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "match": "//.*$",
+          "name": "comment.line.double-slash.wit"
+        },
+        {
+          "begin": "/\\*",
+          "end": "\\*/",
+          "name": "comment.block.wit"
+        }
+      ]
+    },
     "keywords": {
       "patterns": [
         {
