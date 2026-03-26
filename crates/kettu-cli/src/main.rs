@@ -355,6 +355,15 @@ async fn main() {
     }
 }
 
+/// Convert a byte offset to a 1-based line number.
+fn offset_to_line(source: &str, offset: usize) -> usize {
+    source[..offset.min(source.len())]
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .count()
+        + 1
+}
+
 /// Run tests in a Kettu file, returns (passed, failed) counts
 fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
     use kettu_parser::{Gate, InterfaceItem, TopLevelItem};
@@ -400,8 +409,8 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
         std::process::exit(1);
     }
 
-    // Discover test functions
-    let mut tests: Vec<(&str, &kettu_parser::Func)> = Vec::new();
+    // Discover test functions — collect name, func, and source line number
+    let mut tests: Vec<(&str, &kettu_parser::Func, usize)> = Vec::new();
 
     for item in &ast.items {
         if let TopLevelItem::Interface(iface) = item {
@@ -417,7 +426,8 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
                                 continue;
                             }
                         }
-                        tests.push((name, func));
+                        let line = offset_to_line(&content, func.span.start);
+                        tests.push((name, func, line));
                     }
                 }
             }
@@ -459,7 +469,9 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
     let mut passed = 0;
     let mut failed = 0;
 
-    for (name, func) in &tests {
+    let file_display = file.display();
+
+    for (name, func, line) in &tests {
         let start = Instant::now();
 
         // Check if test function has a body and returns bool
@@ -476,13 +488,13 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
             .unwrap_or(false);
 
         if !has_body {
-            println!("  ✗ {} (no body)", name);
+            println!("  ✗ {} (no body) — {}#L{}", name, file_display, line);
             failed += 1;
             continue;
         }
 
         if !returns_bool {
-            println!("  ✗ {} (must return bool)", name);
+            println!("  ✗ {} (must return bool) — {}#L{}", name, file_display, line);
             failed += 1;
             continue;
         }
@@ -494,7 +506,7 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
         let instance = match Instance::new(&mut store, &module, &[]) {
             Ok(i) => i,
             Err(e) => {
-                println!("  ✗ {} (instantiation failed: {})", name, e);
+                println!("  ✗ {} (instantiation failed: {}) — {}#L{}", name, e, file_display, line);
                 failed += 1;
                 continue;
             }
@@ -523,7 +535,7 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
                     .map(|e| e.name().to_string())
                     .filter(|n| n != "memory" && n != "cabi_realloc" && n != "cabi_arena_reset")
                     .collect();
-                println!("  ✗ {} (not found in exports) ({:.1?})", name, elapsed);
+                println!("  ✗ {} (not found in exports) ({:.1?}) — {}#L{}", name, elapsed, file_display, line);
                 if !func_exports.is_empty() {
                     println!("    available: {}", func_exports.join(", "));
                 }
@@ -536,7 +548,7 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
             Ok(f) => f,
             Err(e) => {
                 let elapsed = start.elapsed();
-                println!("  ✗ {} (signature mismatch: {}) ({:.1?})", name, e, elapsed);
+                println!("  ✗ {} (signature mismatch: {}) ({:.1?}) — {}#L{}", name, e, elapsed, file_display, line);
                 failed += 1;
                 continue;
             }
@@ -550,13 +562,13 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
                     println!("  ✓ {} ({:.1?})", name, elapsed);
                     passed += 1;
                 } else {
-                    println!("  ✗ {} (returned false) ({:.1?})", name, elapsed);
+                    println!("  ✗ {} (returned false) ({:.1?}) — {}#L{}", name, elapsed, file_display, line);
                     failed += 1;
                 }
             }
             Err(e) => {
                 let elapsed = start.elapsed();
-                println!("  ✗ {} (execution error: {}) ({:.1?})", name, e, elapsed);
+                println!("  ✗ {} (execution error: {}) ({:.1?}) — {}#L{}", name, e, elapsed, file_display, line);
                 failed += 1;
             }
         }
