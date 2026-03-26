@@ -59,6 +59,12 @@
                 }
             }
         ],
+        "markdown.previewScripts": [
+            "./preview/kettu-preview.js"
+        ],
+        "markdown.previewStyles": [
+            "./preview/kettu-preview.css"
+        ],
         "iconThemes": [
             {
                 "id": "kettu-icons",

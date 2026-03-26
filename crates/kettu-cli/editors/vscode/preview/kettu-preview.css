@@ -1,0 +1,20 @@
+.kettu-keyword {
+    color: #c586c0;
+}
+
+.kettu-comment {
+    color: #6a9955;
+    font-style: italic;
+}
+
+.kettu-string {
+    color: #ce9178;
+}
+
+.kettu-number {
+    color: #b5cea8;
+}
+
+.kettu-decorator {
+    color: #dcdcaa;
+}
