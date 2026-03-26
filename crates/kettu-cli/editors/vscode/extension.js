@@ -36,7 +36,8 @@ function findServerPath(extensionPath) {
     }
 
     // 2b. Try workspace root (for cargo workspace builds - binary is in root target/)
-    const workspaceRoot = path.resolve(extensionPath, '..', '..', '..');
+    // Extension is at crates/kettu-cli/editors/vscode — 4 levels up to repo root
+    const workspaceRoot = path.resolve(extensionPath, '..', '..', '..', '..');
     const debugFromRoot = path.join(workspaceRoot, 'target', 'debug', 'kettu');
     const releaseFromRoot = path.join(workspaceRoot, 'target', 'release', 'kettu');
 
@@ -76,6 +77,14 @@ function activate(context) {
     const serverPath = findServerPath(context.extensionPath);
 
     console.log(`Kettu LSP: using server at ${serverPath}`);
+
+    // Add kettu binary directory to integrated terminal PATH via env contribution
+    const binDir = path.dirname(path.resolve(serverPath));
+    if (binDir && binDir !== '.') {
+        const envCollection = context.environmentVariableCollection;
+        envCollection.prepend('PATH', binDir + path.delimiter);
+        envCollection.description = 'Adds the Kettu compiler to PATH';
+    }
 
     // Gutter decorations for test pass/fail
     passDecorationType = vscode.window.createTextEditorDecorationType({
