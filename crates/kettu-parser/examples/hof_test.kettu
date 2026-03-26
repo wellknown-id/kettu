@@ -54,7 +54,7 @@ interface hof-tests {
     @test
     test-lambda-stored: func() -> bool {
         let f = |x| x * 2;
-        f > 0;
+        f(5) == 10;
     }
 
     @test

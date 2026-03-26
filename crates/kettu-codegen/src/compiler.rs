@@ -2055,10 +2055,11 @@ impl<'a> ModuleCompiler<'a> {
                         }
                         Statement::Return(Some(expr)) => {
                             compiler.compile_expr(function, expr)?;
-                            // Don't need explicit return in if body, just leave value
+                            function.instruction(&Instruction::Return);
                         }
                         Statement::Return(None) => {
                             function.instruction(&Instruction::I32Const(0));
+                            function.instruction(&Instruction::Return);
                         }
                         Statement::Let { value, .. } => {
                             compiler.compile_expr(function, value)?;
@@ -2593,8 +2594,13 @@ impl<'a> ModuleCompiler<'a> {
                     if let Some(&local_idx) = locals.get(&id.name) {
                         // Push argument (element)
                         function.instruction(&Instruction::LocalGet(elem_local));
-                        // Push function table index
+                        // Load table_idx from closure cell offset 0
                         function.instruction(&Instruction::LocalGet(local_idx));
+                        function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 2,
+                            memory_index: 0,
+                        }));
                         // call_indirect with (i32) -> i32 type
                         let type_idx = self.get_or_create_type(&[ValType::I32], &[ValType::I32]);
                         function.instruction(&Instruction::CallIndirect {
@@ -2719,7 +2725,13 @@ impl<'a> ModuleCompiler<'a> {
                     // Function variable - call_indirect
                     if let Some(&local_idx) = locals.get(&id.name) {
                         function.instruction(&Instruction::LocalGet(elem_local));
+                        // Load table_idx from closure cell offset 0
                         function.instruction(&Instruction::LocalGet(local_idx));
+                        function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 2,
+                            memory_index: 0,
+                        }));
                         let type_idx = self.get_or_create_type(&[ValType::I32], &[ValType::I32]);
                         function.instruction(&Instruction::CallIndirect {
                             type_index: type_idx,
@@ -2880,8 +2892,13 @@ impl<'a> ModuleCompiler<'a> {
                         // Push args: acc, elem
                         function.instruction(&Instruction::LocalGet(acc_local));
                         function.instruction(&Instruction::LocalGet(elem_local));
-                        // Push function table index
+                        // Load table_idx from closure cell offset 0
                         function.instruction(&Instruction::LocalGet(local_idx));
+                        function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 2,
+                            memory_index: 0,
+                        }));
                         // call_indirect with (i32, i32) -> i32 type
                         let type_idx =
                             self.get_or_create_type(&[ValType::I32, ValType::I32], &[ValType::I32]);
@@ -2986,8 +3003,13 @@ impl<'a> ModuleCompiler<'a> {
                                 table_index: 0,
                             });
                         } else {
-                            // No captures known - simple call_indirect (function reference without captures)
+                            // No captures known - load table_idx from closure cell offset 0
                             function.instruction(&Instruction::LocalGet(local_idx));
+                            function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                                offset: 0,
+                                align: 2,
+                                memory_index: 0,
+                            }));
 
                             let param_types: Vec<ValType> =
                                 args.iter().map(|_| ValType::I32).collect();
@@ -3253,9 +3275,11 @@ impl<'a> ModuleCompiler<'a> {
                                 locals,
                                 locals_types,
                             )?;
+                            function.instruction(&Instruction::Return);
                         }
                         Statement::Return(None) => {
                             function.instruction(&Instruction::I32Const(0));
+                            function.instruction(&Instruction::Return);
                         }
                         Statement::Let { value, .. } => {
                             compiler.compile_expr_with_locals(
