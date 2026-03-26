@@ -646,4 +646,122 @@ mod tests {
         eprintln!("Parse errors: {:?}", result.errors);
         eprintln!("Parse result is_some: {}", result.result.is_some());
     }
+
+    // ================================================================
+    // Phase 13e: Ergonomic atomics parsing
+    // ================================================================
+
+    #[test]
+    fn test_shared_let_statement_parse() {
+        let src = "interface i {\n  f: func() {\n    shared let counter = 0;\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected Interface"),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!("expected Func"),
+        };
+        let body = func.body.as_ref().expect("should have body");
+        match &body.statements[0] {
+            crate::ast::Statement::SharedLet { name, initial_value } => {
+                assert_eq!(name.name, "counter");
+                assert!(matches!(initial_value, crate::ast::Expr::Integer(0, _)));
+            }
+            other => panic!("expected SharedLet, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_atomic_block_expression_parse() {
+        let src = "interface i {\n  f: func() {\n    atomic {\n      42;\n    };\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected Interface"),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!("expected Func"),
+        };
+        let body = func.body.as_ref().expect("should have body");
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::AtomicBlock { body, .. }) => {
+                assert!(!body.is_empty(), "atomic block should have at least one statement");
+            }
+            other => panic!("expected AtomicBlock expression, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_shared_let_complex_initializer() {
+        let src = "interface i {\n  f: func() {\n    shared let x = 1 + 2;\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::SharedLet { name, initial_value } => {
+                assert_eq!(name.name, "x");
+                assert!(matches!(initial_value, crate::ast::Expr::Binary { .. }));
+            }
+            _ => panic!("expected SharedLet with binary expression"),
+        }
+    }
+
+    #[test]
+    fn test_atomic_block_multi_statement() {
+        let src = "interface i {\n  f: func() {\n    atomic {\n      let x = 1;\n      x + 1;\n    };\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::AtomicBlock { body, .. }) => {
+                assert_eq!(body.len(), 2, "atomic block should have 2 statements");
+            }
+            other => panic!("expected AtomicBlock, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_shared_let_and_atomic_block_together() {
+        let src = "interface i {\n  f: func() {\n    shared let counter = 0;\n    atomic {\n      counter + 1;\n    };\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        assert_eq!(body.statements.len(), 2);
+        assert!(matches!(&body.statements[0], crate::ast::Statement::SharedLet { .. }));
+        assert!(matches!(&body.statements[1], crate::ast::Statement::Expr(crate::ast::Expr::AtomicBlock { .. })));
+    }
 }

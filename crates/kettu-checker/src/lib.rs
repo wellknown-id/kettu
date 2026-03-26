@@ -199,6 +199,10 @@ enum CheckedType {
         err: Option<Box<CheckedType>>,
     },
     Future(Option<Box<CheckedType>>),
+    /// Opaque thread identifier returned by `spawn` — not numeric, no arithmetic allowed
+    ThreadId,
+    /// Opaque shared memory variable — used with `atomic { }` blocks
+    Shared,
     Unknown,
 }
 
@@ -745,6 +749,11 @@ impl Checker {
                 if let Some(cond) = condition {
                     self.check_expr(cond);
                 }
+            }
+            Statement::SharedLet { name, initial_value } => {
+                let _value_ty = self.check_expr(initial_value);
+                // Shared variables always have type Shared (opaque)
+                self.locals.insert(name.name.clone(), CheckedType::Shared);
             }
         }
     }
@@ -1828,6 +1837,52 @@ impl Checker {
                         CheckedType::Unknown
                     }
                 }
+            }
+            // Atomic operations — all return i32 (or void for store)
+            Expr::AtomicLoad { addr, .. } => {
+                self.check_expr(addr);
+                CheckedType::I32
+            }
+            Expr::AtomicStore { addr, value, .. } => {
+                self.check_expr(addr);
+                self.check_expr(value);
+                CheckedType::Unknown // void
+            }
+            Expr::AtomicAdd { addr, value, .. }
+            | Expr::AtomicSub { addr, value, .. } => {
+                self.check_expr(addr);
+                self.check_expr(value);
+                CheckedType::I32 // returns old value
+            }
+            Expr::AtomicCmpxchg { addr, expected, replacement, .. } => {
+                self.check_expr(addr);
+                self.check_expr(expected);
+                self.check_expr(replacement);
+                CheckedType::I32 // returns old value
+            }
+            Expr::AtomicWait { addr, expected, timeout, .. } => {
+                self.check_expr(addr);
+                self.check_expr(expected);
+                self.check_expr(timeout);
+                CheckedType::I32 // 0=ok, 1=mismatch, 2=timeout
+            }
+            Expr::AtomicNotify { addr, count, .. } => {
+                self.check_expr(addr);
+                self.check_expr(count);
+                CheckedType::I32 // returns num waiters woken
+            }
+            Expr::Spawn { body, .. } => {
+                for s in body {
+                    self.validate_statement(s);
+                }
+                CheckedType::ThreadId
+            }
+            Expr::AtomicBlock { body, .. } => {
+                for s in body {
+                    self.validate_statement(s);
+                }
+                // Atomic block evaluates to the type of its last expression (typically I32)
+                CheckedType::I32
             }
         }
     }
@@ -3161,5 +3216,136 @@ mod tests {
             .filter(|d| d.severity == Severity::Error)
             .collect();
         assert!(errors.is_empty(), "Should have no errors: {:?}", errors);
+    }
+
+    #[test]
+    fn test_spawn_returns_thread_id() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                go: func() -> s32 {
+                    let tid = spawn {
+                        atomic.store(0, 1);
+                    };
+                    0;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "spawn should type-check cleanly: {:?}", errors);
+    }
+
+    #[test]
+    fn test_thread_id_arithmetic_rejected() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                go: func() -> s32 {
+                    let tid = spawn {
+                        atomic.store(0, 1);
+                    };
+                    tid + 1;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(!errors.is_empty(), "arithmetic on ThreadId should be rejected");
+    }
+
+    #[test]
+    fn test_shared_let_type_checks() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                counter: func() -> s32 {
+                    shared let counter = 0;
+                    0;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
+        assert!(errors.is_empty(), "shared let should type-check: {:?}", errors);
+    }
+
+    #[test]
+    fn test_atomic_block_type_checks() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                go: func() -> s32 {
+                    atomic {
+                        42;
+                    };
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
+        assert!(errors.is_empty(), "atomic block should type-check: {:?}", errors);
+    }
+
+    #[test]
+    fn test_shared_let_and_atomic_block_combined() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                inc: func() -> s32 {
+                    shared let counter = 0;
+                    let tid = spawn {
+                        atomic {
+                            1;
+                        };
+                    };
+                    0;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
+        assert!(errors.is_empty(), "combined shared let + atomic should type-check: {:?}", errors);
+    }
+
+    #[test]
+    fn test_atomic_block_empty_body() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                noop: func() -> s32 {
+                    atomic {};
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
+        assert!(errors.is_empty(), "empty atomic block should type-check: {:?}", errors);
     }
 }

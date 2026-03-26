@@ -75,6 +75,9 @@ enum Commands {
         /// Enable WASI Preview 3 async ABI (experimental)
         #[arg(long)]
         wasip3: bool,
+        /// Enable WASM threads (shared memory + atomics)
+        #[arg(long)]
+        threads: bool,
     },
     /// Run tests in a .kettu file
     Test {
@@ -83,6 +86,9 @@ enum Commands {
         /// Filter tests by name
         #[arg(long)]
         filter: Option<String>,
+        /// Enable WASM threads (shared memory + atomics)
+        #[arg(long)]
+        threads: bool,
     },
     /// Start the LSP server (stdio)
     Lsp {
@@ -180,6 +186,7 @@ async fn main() {
             output,
             core,
             wasip3,
+            threads,
         } => {
             let content = match fs::read_to_string(&file) {
                 Ok(c) => c,
@@ -241,6 +248,7 @@ async fn main() {
                 core_only: core,
                 memory_pages: 1,
                 wasip3,
+                threads,
             };
 
             let wasm = if core {
@@ -311,7 +319,7 @@ async fn main() {
             }
         }
 
-        Commands::Test { file, filter } => {
+        Commands::Test { file, filter, threads } => {
             if file.is_dir() {
                 // Recursively find all .kettu files
                 use walkdir::WalkDir;
@@ -325,7 +333,7 @@ async fn main() {
                     .filter(|e| e.path().extension().map_or(false, |ext| ext == "kettu"))
                 {
                     let path = entry.path().to_path_buf();
-                    let (passed, failed) = run_tests(&path, filter.as_deref());
+                    let (passed, failed) = run_tests(&path, filter.as_deref(), threads);
                     total_passed += passed;
                     total_failed += failed;
                     files_tested += 1;
@@ -345,7 +353,7 @@ async fn main() {
                     std::process::exit(1);
                 }
             } else {
-                let (passed, failed) = run_tests(&file, filter.as_deref());
+                let (passed, failed) = run_tests(&file, filter.as_deref(), threads);
                 if failed > 0 {
                     std::process::exit(1);
                 }
@@ -365,7 +373,7 @@ fn offset_to_line(source: &str, offset: usize) -> usize {
 }
 
 /// Run tests in a Kettu file, returns (passed, failed) counts
-fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
+fn run_tests(file: &PathBuf, filter: Option<&str>, threads: bool) -> (usize, usize) {
     use kettu_parser::{Gate, InterfaceItem, TopLevelItem};
     use std::time::Instant;
     use wasmtime::{Engine, Instance, Module, Store};
@@ -444,6 +452,7 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
         core_only: true,
         memory_pages: 1,
         wasip3: false,
+        threads,
     };
 
     let wasm_bytes = match kettu_codegen::build_core_module(&ast, &compile_options) {
@@ -455,7 +464,14 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
     };
 
     // Create wasmtime engine and module
-    let engine = Engine::default();
+    let engine = if threads {
+        let mut config = wasmtime::Config::new();
+        config.wasm_threads(true);
+        config.shared_memory(true);
+        Engine::new(&config).expect("failed to create wasmtime engine")
+    } else {
+        Engine::default()
+    };
     let module = match Module::new(&engine, &wasm_bytes) {
         Ok(m) => m,
         Err(e) => {

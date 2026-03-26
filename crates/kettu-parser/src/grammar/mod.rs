@@ -751,6 +751,7 @@ pub struct FuncBody {
 #[derive(Debug, Clone, PartialEq, Rule)]
 pub enum Stmt {
     Let(LetStmt),
+    SharedLet(SharedLetStmt),
     Assign(AssignStmt),
     ReturnValue(ReturnValueStmt),
     ReturnVoid(ReturnVoidStmt),
@@ -763,6 +764,21 @@ pub enum Stmt {
 pub struct LetStmt {
     #[leaf("let")]
     _kw: (),
+    #[leaf(KIdent)]
+    pub name: Spanned<String>,
+    #[leaf("=")]
+    _eq: (),
+    pub value: Spanned<Expr>,
+    #[leaf(";")]
+    _semi: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SharedLetStmt {
+    #[leaf("shared")]
+    _shared_kw: (),
+    #[leaf("let")]
+    _let_kw: (),
     #[leaf(KIdent)]
     pub name: Spanned<String>,
     #[leaf("=")]
@@ -963,6 +979,21 @@ pub enum Expr {
     None_(NoneExpr),
     Ok_(OkExpr),
     Err_(ErrExpr),
+
+    // Atomic operations
+    AtomicLoad(AtomicLoadExpr),
+    AtomicStore(AtomicStoreExpr),
+    AtomicAdd(AtomicAddExpr),
+    AtomicSub(AtomicSubExpr),
+    AtomicCmpxchg(AtomicCmpxchgExpr),
+    AtomicWait(AtomicWaitExpr),
+    AtomicNotify(AtomicNotifyExpr),
+
+    // Thread spawning
+    Spawn(SpawnExpr),
+
+    // Atomic block sugar
+    AtomicBlock(AtomicBlockExpr),
 }
 
 /// Arguments for a function call: `(arg1, arg2, ...)`
@@ -1371,6 +1402,159 @@ pub struct ErrExpr {
     pub value: Spanned<Box<Expr>>,
     #[leaf(")")]
     _rp: (),
+}
+
+// ── Atomic operations ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicLoadExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("load")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub addr: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicStoreExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("store")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub addr: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c1: (),
+    pub value: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicAddExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("add")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub addr: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c1: (),
+    pub value: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicSubExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("sub")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub addr: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c1: (),
+    pub value: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicCmpxchgExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("cmpxchg")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub addr: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c1: (),
+    pub expected: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c2: (),
+    pub replacement: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicWaitExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("wait")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub addr: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c1: (),
+    pub expected: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c2: (),
+    pub timeout: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicNotifyExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("notify")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub addr: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c1: (),
+    pub count: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SpawnExpr {
+    #[leaf("spawn")]
+    _kw: (),
+    #[leaf("{")]
+    _lb: (),
+    pub body: Vec<Spanned<Stmt>>,
+    #[leaf("}")]
+    _rb: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicBlockExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf("{")]
+    _lb: (),
+    pub body: Vec<Spanned<Stmt>>,
+    #[leaf("}")]
+    _rb: (),
 }
 
 // ============================================================================

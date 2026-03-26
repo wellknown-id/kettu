@@ -265,6 +265,8 @@ pub enum Statement {
     Break { condition: Option<Box<Expr>> },
     /// `continue;` or `continue if cond;` - skip to next iteration
     Continue { condition: Option<Box<Expr>> },
+    /// `shared let name = expr;` — allocate shared memory for atomic access
+    SharedLet { name: Id, initial_value: Expr },
 }
 
 /// Part of an interpolated string
@@ -448,6 +450,24 @@ pub enum Expr {
     /// Await expression: `await expr`
     /// Suspends until the future completes and returns its value
     Await { expr: Box<Expr>, span: Span },
+    /// Atomic load: `atomic.load(addr)` - atomically reads i32 from shared memory
+    AtomicLoad { addr: Box<Expr>, span: Span },
+    /// Atomic store: `atomic.store(addr, value)` - atomically writes i32 to shared memory
+    AtomicStore { addr: Box<Expr>, value: Box<Expr>, span: Span },
+    /// Atomic add: `atomic.add(addr, value)` - atomically adds and returns old value
+    AtomicAdd { addr: Box<Expr>, value: Box<Expr>, span: Span },
+    /// Atomic sub: `atomic.sub(addr, value)` - atomically subtracts and returns old value
+    AtomicSub { addr: Box<Expr>, value: Box<Expr>, span: Span },
+    /// Atomic compare-exchange: `atomic.cmpxchg(addr, expected, new)` - returns old value
+    AtomicCmpxchg { addr: Box<Expr>, expected: Box<Expr>, replacement: Box<Expr>, span: Span },
+    /// Atomic wait: `atomic.wait(addr, expected, timeout_ns)` - blocks until notified
+    AtomicWait { addr: Box<Expr>, expected: Box<Expr>, timeout: Box<Expr>, span: Span },
+    /// Atomic notify: `atomic.notify(addr, count)` - wakes waiting threads
+    AtomicNotify { addr: Box<Expr>, count: Box<Expr>, span: Span },
+    /// Spawn: `spawn { body }` - runs body on a new thread
+    Spawn { body: Vec<Statement>, span: Span },
+    /// Atomic block: `atomic { stmts }` - sugar for atomic operations on shared vars
+    AtomicBlock { body: Vec<Statement>, span: Span },
 }
 
 /// Pattern for match arms

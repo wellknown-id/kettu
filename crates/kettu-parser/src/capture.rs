@@ -196,6 +196,36 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
         Expr::Await { expr, .. } => {
             analyze_captures(expr, scope);
         }
+        Expr::AtomicLoad { addr, .. } => {
+            analyze_captures(addr, scope);
+        }
+        Expr::AtomicStore { addr, value, .. }
+        | Expr::AtomicAdd { addr, value, .. }
+        | Expr::AtomicSub { addr, value, .. }
+        | Expr::AtomicNotify { addr, count: value, .. } => {
+            analyze_captures(addr, scope);
+            analyze_captures(value, scope);
+        }
+        Expr::AtomicCmpxchg { addr, expected, replacement, .. } => {
+            analyze_captures(addr, scope);
+            analyze_captures(expected, scope);
+            analyze_captures(replacement, scope);
+        }
+        Expr::AtomicWait { addr, expected, timeout, .. } => {
+            analyze_captures(addr, scope);
+            analyze_captures(expected, scope);
+            analyze_captures(timeout, scope);
+        }
+        Expr::Spawn { body, .. } => {
+            for stmt in body {
+                analyze_statement(stmt, scope);
+            }
+        }
+        Expr::AtomicBlock { body, .. } => {
+            for stmt in body {
+                analyze_statement(stmt, scope);
+            }
+        }
         // Terminals - no recursion needed
         Expr::Integer(_, _) | Expr::Bool(_, _) | Expr::String(_, _) | Expr::Ident(_) => {}
     }
@@ -212,6 +242,7 @@ fn analyze_statement(stmt: &mut Statement, scope: &HashSet<String>) {
         Statement::Break { condition: None } => {}
         Statement::Continue { condition: Some(e) } => analyze_captures(e, scope),
         Statement::Continue { condition: None } => {}
+        Statement::SharedLet { initial_value, .. } => analyze_captures(initial_value, scope),
     }
 }
 
@@ -394,6 +425,36 @@ fn collect_free_variables(expr: &Expr, bound: &HashSet<String>, free: &mut HashS
         Expr::Await { expr, .. } => {
             collect_free_variables(expr, bound, free);
         }
+        Expr::AtomicLoad { addr, .. } => {
+            collect_free_variables(addr, bound, free);
+        }
+        Expr::AtomicStore { addr, value, .. }
+        | Expr::AtomicAdd { addr, value, .. }
+        | Expr::AtomicSub { addr, value, .. }
+        | Expr::AtomicNotify { addr, count: value, .. } => {
+            collect_free_variables(addr, bound, free);
+            collect_free_variables(value, bound, free);
+        }
+        Expr::AtomicCmpxchg { addr, expected, replacement, .. } => {
+            collect_free_variables(addr, bound, free);
+            collect_free_variables(expected, bound, free);
+            collect_free_variables(replacement, bound, free);
+        }
+        Expr::AtomicWait { addr, expected, timeout, .. } => {
+            collect_free_variables(addr, bound, free);
+            collect_free_variables(expected, bound, free);
+            collect_free_variables(timeout, bound, free);
+        }
+        Expr::Spawn { body, .. } => {
+            for stmt in body {
+                collect_free_in_statement(stmt, bound, free);
+            }
+        }
+        Expr::AtomicBlock { body, .. } => {
+            for stmt in body {
+                collect_free_in_statement(stmt, bound, free);
+            }
+        }
         // Terminals
         Expr::Integer(_, _) | Expr::Bool(_, _) | Expr::String(_, _) => {}
     }
@@ -414,6 +475,9 @@ fn collect_free_in_statement(
         Statement::Break { condition: None } => {}
         Statement::Continue { condition: Some(e) } => collect_free_variables(e, bound, free),
         Statement::Continue { condition: None } => {}
+        Statement::SharedLet { initial_value, .. } => {
+            collect_free_variables(initial_value, bound, free)
+        }
     }
 }
 

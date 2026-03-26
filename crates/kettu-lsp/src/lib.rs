@@ -1305,7 +1305,8 @@ fn collect_let_bindings_before(
             Statement::Assign { .. }
             | Statement::Return(None)
             | Statement::Break { .. }
-            | Statement::Continue { .. } => {}
+            | Statement::Continue { .. }
+            | Statement::SharedLet { .. } => {}
         }
     }
 }

@@ -518,6 +518,10 @@ fn stmt(cst: &grammar::Stmt) -> ast::Statement {
         grammar::Stmt::Break(_) => ast::Statement::Break { condition: None },
         grammar::Stmt::Continue(_) => ast::Statement::Continue { condition: None },
         grammar::Stmt::Expr(e) => ast::Statement::Expr(sexpr_flat(&e.expr)),
+        grammar::Stmt::SharedLet(s) => ast::Statement::SharedLet {
+            name: spanned_id(&s.name),
+            initial_value: sexpr_flat(&s.value),
+        },
     }
 }
 
@@ -833,6 +837,56 @@ fn expr_with_span(cst: &grammar::Expr, outer_span: Range<usize>) -> ast::Expr {
             type_name: None,
             case_name: ast::Id::new("err", outer_span.clone()),
             payload: Some(Box::new(sexpr(&e.value))),
+            span: outer_span,
+        },
+
+        // Atomic operations
+        grammar::Expr::AtomicLoad(a) => ast::Expr::AtomicLoad {
+            addr: Box::new(sexpr(&a.addr)),
+            span: outer_span,
+        },
+        grammar::Expr::AtomicStore(a) => ast::Expr::AtomicStore {
+            addr: Box::new(sexpr(&a.addr)),
+            value: Box::new(sexpr(&a.value)),
+            span: outer_span,
+        },
+        grammar::Expr::AtomicAdd(a) => ast::Expr::AtomicAdd {
+            addr: Box::new(sexpr(&a.addr)),
+            value: Box::new(sexpr(&a.value)),
+            span: outer_span,
+        },
+        grammar::Expr::AtomicSub(a) => ast::Expr::AtomicSub {
+            addr: Box::new(sexpr(&a.addr)),
+            value: Box::new(sexpr(&a.value)),
+            span: outer_span,
+        },
+        grammar::Expr::AtomicCmpxchg(a) => ast::Expr::AtomicCmpxchg {
+            addr: Box::new(sexpr(&a.addr)),
+            expected: Box::new(sexpr(&a.expected)),
+            replacement: Box::new(sexpr(&a.replacement)),
+            span: outer_span,
+        },
+        grammar::Expr::AtomicWait(a) => ast::Expr::AtomicWait {
+            addr: Box::new(sexpr(&a.addr)),
+            expected: Box::new(sexpr(&a.expected)),
+            timeout: Box::new(sexpr(&a.timeout)),
+            span: outer_span,
+        },
+        grammar::Expr::AtomicNotify(a) => ast::Expr::AtomicNotify {
+            addr: Box::new(sexpr(&a.addr)),
+            count: Box::new(sexpr(&a.count)),
+            span: outer_span,
+        },
+
+        // Thread spawning
+        grammar::Expr::Spawn(s) => ast::Expr::Spawn {
+            body: s.body.iter().map(spanned_stmt).collect(),
+            span: outer_span,
+        },
+
+        // Atomic block sugar
+        grammar::Expr::AtomicBlock(a) => ast::Expr::AtomicBlock {
+            body: a.body.iter().map(spanned_stmt).collect(),
             span: outer_span,
         },
     }

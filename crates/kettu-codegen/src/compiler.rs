@@ -46,6 +46,8 @@ pub struct CompileOptions {
     /// - Async functions return i32 status code instead of result
     /// - Results passed via task.return canonical built-in
     pub wasip3: bool,
+    /// If true, enable shared memory and thread-spawn support
+    pub threads: bool,
 }
 
 /// Compilation error
@@ -135,6 +137,9 @@ struct ModuleCompiler<'a> {
     subtask_drop_idx: Option<u32>,
     /// Next state memory offset (for saving async state between callbacks)
     async_state_offset: u32,
+    spawn_bodies: Vec<(u32, u32, Vec<Statement>)>,
+    thread_spawn_idx: Option<u32>,
+    next_spawn_id: u32,
 }
 
 impl<'a> ModuleCompiler<'a> {
@@ -163,6 +168,9 @@ impl<'a> ModuleCompiler<'a> {
             waitable_set_wait_idx: None,
             subtask_drop_idx: None,
             async_state_offset: 0,
+            spawn_bodies: Vec::new(),
+            thread_spawn_idx: None,
+            next_spawn_id: 0,
         }
     }
     /// Register an imported interface's functions for qualified calls
@@ -332,6 +340,32 @@ impl<'a> ModuleCompiler<'a> {
         }
         let _has_callbacks = !compiled_callbacks.is_empty();
 
+        // Phase 4c: Compile spawn bodies
+        let spawn_bodies_clone = std::mem::take(&mut self.spawn_bodies);
+        let mut compiled_spawns: Vec<Function> = Vec::new();
+        for (_, _, body_stmts) in &spawn_bodies_clone {
+            let locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();
+            let locals: HashMap<String, u32> = HashMap::new();
+            let mut func = Function::new(vec![]);
+            for stmt in body_stmts {
+                match stmt {
+                    Statement::Expr(e) => {
+                        self.compile_expr_with_locals(&mut func, e, &locals, &locals_types)?;
+                        func.instruction(&Instruction::Drop);
+                    }
+                    Statement::Let { name: _, value, .. } => {
+                        self.compile_expr_with_locals(&mut func, value, &locals, &locals_types)?;
+                        func.instruction(&Instruction::Drop);
+                    }
+                    _ => {}
+                }
+            }
+            func.instruction(&Instruction::End);
+            compiled_spawns.push(func);
+        }
+        self.spawn_bodies = spawn_bodies_clone;
+        let has_spawns = !compiled_spawns.is_empty();
+
         // Phase 5: Emit WASM sections in correct order
         let mut module = Module::new();
 
@@ -430,6 +464,13 @@ impl<'a> ModuleCompiler<'a> {
                 }
             }
         }
+
+        // Add thread_spawn import when spawn expressions are used
+        if self.thread_spawn_idx.is_some() {
+            let type_idx = self.get_or_create_type(&[ValType::I32], &[ValType::I32]);
+            imports.import("wasi", "thread-spawn", EntityType::Function(type_idx));
+        }
+
         if self.import_count > 0 {
             module.section(&imports);
         }
@@ -465,7 +506,16 @@ impl<'a> ModuleCompiler<'a> {
         for _ in &callback_bodies_clone {
             funcs.function(callback_type_idx);
         }
-        if self.local_func_count > 0 || has_lambdas || !callback_bodies_clone.is_empty() {
+        // Spawn body function types
+        let spawn_void_t = self.get_or_create_type(&[], &[]);
+        for _ in &self.spawn_bodies {
+            funcs.function(spawn_void_t);
+        }
+        if has_spawns {
+            let wts_t = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
+            funcs.function(wts_t);
+        }
+        if self.local_func_count > 0 || has_lambdas || !callback_bodies_clone.is_empty() || has_spawns {
             module.section(&funcs);
         }
 
@@ -512,6 +562,14 @@ impl<'a> ModuleCompiler<'a> {
             exports.export(name, ExportKind::Func, *func_idx);
         }
         exports.export("memory", ExportKind::Memory, 0);
+        if has_spawns {
+            let wts_idx = self.import_count
+                + self.local_func_count
+                + self.lambda_bodies.len() as u32
+                + callback_bodies_clone.len() as u32
+                + self.spawn_bodies.len() as u32;
+            exports.export("wasi_thread_start", ExportKind::Func, wts_idx);
+        }
         module.section(&exports);
 
         // 8. Element section (populate function table)
@@ -1169,6 +1227,21 @@ impl<'a> ModuleCompiler<'a> {
         func_idx
     }
 
+
+    /// Ensure thread-spawn import exists, return its function index
+    fn ensure_thread_spawn_import(&mut self) -> u32 {
+        if let Some(idx) = self.thread_spawn_idx {
+            return idx;
+        }
+        let type_idx = self.get_or_create_type(&[ValType::I32], &[ValType::I32]);
+        let func_idx = self.import_count;
+        self.import_count += 1;
+        self.functions
+            .insert("$thread_spawn".to_string(), (type_idx, func_idx, true));
+        self.thread_spawn_idx = Some(func_idx);
+        func_idx
+    }
+
     /// Count the number of await points in a function body
     fn count_await_points_in_func(func: &Func) -> usize {
         fn count_in_expr(expr: &Expr) -> usize {
@@ -1253,6 +1326,12 @@ impl<'a> ModuleCompiler<'a> {
                     })
                     .sum(),
                 // Leaf expressions - no sub-expressions
+                Expr::AtomicLoad { .. } | Expr::AtomicStore { .. } | Expr::AtomicAdd { .. }
+                | Expr::AtomicSub { .. } | Expr::AtomicCmpxchg { .. }
+                | Expr::AtomicWait { .. } | Expr::AtomicNotify { .. } => 0,
+                Expr::Spawn { body, .. } | Expr::AtomicBlock { body, .. } => {
+                    body.iter().map(count_in_stmt).sum()
+                }
                 Expr::Ident(_) | Expr::Integer(_, _) | Expr::String(_, _) | Expr::Bool(_, _) => 0,
             }
         }
@@ -1264,6 +1343,7 @@ impl<'a> ModuleCompiler<'a> {
                 Statement::Assign { value, .. } => count_in_expr(value),
                 Statement::Return(Some(e)) => count_in_expr(e),
                 Statement::Return(None) | Statement::Break { .. } | Statement::Continue { .. } => 0,
+                Statement::SharedLet { initial_value, .. } => count_in_expr(initial_value),
             }
         }
 
@@ -1661,6 +1741,11 @@ impl<'a> ModuleCompiler<'a> {
                             function.instruction(&Instruction::I32Const(0));
                         }
                     }
+                    Statement::SharedLet { .. } => {
+                        if (func.is_async && self.options.wasip3) || func.result.is_some() {
+                            function.instruction(&Instruction::I32Const(0));
+                        }
+                    }
                 }
             } else if (func.is_async && self.options.wasip3) || func.result.is_some() {
                 // Empty body - push default value (0 for async status or sync result)
@@ -1748,6 +1833,17 @@ impl<'a> ModuleCompiler<'a> {
             Statement::Break { .. } | Statement::Continue { .. } => {
                 // These only make sense inside while loops; handled there
             }
+            Statement::SharedLet { name: _name, initial_value } => {
+                let offset = self.string_offset;
+                self.string_offset += 4;
+                function.instruction(&Instruction::I32Const(offset as i32));
+                self.compile_expr_with_locals(function, initial_value, locals, locals_types)?;
+                function.instruction(&Instruction::I32AtomicStore(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
         }
         Ok(())
     }
@@ -1783,6 +1879,7 @@ impl<'a> ModuleCompiler<'a> {
             Statement::Break { .. } | Statement::Continue { .. } => {
                 // These only make sense inside while loops; handled there
             }
+            Statement::SharedLet { .. } => {}
         }
         Ok(())
     }
@@ -2069,7 +2166,8 @@ impl<'a> ModuleCompiler<'a> {
                             compiler.compile_expr(function, value)?;
                             // Leave value on stack
                         }
-                        Statement::Break { .. } | Statement::Continue { .. } => {
+                        Statement::Break { .. } | Statement::Continue { .. }
+                        | Statement::SharedLet { .. } => {
                             // These shouldn't appear in if branches; push 0 for stack balance
                             function.instruction(&Instruction::I32Const(0));
                         }
@@ -2337,6 +2435,12 @@ impl<'a> ModuleCompiler<'a> {
             }
             Expr::Await { .. } => {
                 // Await requires async runtime support - placeholder for now
+                function.instruction(&Instruction::I32Const(0));
+            }
+            Expr::AtomicLoad { .. } | Expr::AtomicStore { .. } | Expr::AtomicAdd { .. }
+            | Expr::AtomicSub { .. } | Expr::AtomicCmpxchg { .. }
+            | Expr::AtomicWait { .. } | Expr::AtomicNotify { .. }
+            | Expr::Spawn { .. } | Expr::AtomicBlock { .. } => {
                 function.instruction(&Instruction::I32Const(0));
             }
         }
@@ -3297,7 +3401,8 @@ impl<'a> ModuleCompiler<'a> {
                                 locals_types,
                             )?;
                         }
-                        Statement::Break { .. } | Statement::Continue { .. } => {
+                        Statement::Break { .. } | Statement::Continue { .. }
+                        | Statement::SharedLet { .. } => {
                             // These shouldn't appear in if branches; push 0 for stack balance
                             function.instruction(&Instruction::I32Const(0));
                         }
@@ -3692,6 +3797,7 @@ impl<'a> ModuleCompiler<'a> {
                                 function.instruction(&Instruction::Br(0));
                             }
                         }
+                        Statement::SharedLet { .. } => {}
                     }
                 }
 
@@ -3844,6 +3950,7 @@ impl<'a> ModuleCompiler<'a> {
                                     function.instruction(&Instruction::Br(0));
                                 }
                             }
+                            Statement::SharedLet { .. } => {}
                         }
                     }
 
@@ -4296,6 +4403,7 @@ impl<'a> ModuleCompiler<'a> {
                                 function.instruction(&Instruction::Br(0));
                             }
                         }
+                        Statement::SharedLet { .. } => {}
                     }
                 }
 
@@ -4448,6 +4556,99 @@ impl<'a> ModuleCompiler<'a> {
                     self.compile_expr_with_locals(function, expr, locals, locals_types)?;
                 }
             }
+            Expr::Spawn { body, .. } => {
+                let spawn_id = self.next_spawn_id;
+                self.next_spawn_id += 1;
+                let func_idx = 0u32;
+                self.spawn_bodies.push((spawn_id, func_idx, body.clone()));
+                let thread_spawn_idx = self.ensure_thread_spawn_import();
+                function.instruction(&Instruction::I32Const(spawn_id as i32));
+                function.instruction(&Instruction::Call(thread_spawn_idx));
+            }
+            Expr::AtomicLoad { addr, .. } => {
+                self.compile_expr_with_locals(function, addr, locals, locals_types)?;
+                function.instruction(&Instruction::I32AtomicLoad(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            Expr::AtomicStore { addr, value, .. } => {
+                self.compile_expr_with_locals(function, addr, locals, locals_types)?;
+                self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                function.instruction(&Instruction::I32AtomicStore(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+                function.instruction(&Instruction::I32Const(0)); // store returns nothing, push dummy
+            }
+            Expr::AtomicAdd { addr, value, .. } => {
+                self.compile_expr_with_locals(function, addr, locals, locals_types)?;
+                self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                function.instruction(&Instruction::I32AtomicRmwAdd(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            Expr::AtomicSub { addr, value, .. } => {
+                self.compile_expr_with_locals(function, addr, locals, locals_types)?;
+                self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                function.instruction(&Instruction::I32AtomicRmwSub(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            Expr::AtomicCmpxchg { addr, expected, replacement, .. } => {
+                self.compile_expr_with_locals(function, addr, locals, locals_types)?;
+                self.compile_expr_with_locals(function, expected, locals, locals_types)?;
+                self.compile_expr_with_locals(function, replacement, locals, locals_types)?;
+                function.instruction(&Instruction::I32AtomicRmwCmpxchg(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            Expr::AtomicWait { addr, expected, timeout, .. } => {
+                self.compile_expr_with_locals(function, addr, locals, locals_types)?;
+                self.compile_expr_with_locals(function, expected, locals, locals_types)?;
+                self.compile_expr_with_locals(function, timeout, locals, locals_types)?;
+                function.instruction(&Instruction::MemoryAtomicWait32(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            Expr::AtomicNotify { addr, count, .. } => {
+                self.compile_expr_with_locals(function, addr, locals, locals_types)?;
+                self.compile_expr_with_locals(function, count, locals, locals_types)?;
+                function.instruction(&Instruction::MemoryAtomicNotify(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            Expr::AtomicBlock { body, .. } => {
+                if body.is_empty() {
+                    function.instruction(&Instruction::I32Const(0));
+                } else {
+                    let mut locals_types_mut = locals_types.clone();
+                    for stmt in &body[..body.len() - 1] {
+                        self.compile_statement_with_locals(function, stmt, locals, &mut locals_types_mut)?;
+                    }
+                    match &body[body.len() - 1] {
+                        Statement::Expr(expr) => {
+                            self.compile_expr_with_locals(function, expr, locals, locals_types)?;
+                        }
+                        _ => {
+                            self.compile_statement_with_locals(function, &body[body.len() - 1], locals, &mut locals_types_mut)?;
+                            function.instruction(&Instruction::I32Const(0));
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -4532,6 +4733,72 @@ mod tests {
         let options = CompileOptions::default();
         let wasm = compile_module(&ast, &options).expect("Should compile");
 
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+    }
+
+    #[test]
+    fn test_compile_shared_let() {
+        let source = r#"
+            package local:test;
+
+            interface effects {
+                go: func() -> s32 {
+                    shared let counter = 0;
+                    0;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("shared let should compile");
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+    }
+
+    #[test]
+    fn test_compile_atomic_block() {
+        let source = r#"
+            package local:test;
+
+            interface effects {
+                go: func() -> s32 {
+                    atomic {
+                        42;
+                    };
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("atomic block should compile");
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+    }
+
+    #[test]
+    fn test_compile_shared_let_with_atomic_block() {
+        let source = r#"
+            package local:test;
+
+            interface effects {
+                inc: func() -> s32 {
+                    shared let counter = 0;
+                    atomic {
+                        1;
+                    };
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("shared let + atomic should compile");
         assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
     }
 }
