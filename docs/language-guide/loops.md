@@ -71,23 +71,20 @@ for item in arr {
 
 ## Break & Continue
 
-Exit or skip iterations:
+> **Note:** `break` and `continue` are recognized by the parser but codegen support is not yet complete. Use loop conditions instead:
 
 ```kettu
-// Break exits the loop
-while true {
-    break;
+// Instead of break, use the while condition
+let i = 0;
+while i < 10 {
+    i += 1;
 };
 
-// Conditional break
-for i in 0 to 100 {
-    break if i > 10;
-};
-
-// Continue skips to next iteration
+// Instead of continue with a skip, use if-else
 for i in 0 to 10 {
-    continue if i == 5;
-    process(i);
+    if i != 5 {
+        process(i);
+    };
 };
 ```
 

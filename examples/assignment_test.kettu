@@ -1,0 +1,48 @@
+// Assignment Tests
+// Tests for reassignment and compound assignment operators
+package local:assignment-tests;
+
+interface assignment-tests {
+    @test
+    test-reassign: func() -> bool {
+        let x = 10;
+        x = 42;
+        x == 42;
+    }
+
+    @test
+    test-add-assign: func() -> bool {
+        let x = 10;
+        x += 5;
+        x == 15;
+    }
+
+    @test
+    test-sub-assign: func() -> bool {
+        let x = 20;
+        x -= 8;
+        x == 12;
+    }
+
+    @test
+    test-multiple-assigns: func() -> bool {
+        let x = 0;
+        x += 10;
+        x += 20;
+        x -= 5;
+        x == 25;
+    }
+
+    @test
+    test-assign-from-expr: func() -> bool {
+        let a = 3;
+        let b = 7;
+        let result = 0;
+        result = a * b;
+        result == 21;
+    }
+}
+
+world tests {
+    export assignment-tests;
+}
