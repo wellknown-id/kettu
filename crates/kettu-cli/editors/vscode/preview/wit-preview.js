@@ -5,7 +5,7 @@
     { regex: /\/\*[\s\S]*?\*\//g, cls: 'wit-comment' },
     { regex: /"[^"]*"/g, cls: 'wit-string' },
     { regex: /@|@since|@unstable|@deprecated|@test/g, cls: 'wit-decorator' },
-    { regex: /\b(?:package|use|as|version|feature|interface|record|variant|enum|flags|type|resource|constructor|static|func|bool|char|string|list|option|result|tuple|future|stream|async|let|return|break|continue|true|false|assert|await|if|else|while|for|in|to|downto|step|match|_|map|filter|reduce|some|none|ok|err|world|import|export|include)\b/g, cls: 'wit-keyword' },
+    { regex: /(?<![a-zA-Z0-9_-])(?:package|use|as|version|feature|interface|record|variant|enum|flags|type|resource|constructor|static|func|bool|char|string|list|option|result|tuple|future|stream|async|let|return|break|continue|true|false|assert|await|if|else|while|for|in|to|downto|step|match|_|map|filter|reduce|some|none|ok|err|world|import|export|include)(?![a-zA-Z0-9_-])/g, cls: 'wit-keyword' },
     { regex: /[0-9]+/g, cls: 'wit-number' },
   ];
 
