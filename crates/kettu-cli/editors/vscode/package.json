@@ -60,10 +60,12 @@
             }
         ],
         "markdown.previewScripts": [
-            "./preview/kettu-preview.js"
+            "./preview/kettu-preview.js",
+            "./preview/wit-preview.js"
         ],
         "markdown.previewStyles": [
-            "./preview/kettu-preview.css"
+            "./preview/kettu-preview.css",
+            "./preview/wit-preview.css"
         ],
         "iconThemes": [
             {
