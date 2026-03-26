@@ -261,6 +261,8 @@ pub enum Statement {
     Return(Option<Expr>),
     /// `name = expr;` (assignment to existing variable)
     Assign { name: Id, value: Expr },
+    /// `name += expr;` or `name -= expr;` (compound assignment)
+    CompoundAssign { name: Id, op: BinOp, value: Expr },
     /// `break;` or `break if cond;` - exit the innermost loop
     Break { condition: Option<Box<Expr>> },
     /// `continue;` or `continue if cond;` - skip to next iteration

@@ -753,6 +753,8 @@ pub enum Stmt {
     Let(LetStmt),
     SharedLet(SharedLetStmt),
     Assign(AssignStmt),
+    AddAssign(AddAssignStmt),
+    SubAssign(SubAssignStmt),
     ReturnValue(ReturnValueStmt),
     ReturnVoid(ReturnVoidStmt),
     Break(BreakStmt),
@@ -794,6 +796,28 @@ pub struct AssignStmt {
     pub name: Spanned<String>,
     #[leaf("=")]
     _eq: (),
+    pub value: Spanned<Expr>,
+    #[leaf(";")]
+    _semi: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AddAssignStmt {
+    #[leaf(KIdent)]
+    pub name: Spanned<String>,
+    #[leaf("+=")]
+    _op: (),
+    pub value: Spanned<Expr>,
+    #[leaf(";")]
+    _semi: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SubAssignStmt {
+    #[leaf(KIdent)]
+    pub name: Spanned<String>,
+    #[leaf("-=")]
+    _op: (),
     pub value: Spanned<Expr>,
     #[leaf(";")]
     _semi: (),

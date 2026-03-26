@@ -814,4 +814,80 @@ mod tests {
             _ => panic!("expected let binding with thread.join"),
         }
     }
+
+    // ================================================================
+    // Phase 13g: Compound assignments and atomic desugaring
+    // ================================================================
+
+    #[test]
+    fn test_compound_assign_add_parse() {
+        let src = "interface i {\n  f: func() {\n    let x = 0;\n    x += 1;\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[1] {
+            crate::ast::Statement::CompoundAssign { name, op, .. } => {
+                assert_eq!(name.name, "x");
+                assert_eq!(*op, crate::ast::BinOp::Add);
+            }
+            other => panic!("expected CompoundAssign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_compound_assign_sub_parse() {
+        let src = "interface i {\n  f: func() {\n    let x = 10;\n    x -= 3;\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[1] {
+            crate::ast::Statement::CompoundAssign { name, op, .. } => {
+                assert_eq!(name.name, "x");
+                assert_eq!(*op, crate::ast::BinOp::Sub);
+            }
+            other => panic!("expected CompoundAssign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_atomic_block_with_compound_assign() {
+        let src = "interface i {\n  f: func() {\n    shared let counter = 0;\n    atomic { counter += 1; };\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[1] {
+            crate::ast::Statement::Expr(crate::ast::Expr::AtomicBlock { body, .. }) => {
+                assert_eq!(body.len(), 1);
+                assert!(matches!(&body[0], crate::ast::Statement::CompoundAssign { .. }));
+            }
+            other => panic!("expected AtomicBlock with CompoundAssign, got {:?}", other),
+        }
+    }
 }

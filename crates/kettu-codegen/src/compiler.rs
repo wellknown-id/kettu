@@ -3,8 +3,8 @@
 //! Compiles Kettu AST (with function bodies) into a core WASM module.
 
 use kettu_parser::{
-    Expr, Func, FuncBody, InterfaceItem, Param, Pattern, PrimitiveTy, ResourceMethod, Statement,
-    StringPart, TopLevelItem, Ty, TypeDef, TypeDefKind, WitFile,
+    BinOp, Expr, Func, FuncBody, InterfaceItem, Param, Pattern, PrimitiveTy, ResourceMethod,
+    Statement, StringPart, TopLevelItem, Ty, TypeDef, TypeDefKind, WitFile,
 };
 use std::collections::HashMap;
 use wasm_encoder::{
@@ -140,6 +140,8 @@ struct ModuleCompiler<'a> {
     spawn_bodies: Vec<(u32, u32, Vec<Statement>)>,
     thread_spawn_idx: Option<u32>,
     next_spawn_id: u32,
+    /// Tracks which variables are shared memory handles (for atomic block desugaring)
+    shared_locals: std::collections::HashSet<String>,
 }
 
 impl<'a> ModuleCompiler<'a> {
@@ -171,6 +173,7 @@ impl<'a> ModuleCompiler<'a> {
             spawn_bodies: Vec::new(),
             thread_spawn_idx: None,
             next_spawn_id: 0,
+            shared_locals: std::collections::HashSet::new(),
         }
     }
     /// Register an imported interface's functions for qualified calls
@@ -1341,7 +1344,7 @@ impl<'a> ModuleCompiler<'a> {
             match stmt {
                 Statement::Expr(e) => count_in_expr(e),
                 Statement::Let { value, .. } => count_in_expr(value),
-                Statement::Assign { value, .. } => count_in_expr(value),
+                Statement::Assign { value, .. } | Statement::CompoundAssign { value, .. } => count_in_expr(value),
                 Statement::Return(Some(e)) => count_in_expr(e),
                 Statement::Return(None) | Statement::Break { .. } | Statement::Continue { .. } => 0,
                 Statement::SharedLet { initial_value, .. } => count_in_expr(initial_value),
@@ -1610,11 +1613,13 @@ impl<'a> ModuleCompiler<'a> {
                     Statement::Expr(e) => {
                         collect_locals_from_expr(e, params_len, locals, let_count);
                     }
-                    Statement::Assign { value, .. } => {
+                    Statement::Assign { value, .. } | Statement::CompoundAssign { value, .. } => {
                         collect_locals_from_expr(value, params_len, locals, let_count);
                     }
-                    Statement::Return(Some(e)) => {
-                        collect_locals_from_expr(e, params_len, locals, let_count);
+                    Statement::SharedLet { name, initial_value } => {
+                        locals.insert(name.name.clone(), params_len as u32 + *let_count);
+                        *let_count += 1;
+                        collect_locals_from_expr(initial_value, params_len, locals, let_count);
                     }
                     _ => {}
                 }
@@ -1652,6 +1657,22 @@ impl<'a> ModuleCompiler<'a> {
                 // Last statement: if it's an expression, leave value on stack for return
                 let last = &stmts[stmts.len() - 1];
                 match last {
+                    Statement::CompoundAssign { name, op, value } => {
+                        // Compile as: local.get + value + op + local.set
+                        if let Some(&idx) = locals.get(&name.name) {
+                            function.instruction(&Instruction::LocalGet(idx));
+                        }
+                        self.compile_expr_with_locals(&mut function, value, &locals, &locals_types)?;
+                        match op {
+                            BinOp::Add => function.instruction(&Instruction::I32Add),
+                            BinOp::Sub => function.instruction(&Instruction::I32Sub),
+                            _ => function.instruction(&Instruction::I32Add),
+                        };
+                        if let Some(&idx) = locals.get(&name.name) {
+                            function.instruction(&Instruction::LocalSet(idx));
+                        }
+                        function.instruction(&Instruction::I32Const(0));
+                    }
                     Statement::Expr(expr) => {
                         // Compile the expression
                         self.compile_expr_with_locals(&mut function, expr, &locals, &locals_types)?;
@@ -1831,12 +1852,28 @@ impl<'a> ModuleCompiler<'a> {
                     function.instruction(&Instruction::LocalSet(idx));
                 }
             }
+            Statement::CompoundAssign { name, op, value } => {
+                // local.get + value + binop + local.set
+                if let Some(&idx) = locals.get(&name.name) {
+                    function.instruction(&Instruction::LocalGet(idx));
+                }
+                self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                match op {
+                    BinOp::Add => { function.instruction(&Instruction::I32Add); }
+                    BinOp::Sub => { function.instruction(&Instruction::I32Sub); }
+                    _ => { function.instruction(&Instruction::I32Add); }
+                }
+                if let Some(&idx) = locals.get(&name.name) {
+                    function.instruction(&Instruction::LocalSet(idx));
+                }
+            }
             Statement::Break { .. } | Statement::Continue { .. } => {
                 // These only make sense inside while loops; handled there
             }
-            Statement::SharedLet { name: _name, initial_value } => {
+            Statement::SharedLet { name, initial_value } => {
                 let offset = self.string_offset;
                 self.string_offset += 4;
+                // Store offset in shared memory and initialize
                 function.instruction(&Instruction::I32Const(offset as i32));
                 self.compile_expr_with_locals(function, initial_value, locals, locals_types)?;
                 function.instruction(&Instruction::I32AtomicStore(wasm_encoder::MemArg {
@@ -1844,6 +1881,12 @@ impl<'a> ModuleCompiler<'a> {
                     align: 2,
                     memory_index: 0,
                 }));
+                // Store the memory offset in the local variable for later reference
+                if let Some(&idx) = locals.get(&name.name) {
+                    function.instruction(&Instruction::I32Const(offset as i32));
+                    function.instruction(&Instruction::LocalSet(idx));
+                }
+                self.shared_locals.insert(name.name.clone());
             }
         }
         Ok(())
@@ -1856,6 +1899,9 @@ impl<'a> ModuleCompiler<'a> {
         stmt: &Statement,
     ) -> Result<(), CompileError> {
         match stmt {
+            Statement::CompoundAssign { .. } => {
+                function.instruction(&Instruction::I32Const(0));
+            }
             Statement::Expr(expr) => {
                 self.compile_expr(function, expr)?;
                 // Drop the result if expression produces a value
@@ -2163,7 +2209,8 @@ impl<'a> ModuleCompiler<'a> {
                             compiler.compile_expr(function, value)?;
                             // Leave value on stack (side effect: doesn't store in local)
                         }
-                        Statement::Assign { value, .. } => {
+                        Statement::Assign { value, .. }
+                        | Statement::CompoundAssign { value, .. } => {
                             compiler.compile_expr(function, value)?;
                             // Leave value on stack
                         }
@@ -3395,7 +3442,8 @@ impl<'a> ModuleCompiler<'a> {
                                 locals_types,
                             )?;
                         }
-                        Statement::Assign { value, .. } => {
+                        Statement::Assign { value, .. }
+                        | Statement::CompoundAssign { value, .. } => {
                             compiler.compile_expr_with_locals(
                                 function,
                                 value,
@@ -3756,6 +3804,20 @@ impl<'a> ModuleCompiler<'a> {
                                 function.instruction(&Instruction::LocalSet(idx));
                             }
                         }
+                        Statement::CompoundAssign { name, op, value } => {
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalGet(idx));
+                            }
+                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                            match op {
+                                BinOp::Add => { function.instruction(&Instruction::I32Add); }
+                                BinOp::Sub => { function.instruction(&Instruction::I32Sub); }
+                                _ => { function.instruction(&Instruction::I32Add); }
+                            }
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalSet(idx));
+                            }
+                        }
                         Statement::Let { name, value } => {
                             // Compile value and store to local
                             self.compile_expr_with_locals(function, value, locals, locals_types)?;
@@ -3898,6 +3960,20 @@ impl<'a> ModuleCompiler<'a> {
                                     locals,
                                     locals_types,
                                 )?;
+                                if let Some(&idx) = locals.get(&name.name) {
+                                    function.instruction(&Instruction::LocalSet(idx));
+                                }
+                            }
+                            Statement::CompoundAssign { name, op, value } => {
+                                if let Some(&idx) = locals.get(&name.name) {
+                                    function.instruction(&Instruction::LocalGet(idx));
+                                }
+                                self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                                match op {
+                                    BinOp::Add => { function.instruction(&Instruction::I32Add); }
+                                    BinOp::Sub => { function.instruction(&Instruction::I32Sub); }
+                                    _ => { function.instruction(&Instruction::I32Add); }
+                                }
                                 if let Some(&idx) = locals.get(&name.name) {
                                     function.instruction(&Instruction::LocalSet(idx));
                                 }
@@ -4367,6 +4443,20 @@ impl<'a> ModuleCompiler<'a> {
                                 function.instruction(&Instruction::LocalSet(idx));
                             }
                         }
+                        Statement::CompoundAssign { name, op, value } => {
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalGet(idx));
+                            }
+                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                            match op {
+                                BinOp::Add => { function.instruction(&Instruction::I32Add); }
+                                BinOp::Sub => { function.instruction(&Instruction::I32Sub); }
+                                _ => { function.instruction(&Instruction::I32Add); }
+                            }
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalSet(idx));
+                            }
+                        }
                         Statement::Let { name, value } => {
                             self.compile_expr_with_locals(function, value, locals, locals_types)?;
                             if let Some(&idx) = locals.get(&name.name) {
@@ -4553,6 +4643,20 @@ impl<'a> ModuleCompiler<'a> {
                     }));
 
                     function.instruction(&Instruction::End); // if/else
+                } else if self.options.threads {
+                    // Thread-await: await tid → thread.join(tid)
+                    // Compile tid (produces flag_offset)
+                    self.compile_expr_with_locals(function, expr, locals, locals_types)?;
+                    // memory.atomic.wait32(flag_offset, expected=0, timeout=-1)
+                    function.instruction(&Instruction::I32Const(0)); // expected
+                    function.instruction(&Instruction::I64Const(-1)); // infinite timeout
+                    function.instruction(&Instruction::MemoryAtomicWait32(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    }));
+                    function.instruction(&Instruction::Drop); // discard wait result
+                    function.instruction(&Instruction::I32Const(0)); // push unit
                 } else {
                     // Sync ABI - just evaluate the expression directly
                     self.compile_expr_with_locals(function, expr, locals, locals_types)?;
@@ -4669,18 +4773,91 @@ impl<'a> ModuleCompiler<'a> {
                 } else {
                     let mut locals_types_mut = locals_types.clone();
                     for stmt in &body[..body.len() - 1] {
-                        self.compile_statement_with_locals(function, stmt, locals, &mut locals_types_mut)?;
+                        self.compile_atomic_statement(function, stmt, locals, &mut locals_types_mut)?;
                     }
                     match &body[body.len() - 1] {
                         Statement::Expr(expr) => {
-                            self.compile_expr_with_locals(function, expr, locals, locals_types)?;
+                            self.compile_atomic_expr(function, expr, locals, locals_types)?;
                         }
                         _ => {
-                            self.compile_statement_with_locals(function, &body[body.len() - 1], locals, &mut locals_types_mut)?;
+                            self.compile_atomic_statement(function, &body[body.len() - 1], locals, &mut locals_types_mut)?;
                             function.instruction(&Instruction::I32Const(0));
                         }
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a statement inside an `atomic { }` block.
+    /// Shared variables are desugared to atomic WASM instructions.
+    fn compile_atomic_statement(
+        &mut self,
+        function: &mut Function,
+        stmt: &Statement,
+        locals: &HashMap<String, u32>,
+        locals_types: &mut HashMap<String, RecordTypeInfo>,
+    ) -> Result<(), CompileError> {
+        match stmt {
+            Statement::CompoundAssign { name, op, value } if self.shared_locals.contains(&name.name) => {
+                // Desugar: shared_var += val → i32.atomic.rmw.add(offset, val)
+                if let Some(&idx) = locals.get(&name.name) {
+                    function.instruction(&Instruction::LocalGet(idx)); // push memory offset
+                }
+                self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                let memarg = wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 };
+                match op {
+                    BinOp::Add => { function.instruction(&Instruction::I32AtomicRmwAdd(memarg)); }
+                    BinOp::Sub => { function.instruction(&Instruction::I32AtomicRmwSub(memarg)); }
+                    _ => { function.instruction(&Instruction::I32AtomicRmwAdd(memarg)); }
+                }
+                function.instruction(&Instruction::Drop); // rmw returns old value; discard
+            }
+            Statement::Assign { name, value } if self.shared_locals.contains(&name.name) => {
+                // Desugar: shared_var = val → i32.atomic.store(offset, val)
+                if let Some(&idx) = locals.get(&name.name) {
+                    function.instruction(&Instruction::LocalGet(idx)); // push memory offset
+                }
+                self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                function.instruction(&Instruction::I32AtomicStore(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            // Non-shared: fall through to regular compilation
+            _ => {
+                self.compile_statement_with_locals(function, stmt, locals, locals_types)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile an expression inside an `atomic { }` block.
+    /// Bare references to shared variables desugar to atomic loads.
+    fn compile_atomic_expr(
+        &mut self,
+        function: &mut Function,
+        expr: &Expr,
+        locals: &HashMap<String, u32>,
+        locals_types: &HashMap<String, RecordTypeInfo>,
+    ) -> Result<(), CompileError> {
+        match expr {
+            Expr::Ident(id) if self.shared_locals.contains(&id.name) => {
+                // Desugar: shared_var → i32.atomic.load(offset)
+                if let Some(&idx) = locals.get(&id.name) {
+                    function.instruction(&Instruction::LocalGet(idx)); // push memory offset
+                }
+                function.instruction(&Instruction::I32AtomicLoad(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            // Non-shared: fall through to regular compilation
+            _ => {
+                self.compile_expr_with_locals(function, expr, locals, locals_types)?;
             }
         }
         Ok(())
@@ -4879,6 +5056,74 @@ mod tests {
 
         let options = CompileOptions { threads: true, ..Default::default() };
         let wasm = compile_module(&ast, &options).expect("full spawn+join should compile");
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+    }
+
+    #[test]
+    fn test_compile_compound_assign() {
+        let source = r#"
+            package local:test;
+
+            interface effects {
+                go: func() -> s32 {
+                    let x = 0;
+                    x += 5;
+                    x -= 2;
+                    x;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("compound assign should compile");
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+    }
+
+    #[test]
+    fn test_compile_atomic_block_desugaring() {
+        let source = r#"
+            package local:test;
+
+            interface effects {
+                go: func() -> s32 {
+                    shared let counter = 0;
+                    atomic { counter += 1; };
+                    let v = atomic { counter };
+                    v;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions { threads: true, ..Default::default() };
+        let wasm = compile_module(&ast, &options).expect("atomic block desugaring should compile");
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+    }
+
+    #[test]
+    fn test_compile_await_thread_id() {
+        let source = r#"
+            package local:test;
+
+            interface effects {
+                go: func() -> s32 {
+                    let tid = spawn { 1; };
+                    await tid;
+                    0;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions { threads: true, ..Default::default() };
+        let wasm = compile_module(&ast, &options).expect("await thread-id should compile");
         assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
     }
 }

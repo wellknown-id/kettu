@@ -1303,6 +1303,7 @@ fn collect_let_bindings_before(
                 collect_let_bindings_in_expr(expr, before_offset, scope, inference_ctx)
             }
             Statement::Assign { .. }
+            | Statement::CompoundAssign { .. }
             | Statement::Return(None)
             | Statement::Break { .. }
             | Statement::Continue { .. }

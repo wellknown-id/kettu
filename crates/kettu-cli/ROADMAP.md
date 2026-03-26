@@ -93,6 +93,16 @@ Foundation (C): `shared<dtype>` with method syntax. Sugar (B): `shared let` + `a
 - [x] Parser: `SharedLetStmt`, `AtomicBlockExpr` grammar rules + CST→AST conversion
 - [x] 14 concurrency tests (5 parser, 6 checker, 3 codegen)[^1]
 
+### Phase 13g: Syntactic Sugar for Thread Ops ✓
+
+- [x] Compound assignments: `x += val;` / `x -= val;` (`Statement::CompoundAssign`)
+- [x] Atomic block desugaring: `atomic { counter += 1; }` → `i32.atomic.rmw.add`
+- [x] Atomic block desugaring: `atomic { counter }` → `i32.atomic.load`
+- [x] Atomic block desugaring: `atomic { counter = val; }` → `i32.atomic.store`
+- [x] `SharedLet` now allocates WASM local for memory offset (enables desugaring)
+- [x] `await tid` → `thread.join(tid)` via `memory.atomic.wait32`
+- [x] 6 new tests (3 parser, 3 codegen)
+
 ### Phase 14: SIMD
 
 - [ ] `v128` type support

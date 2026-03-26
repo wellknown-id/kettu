@@ -744,6 +744,16 @@ impl Checker {
                 // Check the value expression
                 self.check_expr(value);
             }
+            Statement::CompoundAssign { name, value, .. } => {
+                if !self.locals.contains_key(&name.name) {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("Cannot assign to undefined variable: {}", name.name),
+                        name.span.clone(),
+                        DiagnosticCode::UnknownVariable,
+                    ));
+                }
+                self.check_expr(value);
+            }
             Statement::Break { condition } | Statement::Continue { condition } => {
                 // Check condition if present (should be bool)
                 if let Some(cond) = condition {

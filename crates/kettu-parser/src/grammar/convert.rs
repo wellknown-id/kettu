@@ -513,6 +513,16 @@ fn stmt(cst: &grammar::Stmt) -> ast::Statement {
             name: spanned_id(&a.name),
             value: sexpr_flat(&a.value),
         },
+        grammar::Stmt::AddAssign(a) => ast::Statement::CompoundAssign {
+            name: spanned_id(&a.name),
+            op: ast::BinOp::Add,
+            value: sexpr_flat(&a.value),
+        },
+        grammar::Stmt::SubAssign(a) => ast::Statement::CompoundAssign {
+            name: spanned_id(&a.name),
+            op: ast::BinOp::Sub,
+            value: sexpr_flat(&a.value),
+        },
         grammar::Stmt::ReturnValue(r) => ast::Statement::Return(Some(sexpr_flat(&r.value))),
         grammar::Stmt::ReturnVoid(_) => ast::Statement::Return(None),
         grammar::Stmt::Break(_) => ast::Statement::Break { condition: None },

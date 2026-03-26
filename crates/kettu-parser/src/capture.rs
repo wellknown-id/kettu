@@ -239,6 +239,7 @@ fn analyze_statement(stmt: &mut Statement, scope: &HashSet<String>) {
         Statement::Expr(e) => analyze_captures(e, scope),
         Statement::Let { value, .. } => analyze_captures(value, scope),
         Statement::Assign { value, .. } => analyze_captures(value, scope),
+        Statement::CompoundAssign { value, .. } => analyze_captures(value, scope),
         Statement::Return(Some(e)) => analyze_captures(e, scope),
         Statement::Return(None) => {}
         Statement::Break { condition: Some(e) } => analyze_captures(e, scope),
@@ -475,6 +476,7 @@ fn collect_free_in_statement(
         Statement::Expr(e) => collect_free_variables(e, bound, free),
         Statement::Let { value, .. } => collect_free_variables(value, bound, free),
         Statement::Assign { value, .. } => collect_free_variables(value, bound, free),
+        Statement::CompoundAssign { value, .. } => collect_free_variables(value, bound, free),
         Statement::Return(Some(e)) => collect_free_variables(e, bound, free),
         Statement::Return(None) => {}
         Statement::Break { condition: Some(e) } => collect_free_variables(e, bound, free),
