@@ -31,12 +31,12 @@ interface canon-async {
 }
 ```
 
-| Function | Purpose |
-|----------|---------|
-| `task-return` | Signal that an async function has completed with a result |
-| `waitable-set-new` | Create a new waitable set for tracking async operations |
-| `waitable-set-wait` | Block until an event occurs in the waitable set |
-| `subtask-drop` | Clean up a completed subtask |
+| Function            | Purpose                                                   |
+| ------------------- | --------------------------------------------------------- |
+| `task-return`       | Signal that an async function has completed with a result |
+| `waitable-set-new`  | Create a new waitable set for tracking async operations   |
+| `waitable-set-wait` | Block until an event occurs in the waitable set           |
+| `subtask-drop`      | Clean up a completed subtask                              |
 
 ### Why This Interface?
 
@@ -71,11 +71,11 @@ linker.instance("example:mypackage/canon-async")?
 
 WASIP3 async functions return status codes in the low 4 bits:
 
-| Status | Value | Meaning |
-|--------|-------|---------|
-| DONE | 0 | Function completed, result available |
-| STARTED | 1 | Subtask started, running in background |
-| WAIT | 2 | Function blocked, needs to wait |
+| Status  | Value | Meaning                                |
+| ------- | ----- | -------------------------------------- |
+| DONE    | 0     | Function completed, result available   |
+| STARTED | 1     | Subtask started, running in background |
+| WAIT    | 2     | Function blocked, needs to wait        |
 
 ## Future Work
 

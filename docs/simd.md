@@ -79,9 +79,23 @@ let all = i32x4.all_true(v);     // 1 if all lanes non-zero
 let bits = i32x4.bitmask(v);     // high bits as i32
 ```
 
+## SIMD Loops
+
+Use `simd for` to process list elements 4-at-a-time with vectorized operations:
+
+```kettu
+// Double every element (processes 4 per iteration)
+simd for v in numbers {
+    i32x4.mul(v, i32x4.splat(2))
+}
+```
+
+Inside the loop, `v` is a `v128` containing 4 consecutive `i32` elements loaded via `v128.load`. The body expression must return a `v128`, which is stored back to the list. Elements that don't fill a complete group of 4 (the remainder) are left untouched.
+
 ## Complete Operation List
 
 Approximately 45 operations are supported across all interpretations:
+
 
 - **Arithmetic**: `add`, `sub`, `mul`, `neg`, `abs`
 - **Float**: `div`, `sqrt`, `ceil`, `floor`, `trunc`, `nearest`

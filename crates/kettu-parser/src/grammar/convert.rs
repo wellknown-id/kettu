@@ -715,6 +715,12 @@ fn expr_with_span(cst: &grammar::Expr, outer_span: Range<usize>) -> ast::Expr {
             body: f.body.iter().map(stmt).collect(),
             span: outer_span,
         },
+        grammar::Expr::SimdForEach(f) => ast::Expr::SimdForEach {
+            variable: spanned_id(&f.variable),
+            collection: Box::new(sexpr(&f.collection)),
+            body: f.body.iter().map(stmt).collect(),
+            span: outer_span,
+        },
         grammar::Expr::Match(m) => ast::Expr::Match {
             scrutinee: Box::new(sexpr(&m.scrutinee)),
             arms: m.arms.iter().map(spanned_match_arm).collect(),

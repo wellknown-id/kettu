@@ -1918,6 +1918,20 @@ impl Checker {
                     _ => CheckedType::V128,
                 }
             }
+            Expr::SimdForEach { variable, collection, body, .. } => {
+                self.check_expr(collection);
+                // Loop variable is v128 (4 packed i32s)
+                let old_var = self.locals.insert(variable.name.clone(), CheckedType::V128);
+                for stmt in body {
+                    self.validate_statement(stmt);
+                }
+                if let Some(old) = old_var {
+                    self.locals.insert(variable.name.clone(), old);
+                } else {
+                    self.locals.remove(&variable.name);
+                }
+                CheckedType::Unknown
+            }
         }
     }
 

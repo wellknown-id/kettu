@@ -1338,6 +1338,9 @@ impl<'a> ModuleCompiler<'a> {
                     body.iter().map(count_in_stmt).sum()
                 }
                 Expr::SimdOp { args, .. } => args.iter().map(count_in_expr).sum(),
+                Expr::SimdForEach { collection, body, .. } => {
+                    count_in_expr(collection) + body.iter().map(count_in_stmt).sum::<usize>()
+                }
                 Expr::Ident(_) | Expr::Integer(_, _) | Expr::String(_, _) | Expr::Bool(_, _) => 0,
             }
         }
@@ -2492,7 +2495,8 @@ impl<'a> ModuleCompiler<'a> {
             | Expr::AtomicWait { .. } | Expr::AtomicNotify { .. }
             | Expr::Spawn { .. } | Expr::AtomicBlock { .. }
             | Expr::ThreadJoin { .. }
-            | Expr::SimdOp { .. } => {
+            | Expr::SimdOp { .. }
+            | Expr::SimdForEach { .. } => {
                 function.instruction(&Instruction::I32Const(0));
             }
         }
@@ -4791,6 +4795,167 @@ impl<'a> ModuleCompiler<'a> {
             }
             Expr::SimdOp { lane, op, args, lane_idx, .. } => {
                 self.compile_simd_op(function, lane, op, args, *lane_idx, locals, locals_types)?;
+            }
+            Expr::SimdForEach { variable, collection, body, .. } => {
+                // SIMD for-each: simd for v in list { body }
+                // Processes list elements 4-at-a-time using v128 load/store.
+                //
+                // Codegen pattern:
+                //   list_ptr = compile(collection)
+                //   length = i32.load(list_ptr)
+                //   end = (length / 4) * 4
+                //   idx = 0
+                //   block $break
+                //     loop $continue
+                //       if idx >= end: br $break
+                //       v = v128.load(list_ptr + 4 + idx*4)
+                //       result = body(v)          // user SIMD ops on v
+                //       v128.store(list_ptr + 4 + idx*4, result)
+                //       idx += 4
+                //       br $continue
+                //     end
+                //   end
+
+                // Allocate temp locals: list_ptr, idx, end
+                let list_ptr_local = locals.len() as u32;
+                let idx_local = list_ptr_local + 1;
+                let end_local = idx_local + 1;
+                let v_local = *locals
+                    .get(&variable.name)
+                    .expect("simd for-each variable not found");
+
+                // Compile collection and store pointer
+                self.compile_expr_with_locals(function, collection, locals, locals_types)?;
+                function.instruction(&Instruction::LocalSet(list_ptr_local));
+
+                // end = (i32.load(list_ptr) / 4) * 4
+                function.instruction(&Instruction::LocalGet(list_ptr_local));
+                function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+                function.instruction(&Instruction::I32Const(4));
+                function.instruction(&Instruction::I32DivU);
+                function.instruction(&Instruction::I32Const(4));
+                function.instruction(&Instruction::I32Mul);
+                function.instruction(&Instruction::LocalSet(end_local));
+
+                // idx = 0
+                function.instruction(&Instruction::I32Const(0));
+                function.instruction(&Instruction::LocalSet(idx_local));
+
+                // block $break
+                function.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                // loop $continue
+                function.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+                // if idx >= end: br $break
+                function.instruction(&Instruction::LocalGet(idx_local));
+                function.instruction(&Instruction::LocalGet(end_local));
+                function.instruction(&Instruction::I32GeS);
+                function.instruction(&Instruction::BrIf(1)); // break to outer block
+
+                // v = v128.load(list_ptr + 4 + idx*4)
+                function.instruction(&Instruction::LocalGet(list_ptr_local));
+                function.instruction(&Instruction::I32Const(4)); // skip length header
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalGet(idx_local));
+                function.instruction(&Instruction::I32Const(4)); // element size
+                function.instruction(&Instruction::I32Mul);
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::V128Load(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 4, // 16-byte aligned
+                    memory_index: 0,
+                }));
+                function.instruction(&Instruction::LocalSet(v_local));
+
+                // Compile body statements: last expression's v128 result stays on stack
+                let mut has_result = false;
+                for (i, stmt) in body.iter().enumerate() {
+                    match stmt {
+                        Statement::Expr(e) => {
+                            self.compile_expr_with_locals(function, e, locals, locals_types)?;
+                            if i < body.len() - 1 {
+                                function.instruction(&Instruction::Drop);
+                            } else {
+                                has_result = true;
+                            }
+                        }
+                        Statement::Assign { name, value } => {
+                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalSet(idx));
+                            }
+                        }
+                        Statement::Let { name, value } => {
+                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalSet(idx));
+                            }
+                        }
+                        Statement::CompoundAssign { name, op, value } => {
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalGet(idx));
+                            }
+                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                            match op {
+                                BinOp::Add => { function.instruction(&Instruction::I32Add); }
+                                BinOp::Sub => { function.instruction(&Instruction::I32Sub); }
+                                _ => { function.instruction(&Instruction::I32Add); }
+                            }
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalSet(idx));
+                            }
+                        }
+                        Statement::Return(opt_e) => {
+                            if let Some(e) = opt_e {
+                                self.compile_expr_with_locals(function, e, locals, locals_types)?;
+                            }
+                            function.instruction(&Instruction::Return);
+                        }
+                        Statement::Break { .. } | Statement::Continue { .. }
+                        | Statement::SharedLet { .. } => {}
+                    }
+                }
+
+                if has_result {
+                    // v128.store(list_ptr + 4 + idx*4, result)
+                    // But v128.store expects (addr, value) — addr first.
+                    // The result is on top of stack, so we need to compute addr first.
+                    // Store result to a temp, compute addr, load result, then store.
+                    let result_local = v_local; // reuse v_local as temp
+                    function.instruction(&Instruction::LocalSet(result_local));
+
+                    function.instruction(&Instruction::LocalGet(list_ptr_local));
+                    function.instruction(&Instruction::I32Const(4));
+                    function.instruction(&Instruction::I32Add);
+                    function.instruction(&Instruction::LocalGet(idx_local));
+                    function.instruction(&Instruction::I32Const(4));
+                    function.instruction(&Instruction::I32Mul);
+                    function.instruction(&Instruction::I32Add);
+                    function.instruction(&Instruction::LocalGet(result_local));
+                    function.instruction(&Instruction::V128Store(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 4,
+                        memory_index: 0,
+                    }));
+                }
+
+                // idx += 4
+                function.instruction(&Instruction::LocalGet(idx_local));
+                function.instruction(&Instruction::I32Const(4));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalSet(idx_local));
+
+                // br $continue (loop back)
+                function.instruction(&Instruction::Br(0));
+
+                // end loop
+                function.instruction(&Instruction::End);
+                // end block
+                function.instruction(&Instruction::End);
             }
         }
         Ok(())

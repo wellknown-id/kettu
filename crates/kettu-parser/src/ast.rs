@@ -474,6 +474,8 @@ pub enum Expr {
     AtomicBlock { body: Vec<Statement>, span: Span },
     /// SIMD operation: `interpretation.op(args)` — e.g. `i32x4.add(a, b)`
     SimdOp { lane: SimdLane, op: SimdOp, args: Vec<Expr>, lane_idx: Option<u8>, span: Span },
+    /// SIMD for-each loop: `simd for v in list { body }` — vectorized loop processing 4 elements at a time
+    SimdForEach { variable: Id, collection: Box<Expr>, body: Vec<Statement>, span: Span },
 }
 
 /// Pattern for match arms

@@ -1017,4 +1017,28 @@ mod tests {
             other => panic!("expected SimdOp, got {:?}", other),
         }
     }
+
+    #[test]
+    fn test_simd_for_each_parse() {
+        let src = "interface i {\n  f: func() {\n    simd for v in list {\n      i32x4.add(v, i32x4.splat(1));\n    };\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdForEach { variable, body, .. }) => {
+                assert_eq!(variable.name, "v");
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("expected SimdForEach, got {:?}", other),
+        }
+    }
 }

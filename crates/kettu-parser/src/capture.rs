@@ -234,6 +234,12 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
                 analyze_captures(arg, scope);
             }
         }
+        Expr::SimdForEach { collection, body, .. } => {
+            analyze_captures(collection, scope);
+            for stmt in body {
+                analyze_statement(stmt, scope);
+            }
+        }
         // Terminals - no recursion needed
         Expr::Integer(_, _) | Expr::Bool(_, _) | Expr::String(_, _) | Expr::Ident(_) => {}
     }
@@ -470,6 +476,12 @@ fn collect_free_variables(expr: &Expr, bound: &HashSet<String>, free: &mut HashS
         Expr::SimdOp { args, .. } => {
             for arg in args {
                 collect_free_variables(arg, bound, free);
+            }
+        }
+        Expr::SimdForEach { collection, body, .. } => {
+            collect_free_variables(collection, bound, free);
+            for stmt in body {
+                collect_free_in_statement(stmt, bound, free);
             }
         }
         // Terminals

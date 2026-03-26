@@ -5,6 +5,7 @@ This document describes what hover currently supports in `kettu-lsp`.
 ## Scope
 
 Hover is provided for:
+
 - Local symbols in the current document
 - Imported symbols (cross-file), including world imports and top-level `use`
 - Expression identifiers with lightweight local type inference
@@ -14,6 +15,7 @@ Hover is provided for:
 ### 1) Declared symbols
 
 For declarations and references that resolve to known symbols:
+
 - `interface`: `**interface** name`
 - `world`: `**world** name`
 - `func`: `**func** name(param: ty, ...) -> result_ty`
@@ -23,6 +25,7 @@ For declarations and references that resolve to known symbols:
 ### 2) Parameters in function bodies
 
 Inside expression bodies, identifier hovers prefer parameter-level information:
+
 - `**param** b: s32`
 
 This avoids misleading container-level hover when cursor is on a parameter use (for example, `a * b`).
@@ -30,6 +33,7 @@ This avoids misleading container-level hover when cursor is on a parameter use (
 ### 3) Imported symbols (cross-file)
 
 Hover resolves imported symbols via import resolution logic used by go-to-definition:
+
 - World imports (for example, `import helper:lib/math;`)
 - Top-level `use` imports (including aliases)
 - Qualified member calls (for example, `math.add(...)`, `hmath.add(...)`)
@@ -39,9 +43,11 @@ If the imported file is not open, hover can load and parse it from disk.
 ### 4) Local `let` inferred types
 
 For local `let` identifiers in expression contexts, hover can show inferred types:
+
 - `**let** x: s32`
 
 Current inference includes:
+
 - Literals: integer (`s32`), `bool`, `string`
 - Identifier propagation from known params/locals
 - Binary ops:
@@ -66,12 +72,14 @@ Current inference includes:
 ## Resolution Precedence (local document)
 
 When hovering an identifier token:
+
 1. Parameter hover (if inside containing function and name matches parameter)
 2. Named symbol hover (if identifier matches a known symbol)
 3. Local `let` inferred type hover (if inferable)
 4. Otherwise no hover for unresolved identifiers
 
 When hovering non-identifier positions:
+
 - Falls back to smallest enclosing symbol span.
 
 ## Known Limits
@@ -91,6 +99,7 @@ When hovering non-identifier positions:
 `kettu-lsp` now exposes quick-fix code actions for checker-reported qualified variant arity diagnostics.
 
 Current quick fixes:
+
 - Constructor requires payload (`Case 'type#case' requires a payload`):
   - Suggests adding payload argument: `type#case` → `type#case(/* payload */)`
 - Constructor forbids payload (`Case 'type#case' does not accept a payload`):

@@ -108,7 +108,7 @@ Foundation (C): `shared<dtype>` with method syntax. Sugar (B): `shared let` + `a
 - [x] `v128` type support
 - [x] Vector operations (`i32x4.add`, `f32x4.mul`, etc.) — all 6 interpretations
 - [x] Lane operations (`i32x4.extract_lane`, `i32x4.replace_lane`)
-- [ ] SIMD-friendly loops / auto-vectorization hints
+- [x] SIMD-friendly loops: `simd for v in list { body }` — vectorized v128 load/store
 - [x] WASM SIMD proposal integration — ~200 instruction mappings
 
 [^1]: Syntactic sugar for atomic operations:

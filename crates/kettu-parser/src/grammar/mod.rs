@@ -969,6 +969,7 @@ pub enum Expr {
     While(WhileExpr),
     For(ForExpr),
     ForEach(ForEachExpr),
+    SimdForEach(SimdForEachExpr),
     Match(MatchExpr),
 
     // Built-in functions
@@ -1132,6 +1133,24 @@ pub struct StepClause {
 
 #[derive(Debug, Clone, PartialEq, Rule)]
 pub struct ForEachExpr {
+    #[leaf("for")]
+    _for: (),
+    #[leaf(KIdent)]
+    pub variable: Spanned<String>,
+    #[leaf("in")]
+    _in: (),
+    pub collection: Spanned<Box<Expr>>,
+    #[leaf("{")]
+    _lb: (),
+    pub body: Vec<Stmt>,
+    #[leaf("}")]
+    _rb: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdForEachExpr {
+    #[leaf("simd")]
+    _simd: (),
     #[leaf("for")]
     _for: (),
     #[leaf(KIdent)]
