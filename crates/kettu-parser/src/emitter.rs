@@ -84,6 +84,7 @@ impl<'a> WitEmitter<'a> {
                 PrimitiveTy::Bool => "bool".to_string(),
                 PrimitiveTy::Char => "char".to_string(),
                 PrimitiveTy::String => "string".to_string(),
+                PrimitiveTy::V128 => "v128".to_string(),
             },
             Ty::Named(id) => id.name.clone(),
             Ty::List { element, .. } => format!("list-{}", self.ty_to_name_part(element)),
@@ -631,6 +632,7 @@ impl<'a> WitEmitter<'a> {
                     PrimitiveTy::Bool => "bool",
                     PrimitiveTy::Char => "char",
                     PrimitiveTy::String => "string",
+                    PrimitiveTy::V128 => "v128",
                 };
                 self.write(s);
             }

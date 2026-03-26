@@ -122,13 +122,13 @@ interface counter {
 
 ## Desugaring Reference
 
-| Source (sugar) | Compiled WASM instruction |
-|---|---|
-| `shared let x = 0;` | `i32.atomic.store` + local allocation |
-| `atomic { x += val; }` | `i32.atomic.rmw.add` |
-| `atomic { x -= val; }` | `i32.atomic.rmw.sub` |
-| `atomic { x = val; }` | `i32.atomic.store` |
-| `atomic { x }` | `i32.atomic.load` |
-| `await tid` | `memory.atomic.wait32` |
-| `thread.join(tid)` | `memory.atomic.wait32` |
-| `spawn { body }` | `thread-spawn` import + done-flag allocation |
+| Source (sugar)         | Compiled WASM instruction                    |
+| ---------------------- | -------------------------------------------- |
+| `shared let x = 0;`    | `i32.atomic.store` + local allocation        |
+| `atomic { x += val; }` | `i32.atomic.rmw.add`                         |
+| `atomic { x -= val; }` | `i32.atomic.rmw.sub`                         |
+| `atomic { x = val; }`  | `i32.atomic.store`                           |
+| `atomic { x }`         | `i32.atomic.load`                            |
+| `await tid`            | `memory.atomic.wait32`                       |
+| `thread.join(tid)`     | `memory.atomic.wait32`                       |
+| `spawn { body }`       | `thread-spawn` import + done-flag allocation |

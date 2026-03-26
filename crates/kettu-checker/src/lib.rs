@@ -203,6 +203,8 @@ enum CheckedType {
     ThreadId,
     /// Opaque shared memory variable — used with `atomic { }` blocks
     Shared,
+    /// 128-bit SIMD vector
+    V128,
     Unknown,
 }
 
@@ -1904,6 +1906,17 @@ impl Checker {
                 }
                 // Atomic block evaluates to the type of its last expression (typically I32)
                 CheckedType::I32
+            }
+            Expr::SimdOp { args, op, .. } => {
+                // Check all args
+                for arg in args {
+                    self.check_expr(arg);
+                }
+                // extract_lane returns a scalar; everything else returns v128
+                match op {
+                    SimdOp::ExtractLane | SimdOp::AnyTrue | SimdOp::AllTrue | SimdOp::Bitmask => CheckedType::I32,
+                    _ => CheckedType::V128,
+                }
             }
         }
     }

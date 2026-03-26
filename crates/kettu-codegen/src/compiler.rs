@@ -4,7 +4,7 @@
 
 use kettu_parser::{
     BinOp, Expr, Func, FuncBody, InterfaceItem, Param, Pattern, PrimitiveTy, ResourceMethod,
-    Statement, StringPart, TopLevelItem, Ty, TypeDef, TypeDefKind, WitFile,
+    SimdLane, SimdOp, Statement, StringPart, TopLevelItem, Ty, TypeDef, TypeDefKind, WitFile,
 };
 use std::collections::HashMap;
 use wasm_encoder::{
@@ -882,6 +882,7 @@ impl<'a> ModuleCompiler<'a> {
                 PrimitiveTy::F32 => Ok(ValType::F32),
                 PrimitiveTy::F64 => Ok(ValType::F64),
                 PrimitiveTy::String => Ok(ValType::I32), // String is a pointer
+                PrimitiveTy::V128 => Ok(ValType::V128),
             },
             Ty::Named(_) => Ok(ValType::I32), // Named types are pointers
             Ty::List { .. }
@@ -1336,6 +1337,7 @@ impl<'a> ModuleCompiler<'a> {
                 Expr::Spawn { body, .. } | Expr::AtomicBlock { body, .. } => {
                     body.iter().map(count_in_stmt).sum()
                 }
+                Expr::SimdOp { args, .. } => args.iter().map(count_in_expr).sum(),
                 Expr::Ident(_) | Expr::Integer(_, _) | Expr::String(_, _) | Expr::Bool(_, _) => 0,
             }
         }
@@ -2489,7 +2491,8 @@ impl<'a> ModuleCompiler<'a> {
             | Expr::AtomicSub { .. } | Expr::AtomicCmpxchg { .. }
             | Expr::AtomicWait { .. } | Expr::AtomicNotify { .. }
             | Expr::Spawn { .. } | Expr::AtomicBlock { .. }
-            | Expr::ThreadJoin { .. } => {
+            | Expr::ThreadJoin { .. }
+            | Expr::SimdOp { .. } => {
                 function.instruction(&Instruction::I32Const(0));
             }
         }
@@ -4785,6 +4788,284 @@ impl<'a> ModuleCompiler<'a> {
                         }
                     }
                 }
+            }
+            Expr::SimdOp { lane, op, args, lane_idx, .. } => {
+                self.compile_simd_op(function, lane, op, args, *lane_idx, locals, locals_types)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a SIMD operation to WASM SIMD instructions.
+    #[allow(clippy::too_many_arguments)]
+    fn compile_simd_op(
+        &mut self,
+        function: &mut Function,
+        lane: &SimdLane,
+        op: &SimdOp,
+        args: &[Expr],
+        lane_idx: Option<u8>,
+        locals: &HashMap<String, u32>,
+        locals_types: &HashMap<String, RecordTypeInfo>,
+    ) -> Result<(), CompileError> {
+        use SimdLane::*;
+        use SimdOp::*;
+
+        // Compile all arguments onto the stack
+        for arg in args {
+            self.compile_expr_with_locals(function, arg, locals, locals_types)?;
+        }
+
+        let memarg = wasm_encoder::MemArg { offset: 0, align: 4, memory_index: 0 };
+        let lidx = lane_idx.unwrap_or(0) as u8;
+
+        match (lane, op) {
+            // === Splat ===
+            (I8x16, Splat) => { function.instruction(&Instruction::I8x16Splat); }
+            (I16x8, Splat) => { function.instruction(&Instruction::I16x8Splat); }
+            (I32x4, Splat) => { function.instruction(&Instruction::I32x4Splat); }
+            (I64x2, Splat) => { function.instruction(&Instruction::I64x2Splat); }
+            (F32x4, Splat) => { function.instruction(&Instruction::F32x4Splat); }
+            (F64x2, Splat) => { function.instruction(&Instruction::F64x2Splat); }
+
+            // === Add ===
+            (I8x16, Add) => { function.instruction(&Instruction::I8x16Add); }
+            (I16x8, Add) => { function.instruction(&Instruction::I16x8Add); }
+            (I32x4, Add) => { function.instruction(&Instruction::I32x4Add); }
+            (I64x2, Add) => { function.instruction(&Instruction::I64x2Add); }
+            (F32x4, Add) => { function.instruction(&Instruction::F32x4Add); }
+            (F64x2, Add) => { function.instruction(&Instruction::F64x2Add); }
+
+            // === Sub ===
+            (I8x16, Sub) => { function.instruction(&Instruction::I8x16Sub); }
+            (I16x8, Sub) => { function.instruction(&Instruction::I16x8Sub); }
+            (I32x4, Sub) => { function.instruction(&Instruction::I32x4Sub); }
+            (I64x2, Sub) => { function.instruction(&Instruction::I64x2Sub); }
+            (F32x4, Sub) => { function.instruction(&Instruction::F32x4Sub); }
+            (F64x2, Sub) => { function.instruction(&Instruction::F64x2Sub); }
+
+            // === Mul ===
+            (I16x8, Mul) => { function.instruction(&Instruction::I16x8Mul); }
+            (I32x4, Mul) => { function.instruction(&Instruction::I32x4Mul); }
+            (I64x2, Mul) => { function.instruction(&Instruction::I64x2Mul); }
+            (F32x4, Mul) => { function.instruction(&Instruction::F32x4Mul); }
+            (F64x2, Mul) => { function.instruction(&Instruction::F64x2Mul); }
+
+            // === Neg ===
+            (I8x16, Neg) => { function.instruction(&Instruction::I8x16Neg); }
+            (I16x8, Neg) => { function.instruction(&Instruction::I16x8Neg); }
+            (I32x4, Neg) => { function.instruction(&Instruction::I32x4Neg); }
+            (I64x2, Neg) => { function.instruction(&Instruction::I64x2Neg); }
+            (F32x4, Neg) => { function.instruction(&Instruction::F32x4Neg); }
+            (F64x2, Neg) => { function.instruction(&Instruction::F64x2Neg); }
+
+            // === Abs ===
+            (I8x16, Abs) => { function.instruction(&Instruction::I8x16Abs); }
+            (I16x8, Abs) => { function.instruction(&Instruction::I16x8Abs); }
+            (I32x4, Abs) => { function.instruction(&Instruction::I32x4Abs); }
+            (I64x2, Abs) => { function.instruction(&Instruction::I64x2Abs); }
+            (F32x4, Abs) => { function.instruction(&Instruction::F32x4Abs); }
+            (F64x2, Abs) => { function.instruction(&Instruction::F64x2Abs); }
+
+            // === Float-only: Div, Sqrt, Ceil, Floor, Trunc, Nearest ===
+            (F32x4, Div) => { function.instruction(&Instruction::F32x4Div); }
+            (F64x2, Div) => { function.instruction(&Instruction::F64x2Div); }
+            (F32x4, Sqrt) => { function.instruction(&Instruction::F32x4Sqrt); }
+            (F64x2, Sqrt) => { function.instruction(&Instruction::F64x2Sqrt); }
+            (F32x4, Ceil) => { function.instruction(&Instruction::F32x4Ceil); }
+            (F64x2, Ceil) => { function.instruction(&Instruction::F64x2Ceil); }
+            (F32x4, Floor) => { function.instruction(&Instruction::F32x4Floor); }
+            (F64x2, Floor) => { function.instruction(&Instruction::F64x2Floor); }
+            (F32x4, Trunc) => { function.instruction(&Instruction::F32x4Trunc); }
+            (F64x2, Trunc) => { function.instruction(&Instruction::F64x2Trunc); }
+            (F32x4, Nearest) => { function.instruction(&Instruction::F32x4Nearest); }
+            (F64x2, Nearest) => { function.instruction(&Instruction::F64x2Nearest); }
+
+            // === Shifts ===
+            (I8x16, Shl) => { function.instruction(&Instruction::I8x16Shl); }
+            (I16x8, Shl) => { function.instruction(&Instruction::I16x8Shl); }
+            (I32x4, Shl) => { function.instruction(&Instruction::I32x4Shl); }
+            (I64x2, Shl) => { function.instruction(&Instruction::I64x2Shl); }
+            (I8x16, ShrS) => { function.instruction(&Instruction::I8x16ShrS); }
+            (I16x8, ShrS) => { function.instruction(&Instruction::I16x8ShrS); }
+            (I32x4, ShrS) => { function.instruction(&Instruction::I32x4ShrS); }
+            (I64x2, ShrS) => { function.instruction(&Instruction::I64x2ShrS); }
+            (I8x16, ShrU) => { function.instruction(&Instruction::I8x16ShrU); }
+            (I16x8, ShrU) => { function.instruction(&Instruction::I16x8ShrU); }
+            (I32x4, ShrU) => { function.instruction(&Instruction::I32x4ShrU); }
+            (I64x2, ShrU) => { function.instruction(&Instruction::I64x2ShrU); }
+
+            // === Min / Max ===
+            (I8x16, Min) => { function.instruction(&Instruction::I8x16MinS); }
+            (I16x8, Min) => { function.instruction(&Instruction::I16x8MinS); }
+            (I32x4, Min) => { function.instruction(&Instruction::I32x4MinS); }
+            (F32x4, Min) => { function.instruction(&Instruction::F32x4Min); }
+            (F64x2, Min) => { function.instruction(&Instruction::F64x2Min); }
+            (I8x16, Max) => { function.instruction(&Instruction::I8x16MaxS); }
+            (I16x8, Max) => { function.instruction(&Instruction::I16x8MaxS); }
+            (I32x4, Max) => { function.instruction(&Instruction::I32x4MaxS); }
+            (F32x4, Max) => { function.instruction(&Instruction::F32x4Max); }
+            (F64x2, Max) => { function.instruction(&Instruction::F64x2Max); }
+
+            // === Extract / Replace Lane ===
+            (I8x16, ExtractLane) => { function.instruction(&Instruction::I8x16ExtractLaneS(lidx)); }
+            (I16x8, ExtractLane) => { function.instruction(&Instruction::I16x8ExtractLaneS(lidx)); }
+            (I32x4, ExtractLane) => { function.instruction(&Instruction::I32x4ExtractLane(lidx)); }
+            (I64x2, ExtractLane) => { function.instruction(&Instruction::I64x2ExtractLane(lidx)); }
+            (F32x4, ExtractLane) => { function.instruction(&Instruction::F32x4ExtractLane(lidx)); }
+            (F64x2, ExtractLane) => { function.instruction(&Instruction::F64x2ExtractLane(lidx)); }
+            (I8x16, ReplaceLane) => { function.instruction(&Instruction::I8x16ReplaceLane(lidx)); }
+            (I16x8, ReplaceLane) => { function.instruction(&Instruction::I16x8ReplaceLane(lidx)); }
+            (I32x4, ReplaceLane) => { function.instruction(&Instruction::I32x4ReplaceLane(lidx)); }
+            (I64x2, ReplaceLane) => { function.instruction(&Instruction::I64x2ReplaceLane(lidx)); }
+            (F32x4, ReplaceLane) => { function.instruction(&Instruction::F32x4ReplaceLane(lidx)); }
+            (F64x2, ReplaceLane) => { function.instruction(&Instruction::F64x2ReplaceLane(lidx)); }
+
+            // === Comparisons (integer signed) ===
+            (I8x16, Eq) => { function.instruction(&Instruction::I8x16Eq); }
+            (I16x8, Eq) => { function.instruction(&Instruction::I16x8Eq); }
+            (I32x4, Eq) => { function.instruction(&Instruction::I32x4Eq); }
+            (I64x2, Eq) => { function.instruction(&Instruction::I64x2Eq); }
+            (I8x16, Ne) => { function.instruction(&Instruction::I8x16Ne); }
+            (I16x8, Ne) => { function.instruction(&Instruction::I16x8Ne); }
+            (I32x4, Ne) => { function.instruction(&Instruction::I32x4Ne); }
+            (I64x2, Ne) => { function.instruction(&Instruction::I64x2Ne); }
+            (I8x16, LtS) => { function.instruction(&Instruction::I8x16LtS); }
+            (I16x8, LtS) => { function.instruction(&Instruction::I16x8LtS); }
+            (I32x4, LtS) => { function.instruction(&Instruction::I32x4LtS); }
+            (I64x2, LtS) => { function.instruction(&Instruction::I64x2LtS); }
+            (I8x16, GtS) => { function.instruction(&Instruction::I8x16GtS); }
+            (I16x8, GtS) => { function.instruction(&Instruction::I16x8GtS); }
+            (I32x4, GtS) => { function.instruction(&Instruction::I32x4GtS); }
+            (I64x2, GtS) => { function.instruction(&Instruction::I64x2GtS); }
+            (I8x16, LeS) => { function.instruction(&Instruction::I8x16LeS); }
+            (I16x8, LeS) => { function.instruction(&Instruction::I16x8LeS); }
+            (I32x4, LeS) => { function.instruction(&Instruction::I32x4LeS); }
+            (I64x2, LeS) => { function.instruction(&Instruction::I64x2LeS); }
+            (I8x16, GeS) => { function.instruction(&Instruction::I8x16GeS); }
+            (I16x8, GeS) => { function.instruction(&Instruction::I16x8GeS); }
+            (I32x4, GeS) => { function.instruction(&Instruction::I32x4GeS); }
+            (I64x2, GeS) => { function.instruction(&Instruction::I64x2GeS); }
+
+            // === Comparisons (unsigned) ===
+            (I8x16, LtU) => { function.instruction(&Instruction::I8x16LtU); }
+            (I16x8, LtU) => { function.instruction(&Instruction::I16x8LtU); }
+            (I32x4, LtU) => { function.instruction(&Instruction::I32x4LtU); }
+            (I8x16, GtU) => { function.instruction(&Instruction::I8x16GtU); }
+            (I16x8, GtU) => { function.instruction(&Instruction::I16x8GtU); }
+            (I32x4, GtU) => { function.instruction(&Instruction::I32x4GtU); }
+            (I8x16, LeU) => { function.instruction(&Instruction::I8x16LeU); }
+            (I16x8, LeU) => { function.instruction(&Instruction::I16x8LeU); }
+            (I32x4, LeU) => { function.instruction(&Instruction::I32x4LeU); }
+            (I8x16, GeU) => { function.instruction(&Instruction::I8x16GeU); }
+            (I16x8, GeU) => { function.instruction(&Instruction::I16x8GeU); }
+            (I32x4, GeU) => { function.instruction(&Instruction::I32x4GeU); }
+
+            // === Float comparisons ===
+            (F32x4, Eq) | (F32x4, Lt) | (F32x4, Gt) | (F32x4, Le) | (F32x4, Ge) | (F32x4, Ne) => {
+                let instr = match op {
+                    Eq => Instruction::F32x4Eq,
+                    Ne => Instruction::F32x4Ne,
+                    Lt => Instruction::F32x4Lt,
+                    Gt => Instruction::F32x4Gt,
+                    Le => Instruction::F32x4Le,
+                    Ge => Instruction::F32x4Ge,
+                    _ => unreachable!(),
+                };
+                function.instruction(&instr);
+            }
+            (F64x2, Eq) | (F64x2, Lt) | (F64x2, Gt) | (F64x2, Le) | (F64x2, Ge) | (F64x2, Ne) => {
+                let instr = match op {
+                    Eq => Instruction::F64x2Eq,
+                    Ne => Instruction::F64x2Ne,
+                    Lt => Instruction::F64x2Lt,
+                    Gt => Instruction::F64x2Gt,
+                    Le => Instruction::F64x2Le,
+                    Ge => Instruction::F64x2Ge,
+                    _ => unreachable!(),
+                };
+                function.instruction(&instr);
+            }
+
+            // === Bitwise (v128 interpretation) ===
+            (_, And) => { function.instruction(&Instruction::V128And); }
+            (_, Or) => { function.instruction(&Instruction::V128Or); }
+            (_, Xor) => { function.instruction(&Instruction::V128Xor); }
+            (_, Not) => { function.instruction(&Instruction::V128Not); }
+            (_, AndNot) => { function.instruction(&Instruction::V128AndNot); }
+            (_, Bitselect) => { function.instruction(&Instruction::V128Bitselect); }
+
+            // === Tests ===
+            (_, AnyTrue) => { function.instruction(&Instruction::V128AnyTrue); }
+            (I8x16, AllTrue) => { function.instruction(&Instruction::I8x16AllTrue); }
+            (I16x8, AllTrue) => { function.instruction(&Instruction::I16x8AllTrue); }
+            (I32x4, AllTrue) => { function.instruction(&Instruction::I32x4AllTrue); }
+            (I64x2, AllTrue) => { function.instruction(&Instruction::I64x2AllTrue); }
+            (I8x16, Bitmask) => { function.instruction(&Instruction::I8x16Bitmask); }
+            (I16x8, Bitmask) => { function.instruction(&Instruction::I16x8Bitmask); }
+            (I32x4, Bitmask) => { function.instruction(&Instruction::I32x4Bitmask); }
+            (I64x2, Bitmask) => { function.instruction(&Instruction::I64x2Bitmask); }
+
+            // === Swizzle ===
+            (I8x16, Swizzle) => { function.instruction(&Instruction::I8x16Swizzle); }
+
+            // === Memory ===
+            (_, Load) => { function.instruction(&Instruction::V128Load(memarg)); }
+            (_, Store) => { function.instruction(&Instruction::V128Store(memarg)); }
+
+            // === Popcnt ===
+            (I8x16, Popcnt) => { function.instruction(&Instruction::I8x16Popcnt); }
+
+            // === AvgR ===
+            (I8x16, AvgRU) => { function.instruction(&Instruction::I8x16AvgrU); }
+            (I16x8, AvgRU) => { function.instruction(&Instruction::I16x8AvgrU); }
+
+            // === Dot ===
+            (I32x4, Dot) => { function.instruction(&Instruction::I32x4DotI16x8S); }
+
+            // === Widening multiply ===
+            (I16x8, ExtMulLowS) => { function.instruction(&Instruction::I16x8ExtMulLowI8x16S); }
+            (I16x8, ExtMulHighS) => { function.instruction(&Instruction::I16x8ExtMulHighI8x16S); }
+            (I16x8, ExtMulLowU) => { function.instruction(&Instruction::I16x8ExtMulLowI8x16U); }
+            (I16x8, ExtMulHighU) => { function.instruction(&Instruction::I16x8ExtMulHighI8x16U); }
+            (I32x4, ExtMulLowS) => { function.instruction(&Instruction::I32x4ExtMulLowI16x8S); }
+            (I32x4, ExtMulHighS) => { function.instruction(&Instruction::I32x4ExtMulHighI16x8S); }
+            (I32x4, ExtMulLowU) => { function.instruction(&Instruction::I32x4ExtMulLowI16x8U); }
+            (I32x4, ExtMulHighU) => { function.instruction(&Instruction::I32x4ExtMulHighI16x8U); }
+            (I64x2, ExtMulLowS) => { function.instruction(&Instruction::I64x2ExtMulLowI32x4S); }
+            (I64x2, ExtMulHighS) => { function.instruction(&Instruction::I64x2ExtMulHighI32x4S); }
+            (I64x2, ExtMulLowU) => { function.instruction(&Instruction::I64x2ExtMulLowI32x4U); }
+            (I64x2, ExtMulHighU) => { function.instruction(&Instruction::I64x2ExtMulHighI32x4U); }
+
+            // === Pairwise add ===
+            (I16x8, ExtAddPairwiseS) => { function.instruction(&Instruction::I16x8ExtAddPairwiseI8x16S); }
+            (I16x8, ExtAddPairwiseU) => { function.instruction(&Instruction::I16x8ExtAddPairwiseI8x16U); }
+            (I32x4, ExtAddPairwiseS) => { function.instruction(&Instruction::I32x4ExtAddPairwiseI16x8S); }
+            (I32x4, ExtAddPairwiseU) => { function.instruction(&Instruction::I32x4ExtAddPairwiseI16x8U); }
+
+            // === Narrowing ===
+            (I8x16, NarrowS) => { function.instruction(&Instruction::I8x16NarrowI16x8S); }
+            (I8x16, NarrowU) => { function.instruction(&Instruction::I8x16NarrowI16x8U); }
+            (I16x8, NarrowS) => { function.instruction(&Instruction::I16x8NarrowI32x4S); }
+            (I16x8, NarrowU) => { function.instruction(&Instruction::I16x8NarrowI32x4U); }
+
+            // === Extending ===
+            (I16x8, ExtendLowS) => { function.instruction(&Instruction::I16x8ExtendLowI8x16S); }
+            (I16x8, ExtendHighS) => { function.instruction(&Instruction::I16x8ExtendHighI8x16S); }
+            (I16x8, ExtendLowU) => { function.instruction(&Instruction::I16x8ExtendLowI8x16U); }
+            (I16x8, ExtendHighU) => { function.instruction(&Instruction::I16x8ExtendHighI8x16U); }
+            (I32x4, ExtendLowS) => { function.instruction(&Instruction::I32x4ExtendLowI16x8S); }
+            (I32x4, ExtendHighS) => { function.instruction(&Instruction::I32x4ExtendHighI16x8S); }
+            (I32x4, ExtendLowU) => { function.instruction(&Instruction::I32x4ExtendLowI16x8U); }
+            (I32x4, ExtendHighU) => { function.instruction(&Instruction::I32x4ExtendHighI16x8U); }
+            (I64x2, ExtendLowS) => { function.instruction(&Instruction::I64x2ExtendLowI32x4S); }
+            (I64x2, ExtendHighS) => { function.instruction(&Instruction::I64x2ExtendHighI32x4S); }
+            (I64x2, ExtendLowU) => { function.instruction(&Instruction::I64x2ExtendLowI32x4U); }
+            (I64x2, ExtendHighU) => { function.instruction(&Instruction::I64x2ExtendHighI32x4U); }
+
+            // Fallback: unsupported combination — emit i32.const 0
+            _ => {
+                function.instruction(&Instruction::I32Const(0));
             }
         }
         Ok(())

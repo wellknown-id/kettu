@@ -1021,6 +1021,15 @@ pub enum Expr {
 
     // Atomic block sugar
     AtomicBlock(AtomicBlockExpr),
+
+    // SIMD operations: interpretation.op(args)
+    SimdV128(SimdV128Expr),
+    SimdI8x16(SimdI8x16Expr),
+    SimdI16x8(SimdI16x8Expr),
+    SimdI32x4(SimdI32x4Expr),
+    SimdI64x2(SimdI64x2Expr),
+    SimdF32x4(SimdF32x4Expr),
+    SimdF64x2(SimdF64x2Expr),
 }
 
 /// Arguments for a function call: `(arg1, arg2, ...)`
@@ -1600,7 +1609,87 @@ pub struct AtomicBlockExpr {
 }
 
 // ============================================================================
-// World
+// SIMD operations: interpretation.op(args)
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdV128Expr {
+    #[leaf("v128")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf(KIdent)]
+    pub op: Spanned<String>,
+    pub call_args: CallArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdI8x16Expr {
+    #[leaf("i8x16")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf(KIdent)]
+    pub op: Spanned<String>,
+    pub call_args: CallArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdI16x8Expr {
+    #[leaf("i16x8")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf(KIdent)]
+    pub op: Spanned<String>,
+    pub call_args: CallArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdI32x4Expr {
+    #[leaf("i32x4")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf(KIdent)]
+    pub op: Spanned<String>,
+    pub call_args: CallArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdI64x2Expr {
+    #[leaf("i64x2")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf(KIdent)]
+    pub op: Spanned<String>,
+    pub call_args: CallArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdF32x4Expr {
+    #[leaf("f32x4")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf(KIdent)]
+    pub op: Spanned<String>,
+    pub call_args: CallArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdF64x2Expr {
+    #[leaf("f64x2")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf(KIdent)]
+    pub op: Spanned<String>,
+    pub call_args: CallArgs,
+}
+
+
 // ============================================================================
 
 /// `world name { items }`

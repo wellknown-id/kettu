@@ -905,6 +905,108 @@ fn expr_with_span(cst: &grammar::Expr, outer_span: Range<usize>) -> ast::Expr {
             body: a.body.iter().map(spanned_stmt).collect(),
             span: outer_span,
         },
+
+        // SIMD operations
+        grammar::Expr::SimdV128(s) => convert_simd_expr(ast::SimdLane::V128, s.op.value.as_str(), &s.call_args.args, outer_span),
+        grammar::Expr::SimdI8x16(s) => convert_simd_expr(ast::SimdLane::I8x16, s.op.value.as_str(), &s.call_args.args, outer_span),
+        grammar::Expr::SimdI16x8(s) => convert_simd_expr(ast::SimdLane::I16x8, s.op.value.as_str(), &s.call_args.args, outer_span),
+        grammar::Expr::SimdI32x4(s) => convert_simd_expr(ast::SimdLane::I32x4, s.op.value.as_str(), &s.call_args.args, outer_span),
+        grammar::Expr::SimdI64x2(s) => convert_simd_expr(ast::SimdLane::I64x2, s.op.value.as_str(), &s.call_args.args, outer_span),
+        grammar::Expr::SimdF32x4(s) => convert_simd_expr(ast::SimdLane::F32x4, s.op.value.as_str(), &s.call_args.args, outer_span),
+        grammar::Expr::SimdF64x2(s) => convert_simd_expr(ast::SimdLane::F64x2, s.op.value.as_str(), &s.call_args.args, outer_span),
+    }
+}
+
+/// Convert a SIMD grammar expression to `Expr::SimdOp`
+fn convert_simd_expr(
+    lane: ast::SimdLane,
+    op_name: &str,
+    args: &[Spanned<grammar::Expr>],
+    span: Range<usize>,
+) -> ast::Expr {
+    let op = parse_simd_op(op_name);
+    let mut converted_args: Vec<ast::Expr> = Vec::new();
+    let mut lane_idx: Option<u8> = None;
+
+    for (i, arg) in args.iter().enumerate() {
+        // For extract_lane/replace_lane, the lane index is a numeric arg
+        if (op == ast::SimdOp::ExtractLane && i == args.len() - 1)
+            || (op == ast::SimdOp::ReplaceLane && i == 1)
+        {
+            if let grammar::Expr::Integer(n) = &arg.value {
+                lane_idx = Some(*n as u8);
+                continue;
+            }
+        }
+        converted_args.push(sexpr_flat(arg));
+    }
+
+    ast::Expr::SimdOp { lane, op, args: converted_args, lane_idx, span }
+}
+
+fn parse_simd_op(name: &str) -> ast::SimdOp {
+    match name {
+        "splat" => ast::SimdOp::Splat,
+        "add" => ast::SimdOp::Add,
+        "sub" => ast::SimdOp::Sub,
+        "mul" => ast::SimdOp::Mul,
+        "neg" => ast::SimdOp::Neg,
+        "abs" => ast::SimdOp::Abs,
+        "div" => ast::SimdOp::Div,
+        "sqrt" => ast::SimdOp::Sqrt,
+        "ceil" => ast::SimdOp::Ceil,
+        "floor" => ast::SimdOp::Floor,
+        "trunc" => ast::SimdOp::Trunc,
+        "nearest" => ast::SimdOp::Nearest,
+        "shl" => ast::SimdOp::Shl,
+        "shr-s" | "shr_s" => ast::SimdOp::ShrS,
+        "shr-u" | "shr_u" => ast::SimdOp::ShrU,
+        "min" => ast::SimdOp::Min,
+        "max" => ast::SimdOp::Max,
+        "extract-lane" | "extract_lane" => ast::SimdOp::ExtractLane,
+        "replace-lane" | "replace_lane" => ast::SimdOp::ReplaceLane,
+        "eq" => ast::SimdOp::Eq,
+        "ne" => ast::SimdOp::Ne,
+        "lt-s" | "lt_s" => ast::SimdOp::LtS,
+        "lt-u" | "lt_u" => ast::SimdOp::LtU,
+        "gt-s" | "gt_s" => ast::SimdOp::GtS,
+        "gt-u" | "gt_u" => ast::SimdOp::GtU,
+        "le-s" | "le_s" => ast::SimdOp::LeS,
+        "le-u" | "le_u" => ast::SimdOp::LeU,
+        "ge-s" | "ge_s" => ast::SimdOp::GeS,
+        "ge-u" | "ge_u" => ast::SimdOp::GeU,
+        "lt" => ast::SimdOp::Lt,
+        "gt" => ast::SimdOp::Gt,
+        "le" => ast::SimdOp::Le,
+        "ge" => ast::SimdOp::Ge,
+        "and" => ast::SimdOp::And,
+        "or" => ast::SimdOp::Or,
+        "xor" => ast::SimdOp::Xor,
+        "not" => ast::SimdOp::Not,
+        "andnot" => ast::SimdOp::AndNot,
+        "bitselect" => ast::SimdOp::Bitselect,
+        "any-true" | "any_true" => ast::SimdOp::AnyTrue,
+        "all-true" | "all_true" => ast::SimdOp::AllTrue,
+        "bitmask" => ast::SimdOp::Bitmask,
+        "swizzle" => ast::SimdOp::Swizzle,
+        "load" => ast::SimdOp::Load,
+        "store" => ast::SimdOp::Store,
+        "popcnt" => ast::SimdOp::Popcnt,
+        "avgr-u" | "avgr_u" => ast::SimdOp::AvgRU,
+        "ext-mul-low-s" | "ext_mul_low_s" => ast::SimdOp::ExtMulLowS,
+        "ext-mul-low-u" | "ext_mul_low_u" => ast::SimdOp::ExtMulLowU,
+        "ext-mul-high-s" | "ext_mul_high_s" => ast::SimdOp::ExtMulHighS,
+        "ext-mul-high-u" | "ext_mul_high_u" => ast::SimdOp::ExtMulHighU,
+        "ext-add-pairwise-s" | "ext_add_pairwise_s" => ast::SimdOp::ExtAddPairwiseS,
+        "ext-add-pairwise-u" | "ext_add_pairwise_u" => ast::SimdOp::ExtAddPairwiseU,
+        "narrow-s" | "narrow_s" => ast::SimdOp::NarrowS,
+        "narrow-u" | "narrow_u" => ast::SimdOp::NarrowU,
+        "extend-low-s" | "extend_low_s" => ast::SimdOp::ExtendLowS,
+        "extend-low-u" | "extend_low_u" => ast::SimdOp::ExtendLowU,
+        "extend-high-s" | "extend_high_s" => ast::SimdOp::ExtendHighS,
+        "extend-high-u" | "extend_high_u" => ast::SimdOp::ExtendHighU,
+        "dot" => ast::SimdOp::Dot,
+        _ => ast::SimdOp::Add, // fallback — checker will catch invalid ops
     }
 }
 

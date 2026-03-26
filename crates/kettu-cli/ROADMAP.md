@@ -103,13 +103,13 @@ Foundation (C): `shared<dtype>` with method syntax. Sugar (B): `shared let` + `a
 - [x] `await tid` → `thread.join(tid)` via `memory.atomic.wait32`
 - [x] 6 new tests (3 parser, 3 codegen)
 
-### Phase 14: SIMD
+### Phase 14: SIMD ✅
 
-- [ ] `v128` type support
-- [ ] Vector operations (`v128.add`, `v128.mul`, etc.)
-- [ ] Lane operations (`i32x4.extract_lane`)
+- [x] `v128` type support
+- [x] Vector operations (`i32x4.add`, `f32x4.mul`, etc.) — all 6 interpretations
+- [x] Lane operations (`i32x4.extract_lane`, `i32x4.replace_lane`)
 - [ ] SIMD-friendly loops / auto-vectorization hints
-- [ ] WASM SIMD proposal integration
+- [x] WASM SIMD proposal integration — ~200 instruction mappings
 
 [^1]: Syntactic sugar for atomic operations:
 

@@ -263,6 +263,7 @@ fn primitive_to_string(p: &PrimitiveTy) -> &'static str {
         PrimitiveTy::Bool => "bool",
         PrimitiveTy::Char => "char",
         PrimitiveTy::String => "string",
+        PrimitiveTy::V128 => "v128",
     }
 }
 

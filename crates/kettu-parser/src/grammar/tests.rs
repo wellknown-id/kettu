@@ -890,4 +890,131 @@ mod tests {
             other => panic!("expected AtomicBlock with CompoundAssign, got {:?}", other),
         }
     }
+
+    #[test]
+    fn test_simd_splat_parse() {
+        let src = "interface i {\n  f: func() {\n    i32x4.splat(42);\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdOp { lane, op, args, lane_idx, .. }) => {
+                assert!(matches!(lane, crate::ast::SimdLane::I32x4));
+                assert!(matches!(op, crate::ast::SimdOp::Splat));
+                assert_eq!(args.len(), 1);
+                assert!(lane_idx.is_none());
+            }
+            other => panic!("expected SimdOp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_simd_add_parse() {
+        let src = "interface i {\n  f: func() {\n    i32x4.add(a, b);\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdOp { lane, op, args, .. }) => {
+                assert!(matches!(lane, crate::ast::SimdLane::I32x4));
+                assert!(matches!(op, crate::ast::SimdOp::Add));
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected SimdOp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_simd_extract_lane_parse() {
+        let src = "interface i {\n  f: func() {\n    i32x4.extract_lane(v, 2);\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdOp { lane, op, lane_idx, args, .. }) => {
+                assert!(matches!(lane, crate::ast::SimdLane::I32x4));
+                assert!(matches!(op, crate::ast::SimdOp::ExtractLane));
+                assert_eq!(*lane_idx, Some(2));
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected SimdOp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_simd_v128_bitwise_parse() {
+        let src = "interface i {\n  f: func() {\n    v128.and(a, b);\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdOp { lane, op, args, .. }) => {
+                assert!(matches!(lane, crate::ast::SimdLane::V128));
+                assert!(matches!(op, crate::ast::SimdOp::And));
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected SimdOp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_simd_f64x2_parse() {
+        let src = "interface i {\n  f: func() {\n    f64x2.mul(a, b);\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdOp { lane, op, args, .. }) => {
+                assert!(matches!(lane, crate::ast::SimdLane::F64x2));
+                assert!(matches!(op, crate::ast::SimdOp::Mul));
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected SimdOp, got {:?}", other),
+        }
+    }
 }

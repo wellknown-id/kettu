@@ -229,6 +229,11 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
                 analyze_statement(stmt, scope);
             }
         }
+        Expr::SimdOp { args, .. } => {
+            for arg in args {
+                analyze_captures(arg, scope);
+            }
+        }
         // Terminals - no recursion needed
         Expr::Integer(_, _) | Expr::Bool(_, _) | Expr::String(_, _) | Expr::Ident(_) => {}
     }
@@ -460,6 +465,11 @@ fn collect_free_variables(expr: &Expr, bound: &HashSet<String>, free: &mut HashS
         Expr::AtomicBlock { body, .. } => {
             for stmt in body {
                 collect_free_in_statement(stmt, bound, free);
+            }
+        }
+        Expr::SimdOp { args, .. } => {
+            for arg in args {
+                collect_free_variables(arg, bound, free);
             }
         }
         // Terminals

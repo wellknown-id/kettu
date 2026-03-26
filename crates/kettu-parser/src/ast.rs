@@ -472,6 +472,8 @@ pub enum Expr {
     ThreadJoin { tid: Box<Expr>, span: Span },
     /// Atomic block: `atomic { stmts }` - sugar for atomic operations on shared vars
     AtomicBlock { body: Vec<Statement>, span: Span },
+    /// SIMD operation: `interpretation.op(args)` — e.g. `i32x4.add(a, b)`
+    SimdOp { lane: SimdLane, op: SimdOp, args: Vec<Expr>, lane_idx: Option<u8>, span: Span },
 }
 
 /// Pattern for match arms
@@ -570,6 +572,100 @@ pub enum PrimitiveTy {
     Bool,
     Char,
     String,
+    V128,
+}
+
+/// SIMD lane interpretation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimdLane {
+    I8x16,
+    I16x8,
+    I32x4,
+    I64x2,
+    F32x4,
+    F64x2,
+    /// `v128` — for bitwise ops and load/store
+    V128,
+}
+
+/// SIMD operation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimdOp {
+    // Construction
+    Splat,
+    // Arithmetic
+    Add,
+    Sub,
+    Mul,
+    Neg,
+    Abs,
+    // Float-only arithmetic
+    Div,
+    Sqrt,
+    Ceil,
+    Floor,
+    Trunc,
+    Nearest,
+    // Integer shifts
+    Shl,
+    ShrS,
+    ShrU,
+    // Min / Max
+    Min,
+    Max,
+    // Lane access
+    ExtractLane,
+    ReplaceLane,
+    // Comparisons (return v128 mask)
+    Eq,
+    Ne,
+    LtS,
+    LtU,
+    GtS,
+    GtU,
+    LeS,
+    LeU,
+    GeS,
+    GeU,
+    // Float comparisons
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    // Bitwise (v128 interpretation)
+    And,
+    Or,
+    Xor,
+    Not,
+    AndNot,
+    Bitselect,
+    // Test
+    AnyTrue,
+    AllTrue,
+    Bitmask,
+    // Swizzle / Shuffle
+    Swizzle,
+    // Memory
+    Load,
+    Store,
+    // Integer-specific
+    Popcnt,
+    AvgRU,
+    // Widening / Narrowing
+    ExtMulLowS,
+    ExtMulLowU,
+    ExtMulHighS,
+    ExtMulHighU,
+    ExtAddPairwiseS,
+    ExtAddPairwiseU,
+    NarrowS,
+    NarrowU,
+    ExtendLowS,
+    ExtendLowU,
+    ExtendHighS,
+    ExtendHighU,
+    // Dot product
+    Dot,
 }
 
 /// World definition
