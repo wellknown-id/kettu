@@ -303,3 +303,70 @@ fn test_docs_search_command() {
         "Output should contain search header"
     );
 }
+
+#[test]
+fn test_mcp_initialize() {
+    let mut child = Command::new("cargo")
+        .args(["run", "-p", "kettu-cli", "--", "mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("Failed to start kettu mcp");
+
+    let stdin = child.stdin.as_mut().unwrap();
+    stdin
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\"}}}\n",
+        )
+        .unwrap();
+    drop(child.stdin.take()); // close stdin to signal EOF
+
+    let output = child.wait_with_output().expect("Failed to read output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("\"protocolVersion\""),
+        "Should return protocolVersion: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"tools\""),
+        "Should advertise tools capability: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_mcp_tools_call_check() {
+
+    let mut child = Command::new("cargo")
+        .args(["run", "-p", "kettu-cli", "--", "mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("Failed to start kettu mcp");
+
+    let stdin = child.stdin.as_mut().unwrap();
+    stdin
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"check\",\"arguments\":{\"source\":\"interface math { add: func(a: s32, b: s32) -> s32 { a + b } }\"}}}\n",
+        )
+        .unwrap();
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("Failed to read output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("OK"),
+        "Valid code should pass check: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"isError\":false"),
+        "Should not be an error: {}",
+        stdout
+    );
+}

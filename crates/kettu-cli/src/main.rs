@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 mod docs;
 mod doctest;
+mod mcp;
 
 fn load_imported_asts(
     file: &PathBuf,
@@ -112,6 +113,8 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+    /// Start the MCP server (stdio)
+    Mcp,
 }
 
 #[tokio::main]
@@ -401,6 +404,10 @@ async fn main() {
             } else {
                 docs::print_topic(&topic[0]);
             }
+        }
+
+        Commands::Mcp => {
+            mcp::run_server();
         }
     }
 }

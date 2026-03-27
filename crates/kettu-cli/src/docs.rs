@@ -501,6 +501,85 @@ fn extract_snippet(content: &str, query: &str) -> String {
     }
 }
 
+/// Programmatic search: returns `(selector, title, snippet)` triples sorted by relevance.
+pub fn search_docs_results(query: &str) -> Vec<(String, String, String)> {
+    let pages = load_docs();
+    let groups = grouped(&pages);
+    let query_lower = query.to_lowercase();
+    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+
+    let mut results: Vec<(String, String, u32, String)> = Vec::new();
+
+    for (sec_idx, (_section, topics)) in groups.iter().enumerate() {
+        let sec_num = sec_idx + 1;
+        for (topic_idx, page) in topics.iter().enumerate() {
+            let sub_num = topic_idx + 1;
+            let selector = format!("{}.{}", sec_num, sub_num);
+
+            let mut score: u32 = 0;
+
+            for kw in &page.keywords {
+                if query_words.iter().any(|q| kw.contains(q)) {
+                    score += 10;
+                }
+            }
+
+            let title_lower = page.title.to_lowercase();
+            if title_lower.contains(&query_lower) {
+                score += 8;
+            } else if query_words.iter().any(|q| title_lower.contains(q)) {
+                score += 5;
+            }
+
+            let content_lower = page.content.to_lowercase();
+            if content_lower.contains(&query_lower) {
+                score += 3;
+            }
+
+            if score == 0 {
+                continue;
+            }
+
+            let snippet = extract_snippet(&page.content, &query_lower);
+            results.push((selector, page.title.clone(), score, snippet));
+        }
+    }
+
+    results.sort_by(|a, b| b.2.cmp(&a.2));
+    results.into_iter().map(|(s, t, _, sn)| (s, t, sn)).collect()
+}
+
+/// Return the content of a specific topic as a string, or None if not found.
+pub fn get_topic_text(selector: &str) -> Option<String> {
+    let pages = load_docs();
+    let link_map = build_link_map(&pages);
+    let groups = grouped(&pages);
+    let parts: Vec<&str> = selector.split('.').collect();
+
+    let sec_num: usize = parts[0].parse::<usize>().ok()?;
+    if sec_num < 1 || sec_num > groups.len() {
+        return None;
+    }
+    let (_section_name, topics) = &groups[sec_num - 1];
+
+    if parts.len() == 1 {
+        // Whole section overview
+        let mut out = String::new();
+        for (i, t) in topics.iter().enumerate() {
+            out.push_str(&format!("{}.{}  {}\n", sec_num, i + 1, t.title));
+        }
+        return Some(out);
+    }
+
+    let topic_num: usize = parts.get(1)?.parse::<usize>().ok()?;
+    if topic_num < 1 || topic_num > topics.len() {
+        return None;
+    }
+
+    let topic = topics[topic_num - 1];
+    Some(rewrite_links(&topic.content, &link_map))
+}
+
 /// Return all doc pages as `(title, raw_content, preamble)` triples for doc-testing.
 /// If `selector` is provided, filter to that specific topic/section.
 pub fn get_pages_for_testing(selector: Option<&str>) -> Vec<(String, String, Option<String>)> {

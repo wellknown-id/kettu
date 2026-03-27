@@ -1,0 +1,121 @@
+{
+  "name": "kettu",
+  "displayName": "Kettu",
+  "description": "Kettu language support — LSP diagnostics, completion, hover, and MCP tools for AI chat",
+  "version": "0.1.0",
+  "publisher": "kettu",
+  "engines": {
+    "vscode": "^1.99.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "AI",
+    "Chat"
+  ],
+  "activationEvents": [
+    "onLanguage:kettu",
+    "onLanguage:wit"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "kettu",
+        "aliases": ["Kettu", "kettu"],
+        "extensions": [".kettu"],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "wit",
+        "aliases": ["WIT", "wit"],
+        "extensions": [".wit"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "configuration": {
+      "title": "Kettu",
+      "properties": {
+        "kettu.path": {
+          "type": "string",
+          "default": "kettu",
+          "description": "Path to the kettu binary (defaults to 'kettu' on $PATH)"
+        }
+      }
+    },
+    "languageModelTools": [
+      {
+        "name": "kettu-check",
+        "displayName": "Kettu Check",
+        "description": "Type-check Kettu/WIT source code",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string",
+              "description": "Kettu source code to check"
+            }
+          },
+          "required": ["source"]
+        }
+      },
+      {
+        "name": "kettu-docs-search",
+        "displayName": "Kettu Docs Search",
+        "description": "Search the Kettu language guide by keyword",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query (e.g. 'lists', 'async', 'pattern matching')"
+            }
+          },
+          "required": ["query"]
+        }
+      },
+      {
+        "name": "kettu-docs-read",
+        "displayName": "Kettu Docs Read",
+        "description": "Read a specific topic from the Kettu language guide",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "description": "Topic number (e.g. '1.2' for Data Types)"
+            }
+          },
+          "required": ["topic"]
+        }
+      },
+      {
+        "name": "kettu-emit-wit",
+        "displayName": "Kettu Emit WIT",
+        "description": "Strip Kettu extensions and emit pure WIT",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string",
+              "description": "Kettu source code to convert to WIT"
+            }
+          },
+          "required": ["source"]
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.99.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.0"
+  }
+}
