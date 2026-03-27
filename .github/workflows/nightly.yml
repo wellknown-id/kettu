@@ -6,87 +6,82 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-binaries:
-    name: Build ${{ matrix.name }}
+  build:
+    name: Build ${{ matrix.vscode-target }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            name: kettu-linux-x86_64
+            rust-target: x86_64-unknown-linux-gnu
+            vscode-target: linux-x64
+            binary: kettu
+          - os: ubuntu-latest
+            rust-target: aarch64-unknown-linux-gnu
+            vscode-target: linux-arm64
+            binary: kettu
+            cross: true
           - os: macos-latest
-            target: aarch64-apple-darwin
-            name: kettu-macos-aarch64
+            rust-target: aarch64-apple-darwin
+            vscode-target: darwin-arm64
+            binary: kettu
           - os: macos-13
-            target: x86_64-apple-darwin
-            name: kettu-macos-x86_64
+            rust-target: x86_64-apple-darwin
+            vscode-target: darwin-x64
+            binary: kettu
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            name: kettu-windows-x86_64.exe
+            rust-target: x86_64-pc-windows-msvc
+            vscode-target: win32-x64
+            binary: kettu.exe
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Rust Target
-        run: rustup target add ${{ matrix.target }}
+        run: rustup target add ${{ matrix.rust-target }}
+
+      - name: Install cross (linux-arm64)
+        if: matrix.cross
+        run: cargo install cross --locked
 
       - name: Build Binary
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Rename Binary
-        run: |
-          mv target/${{ matrix.target }}/release/kettu${{ contains(matrix.os, 'windows') && '.exe' || '' }} target/${{ matrix.target }}/release/${{ matrix.name }}
-
-      - name: Upload Binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.name }}
-
-  build-vsix:
-    name: Build VSIX
-    needs: build-binaries
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: crates/kettu-cli/editors/vscode/bin
-
-      - name: Prepare Binaries
-        run: |
-          # The download-artifact action creates subdirectories for each artifact.
-          # We need to flatten them into the bin/ directory.
-          cd crates/kettu-cli/editors/vscode/bin
-          find . -mindepth 2 -type f -exec mv {} . \;
-          find . -type d -empty -delete
-          chmod +x kettu-*
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --release --target ${{ matrix.rust-target }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '24'
 
-      - name: Install Dependencies
+      - name: Install Extension Dependencies
         working-directory: crates/kettu-cli/editors/vscode
         run: npm ci
 
+      - name: Stage Binary
+        shell: bash
+        run: |
+          mkdir -p crates/kettu-cli/editors/vscode/bin
+          cp target/${{ matrix.rust-target }}/release/${{ matrix.binary }} crates/kettu-cli/editors/vscode/bin/${{ matrix.binary }}
+          chmod +x crates/kettu-cli/editors/vscode/bin/${{ matrix.binary }} || true
+
       - name: Package VSIX
         working-directory: crates/kettu-cli/editors/vscode
-        run: npx @vscode/vsce package -o kettu-nightly.vsix
+        run: npx @vscode/vsce package --target ${{ matrix.vscode-target }} -o kettu-${{ matrix.vscode-target }}.vsix
 
       - name: Upload VSIX
         uses: actions/upload-artifact@v4
         with:
-          name: kettu-vsix
-          path: crates/kettu-cli/editors/vscode/kettu-nightly.vsix
+          name: kettu-${{ matrix.vscode-target }}
+          path: crates/kettu-cli/editors/vscode/kettu-${{ matrix.vscode-target }}.vsix
+
+      - name: Upload Standalone Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: kettu-${{ matrix.vscode-target }}-binary
+          path: target/${{ matrix.rust-target }}/release/${{ matrix.binary }}
 
   release:
     name: Create Nightly Release
-    needs: [build-binaries, build-vsix]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -101,7 +96,19 @@ jobs:
       - name: Prepare Assets
         run: |
           mkdir -p release-assets
-          find artifacts -type f -exec cp {} release-assets/ \;
+          find artifacts -type f \( -name '*.vsix' -o -name 'kettu' -o -name 'kettu.exe' \) | while read f; do
+            dir=$(basename "$(dirname "$f")")
+            name=$(basename "$f")
+            if [[ "$name" == "kettu" || "$name" == "kettu.exe" ]]; then
+              # Rename standalone binaries to include platform
+              platform="${dir%-binary}"
+              ext=""
+              [[ "$name" == *.exe ]] && ext=".exe"
+              cp "$f" "release-assets/kettu-${platform}${ext}"
+            else
+              cp "$f" "release-assets/$name"
+            fi
+          done
           ls -la release-assets/
 
       - name: Publish Nightly Release

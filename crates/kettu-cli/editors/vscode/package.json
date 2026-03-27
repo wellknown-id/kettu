@@ -1,16 +1,20 @@
 {
     "name": "kettu",
     "displayName": "Kettu",
-    "description": "Language support for Kettu (.kettu) and WIT (.wit) files",
+    "description": "Kettu language support — LSP diagnostics, syntax highlighting, and MCP tools for AI chat",
     "version": "0.1.0",
     "publisher": "kettu",
     "engines": {
-        "vscode": "^1.75.0"
+        "vscode": "^1.99.0"
     },
     "categories": [
-        "Programming Languages"
+        "Programming Languages",
+        "AI",
+        "Chat"
     ],
-    "activationEvents": [],
+    "activationEvents": [
+        "onStartupFinished"
+    ],
     "main": "./extension.js",
     "contributes": {
         "languages": [
@@ -74,6 +78,74 @@
                 "path": "./kettu-icon-theme.json"
             }
         ],
+        "mcpServerDefinitionProviders": [
+            {
+                "id": "kettuMcpProvider",
+                "label": "Kettu MCP Server"
+            }
+        ],
+        "languageModelTools": [
+            {
+                "name": "kettu-check",
+                "displayName": "Kettu Check",
+                "modelDescription": "Type-check Kettu/WIT source code",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "Kettu source code to check"
+                        }
+                    },
+                    "required": ["source"]
+                }
+            },
+            {
+                "name": "kettu-docs-search",
+                "displayName": "Kettu Docs Search",
+                "modelDescription": "Search the Kettu language guide by keyword",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query (e.g. 'lists', 'async', 'pattern matching')"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "kettu-docs-read",
+                "displayName": "Kettu Docs Read",
+                "modelDescription": "Read a specific topic from the Kettu language guide",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "description": "Topic number (e.g. '1.2' for Data Types)"
+                        }
+                    },
+                    "required": ["topic"]
+                }
+            },
+            {
+                "name": "kettu-emit-wit",
+                "displayName": "Kettu Emit WIT",
+                "modelDescription": "Strip Kettu extensions and emit pure WIT",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "Kettu source code to convert to WIT"
+                        }
+                    },
+                    "required": ["source"]
+                }
+            }
+        ],
         "configuration": {
             "type": "object",
             "title": "Kettu",
@@ -87,11 +159,11 @@
         }
     },
     "scripts": {
-        "vscode:prepublish": "echo 'Ready to publish'",
+        "vscode:prepublish": "node -e \"try{require('fs').chmodSync('./bin/kettu',0o755)}catch(e){}\"",
         "test": "node ./tests/textmate-regex-tests.js"
     },
     "devDependencies": {
-        "@types/vscode": "^1.75.0",
+        "@types/vscode": "^1.99.0",
         "vscode-languageclient": "^9.0.1"
     },
     "dependencies": {

@@ -1,0 +1,15 @@
+# Dev/build files
+src/
+tests/
+tsconfig.json
+.gitignore
+
+# Package manager
+node_modules/
+package-lock.json
+
+# Output artifacts
+*.vsix
+
+# Editor/IDE
+.vscode/
