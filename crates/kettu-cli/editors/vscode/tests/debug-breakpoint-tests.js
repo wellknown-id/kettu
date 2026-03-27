@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { normalizePath, hasBreakpointInRange } = require('../debug-breakpoints');
+const { normalizePath, hasBreakpointInRange, getBreakpointLinesInRange } = require('../debug-breakpoints');
 
 const breakpoints = new Map();
 breakpoints.set(normalizePath('/tmp/sample.kettu'), new Set([3, 10, 21]));
@@ -26,6 +26,18 @@ assert.strictEqual(
     hasBreakpointInRange(breakpoints, '/tmp/other.kettu', 1, 100),
     false,
     'should not match for different files'
+);
+
+assert.deepStrictEqual(
+    getBreakpointLinesInRange(breakpoints, '/tmp/sample.kettu', 2, 12),
+    [3, 10],
+    'should return sorted breakpoint lines within the requested range'
+);
+
+assert.deepStrictEqual(
+    getBreakpointLinesInRange(breakpoints, '/tmp/sample.kettu', 30, 40),
+    [],
+    'should return empty list when no breakpoints are in range'
 );
 
 console.log('Debug breakpoint tests passed');

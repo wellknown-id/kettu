@@ -3,7 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const cp = require('child_process');
 const { LanguageClient, TransportKind } = require('vscode-languageclient/node');
-const { normalizePath, hasBreakpointInRange } = require('./debug-breakpoints');
+const { normalizePath, hasBreakpointInRange, getBreakpointLinesInRange } = require('./debug-breakpoints');
 
 let client;
 let passDecorationType;
@@ -296,6 +296,7 @@ class KettuInlineDebugAdapter {
         this.started = false;
         this.terminated = false;
         this.continueResolver = null;
+        this.resumeAction = 'continue';
         this.threadId = 1;
         this.variablesRef = 1;
     }
@@ -427,8 +428,9 @@ class KettuInlineDebugAdapter {
             }
 
             case 'continue': {
+                this.resumeAction = 'continue';
                 if (this.continueResolver) {
-                    this.continueResolver();
+                    this.continueResolver(this.resumeAction);
                     this.continueResolver = null;
                 }
                 this.sendResponse(message, { allThreadsContinued: true });
@@ -438,8 +440,9 @@ class KettuInlineDebugAdapter {
             case 'next':
             case 'stepIn':
             case 'stepOut': {
+                this.resumeAction = message.command;
                 if (this.continueResolver) {
-                    this.continueResolver();
+                    this.continueResolver(this.resumeAction);
                     this.continueResolver = null;
                 }
                 this.sendResponse(message);
@@ -449,8 +452,9 @@ class KettuInlineDebugAdapter {
             case 'disconnect':
             case 'terminate': {
                 this.terminated = true;
+                this.resumeAction = 'terminate';
                 if (this.continueResolver) {
-                    this.continueResolver();
+                    this.continueResolver(this.resumeAction);
                     this.continueResolver = null;
                 }
                 this.sendResponse(message);
@@ -490,11 +494,28 @@ class KettuInlineDebugAdapter {
 
             const startLine = Number.isInteger(test.line) ? test.line : 1;
             const endLine = Number.isInteger(test.endLine) ? test.endLine : startLine;
-            const stopLine = startLine;
 
-            const isBreakpoint = this.hasBreakpoint(this.program, startLine, endLine);
-            if (isBreakpoint) {
-                await this.stopAndWait('breakpoint', { name: test.name, line: stopLine, status: 'paused' });
+            const breakpointLines = this.getBreakpointLines(this.program, startLine, endLine);
+            if (breakpointLines.length > 0) {
+                let stopLine = breakpointLines[0];
+                let action = await this.stopAndWait('breakpoint', { name: test.name, line: stopLine, status: 'paused' });
+
+                while (!this.terminated && (action === 'next' || action === 'stepIn' || action === 'stepOut')) {
+                    const nextBreakpoint = breakpointLines.find((line) => line > stopLine);
+                    if (typeof nextBreakpoint === 'number') {
+                        stopLine = nextBreakpoint;
+                    } else if (stopLine < endLine) {
+                        stopLine = Math.min(stopLine + 1, endLine);
+                    } else {
+                        break;
+                    }
+
+                    action = await this.stopAndWait('step', {
+                        name: test.name,
+                        line: stopLine,
+                        status: 'stepping',
+                    });
+                }
             }
 
             if (this.terminated) {
@@ -517,7 +538,7 @@ class KettuInlineDebugAdapter {
             if (runResult.exitCode !== 0) {
                 await this.stopAndWait('exception', {
                     name: test.name,
-                    line: stopLine,
+                    line: startLine,
                     status: 'failed',
                 });
             }
@@ -532,6 +553,10 @@ class KettuInlineDebugAdapter {
         return hasBreakpointInRange(this.breakpoints, filePath, startLine, endLine);
     }
 
+    getBreakpointLines(filePath, startLine, endLine) {
+        return getBreakpointLinesInRange(this.breakpoints, filePath, startLine, endLine);
+    }
+
     async stopAndWait(reason, stop) {
         this.currentStop = stop;
         this.sendEvent('stopped', {
@@ -541,9 +566,11 @@ class KettuInlineDebugAdapter {
             description: `${stop.name} (${stop.status})`,
         });
 
-        await new Promise((resolve) => {
+        this.resumeAction = 'continue';
+        const action = await new Promise((resolve) => {
             this.continueResolver = resolve;
         });
+        return action || 'continue';
     }
 
     sendEvent(event, body = {}) {

@@ -5,10 +5,14 @@ function normalizePath(filePath) {
 }
 
 function hasBreakpointInRange(breakpointsMap, filePath, startLine, endLine) {
+    return getBreakpointLinesInRange(breakpointsMap, filePath, startLine, endLine).length > 0;
+}
+
+function getBreakpointLinesInRange(breakpointsMap, filePath, startLine, endLine) {
     const normalized = normalizePath(filePath);
     const lines = breakpointsMap.get(normalized);
     if (!lines || lines.size === 0) {
-        return false;
+        return [];
     }
 
     const start = Number.isInteger(startLine) ? startLine : 0;
@@ -16,16 +20,19 @@ function hasBreakpointInRange(breakpointsMap, filePath, startLine, endLine) {
     const min = Math.min(start, end);
     const max = Math.max(start, end);
 
+    const hits = [];
     for (const line of lines) {
         if (line >= min && line <= max) {
-            return true;
+            hits.push(line);
         }
     }
 
-    return false;
+    hits.sort((a, b) => a - b);
+    return hits;
 }
 
 module.exports = {
     normalizePath,
     hasBreakpointInRange,
+    getBreakpointLinesInRange,
 };
