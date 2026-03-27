@@ -315,6 +315,9 @@ pub fn print_index() {
     println!(
         "Run: \x1b[1mkettu docs <number>\x1b[0m  (e.g. \x1b[36mkettu docs 1.2\x1b[0m)"
     );
+    println!(
+        "     \x1b[1mkettu docs search <query>\x1b[0m  to search topics"
+    );
 }
 
 /// Print a specific topic or section overview.
@@ -462,6 +465,9 @@ pub fn search_docs(query: &str) {
 
     println!(
         "Run: \x1b[1mkettu docs <number>\x1b[0m to read a topic."
+    );
+    println!(
+        "     \x1b[1mkettu docs search <query>\x1b[0m to search topics."
     );
 }
 
