@@ -4,6 +4,7 @@
 // order: 3
 // title: "Async/Await"
 // file: "wasip3"
+// keywords: "wasi, preview3, wasip3, component, async, future, stream"
 ---
 # WASI Preview 3 Support
 

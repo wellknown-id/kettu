@@ -280,4 +280,26 @@ fn test_docs_check_command() {
     );
 }
 
+#[test]
+fn test_docs_search_command() {
+    let output = Command::new("cargo")
+        .args(["run", "-p", "kettu-cli", "--", "docs", "search", "lists"])
+        .output()
+        .expect("Failed to run kettu docs search");
 
+    assert!(
+        output.status.success(),
+        "Search should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Lists"),
+        "Search for 'lists' should find Lists topic"
+    );
+    assert!(
+        stdout.contains("Search results"),
+        "Output should contain search header"
+    );
+}

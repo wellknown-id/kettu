@@ -7,6 +7,7 @@
 // preamble-start
 //   let name = "kettu";
 // preamble-end
+// keywords: "string, text, concatenation, interpolation, length, char"
 ---
 # Strings
 

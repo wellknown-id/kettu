@@ -4,6 +4,7 @@
 // order: 1
 // title: "Packages & Interfaces"
 // file: "packages"
+// keywords: "package, interface, world, namespace, import, export, wit, component"
 ---
 # Packages & Interfaces
 

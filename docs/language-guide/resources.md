@@ -4,6 +4,7 @@
 // order: 10
 // title: "Resources"
 // file: "resources"
+// keywords: "resource, constructor, method, static, lifecycle, handle, own, borrow"
 ---
 # Resources
 

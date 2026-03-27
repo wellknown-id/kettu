@@ -4,6 +4,7 @@
 // order: 12
 // title: "Feature Gates"
 // file: "gates"
+// keywords: "gate, annotation, since, deprecated, unstable, feature, version, stability"
 ---
 # Feature Gates
 

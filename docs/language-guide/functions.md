@@ -10,6 +10,7 @@
 //   let x = 10;
 //   let y = 20;
 // preamble-end
+// keywords: "function, func, return, closure, lambda, async, parameter, argument"
 ---
 # Functions
 

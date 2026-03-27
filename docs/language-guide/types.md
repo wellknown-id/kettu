@@ -10,6 +10,7 @@
 //   let a = 1;
 //   let b = 2;
 // preamble-end
+// keywords: "type, record, variant, enum, flags, option, result, tuple, simd, v128"
 ---
 # Data Types
 

@@ -4,6 +4,7 @@
 // order: 11
 // title: "Testing"
 // file: "testing"
+// keywords: "test, assert, testing, expect, check, verify, unit"
 ---
 # Testing
 

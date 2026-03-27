@@ -10,6 +10,7 @@
 //   let n = 5;
 //   let arr = [1, 2, 3, 4, 5];
 // preamble-end
+// keywords: "closure, lambda, higher-order, map, filter, reduce, callback, anonymous"
 ---
 # Closures & Higher-Order Functions
 

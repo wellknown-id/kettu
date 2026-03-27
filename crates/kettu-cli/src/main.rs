@@ -106,8 +106,8 @@ enum Commands {
     },
     /// Browse the embedded language guide
     Docs {
-        /// Topic number (e.g. 1.2) — omit to see the index
-        topic: Option<String>,
+        /// Topic number (e.g. 1.2), or 'search <query>'
+        topic: Vec<String>,
         /// Verify code snippets in the docs (doc-testing)
         #[arg(long)]
         check: bool,
@@ -374,7 +374,8 @@ async fn main() {
 
         Commands::Docs { topic, check } => {
             if check {
-                let pages = docs::get_pages_for_testing(topic.as_deref());
+                let selector = topic.first().map(|s| s.as_str());
+                let pages = docs::get_pages_for_testing(selector);
                 let refs: Vec<(&str, &str, Option<&str>)> = pages
                     .iter()
                     .map(|(t, c, p)| (t.as_str(), c.as_str(), p.as_deref()))
@@ -388,11 +389,17 @@ async fn main() {
                 if failed > 0 {
                     std::process::exit(1);
                 }
-            } else {
-                match topic {
-                    Some(selector) => docs::print_topic(&selector),
-                    None => docs::print_index(),
+            } else if topic.is_empty() {
+                docs::print_index();
+            } else if topic[0] == "search" {
+                if topic.len() < 2 {
+                    eprintln!("Usage: kettu docs search <query>");
+                    std::process::exit(1);
                 }
+                let query = topic[1..].join(" ");
+                docs::search_docs(&query);
+            } else {
+                docs::print_topic(&topic[0]);
             }
         }
     }

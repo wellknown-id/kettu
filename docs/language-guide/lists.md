@@ -7,6 +7,7 @@
 // preamble-start
 //   let arr = [10, 20, 30];
 // preamble-end
+// keywords: "list, array, collection, index, slice, length, push, pop"
 ---
 # Lists & Collections
 

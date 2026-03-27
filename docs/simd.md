@@ -4,6 +4,7 @@
 // order: 1
 // title: "SIMD"
 // file: "simd"
+// keywords: "simd, vector, parallel, v128, lane, splat, i32x4, f32x4, performance"
 ---
 # SIMD Support
 

@@ -12,6 +12,7 @@
 //   let c = true;
 //   let maybe = #some(5);
 // preamble-end
+// keywords: "expression, operator, arithmetic, comparison, boolean, literal, assignment, if, else, ternary"
 ---
 # Expressions
 

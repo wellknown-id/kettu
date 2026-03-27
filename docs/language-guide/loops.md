@@ -8,6 +8,7 @@
 //   let sum = 0;
 //   let a = 1;
 // preamble-end
+// keywords: "loop, for, while, iteration, range, step, simd, break, continue"
 ---
 # Loops & Iteration
 

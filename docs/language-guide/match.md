@@ -8,6 +8,7 @@
 //   let value = #some(42);
 //   let status = #some(1);
 // preamble-end
+// keywords: "match, pattern, switch, case, variant, option, result, wildcard"
 ---
 # Pattern Matching
 

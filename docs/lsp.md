@@ -4,6 +4,7 @@
 // order: 4
 // title: "Language Server"
 // file: "lsp"
+// keywords: "lsp, language server, ide, completion, hover, diagnostic, editor, vscode"
 ---
 # Kettu LSP Hover Capabilities
 

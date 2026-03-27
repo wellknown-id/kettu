@@ -30,6 +30,8 @@ struct DocPage {
     filename: String,
     /// Optional preamble code to prepend when doc-testing snippets.
     preamble: Option<String>,
+    /// Keywords for search matching.
+    keywords: Vec<String>,
 }
 
 /// Parse a kettu-style frontmatter value from a `// key: "value"` or `// key: value` line.
@@ -151,6 +153,14 @@ fn parse_page(source: &str) -> Option<DocPage> {
     let filename = extract_filename(front, &title_str);
     let preamble = extract_preamble(front);
 
+    // Parse keywords: // keywords: "comma, separated, values"
+    let mut keywords = Vec::new();
+    for line in front.lines() {
+        if let Some(v) = parse_meta(line, "keywords") {
+            keywords = v.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+        }
+    }
+
     Some(DocPage {
         section: section?,
         order: order?,
@@ -158,6 +168,7 @@ fn parse_page(source: &str) -> Option<DocPage> {
         content: strip_frontmatter(source).to_string(),
         filename,
         preamble,
+        keywords,
     })
 }
 
@@ -372,6 +383,116 @@ pub fn print_topic(selector: &str) {
     let topic = topics[topic_num - 1];
     let rewritten = rewrite_links(&topic.content, &link_map);
     println!("{}", rewritten);
+}
+
+/// Search docs by keyword/title/content and print matching results.
+pub fn search_docs(query: &str) {
+    let pages = load_docs();
+    let groups = grouped(&pages);
+    let query_lower = query.to_lowercase();
+    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+
+    // Build (selector, title, score, snippet) for each match
+    let mut results: Vec<(String, &str, u32, String)> = Vec::new();
+
+    for (sec_idx, (_section, topics)) in groups.iter().enumerate() {
+        let sec_num = sec_idx + 1;
+        for (topic_idx, page) in topics.iter().enumerate() {
+            let sub_num = topic_idx + 1;
+            let selector = format!("{}.{}", sec_num, sub_num);
+
+            let mut score: u32 = 0;
+
+            // Score: exact keyword match (highest)
+            for kw in &page.keywords {
+                if query_words.iter().any(|q| kw.contains(q)) {
+                    score += 10;
+                }
+            }
+
+            // Score: title match
+            let title_lower = page.title.to_lowercase();
+            if title_lower.contains(&query_lower) {
+                score += 8;
+            } else if query_words.iter().any(|q| title_lower.contains(q)) {
+                score += 5;
+            }
+
+            // Score: content match
+            let content_lower = page.content.to_lowercase();
+            if content_lower.contains(&query_lower) {
+                score += 3;
+            }
+
+            if score == 0 {
+                continue;
+            }
+
+            // Extract a snippet around the first match in content
+            let snippet = extract_snippet(&page.content, &query_lower);
+
+            results.push((selector, &page.title, score, snippet));
+        }
+    }
+
+    // Sort by score descending
+    results.sort_by(|a, b| b.2.cmp(&a.2));
+
+    if results.is_empty() {
+        println!("No results found for \"{}\".", query);
+        println!("Run `kettu docs` to browse all topics.");
+        return;
+    }
+
+    println!(
+        "\x1b[1mSearch results for \"{}\"\x1b[0m\n",
+        query
+    );
+
+    for (selector, title, _score, snippet) in &results {
+        println!(
+            "  \x1b[36m{}\x1b[0m  \x1b[1m{}\x1b[0m",
+            selector, title
+        );
+        if !snippet.is_empty() {
+            println!("      {}", snippet);
+        }
+        println!();
+    }
+
+    println!(
+        "Run: \x1b[1mkettu docs <number>\x1b[0m to read a topic."
+    );
+}
+
+/// Extract a short snippet around the first occurrence of `query` in `content`.
+fn extract_snippet(content: &str, query: &str) -> String {
+    let content_lower = content.to_lowercase();
+
+    if let Some(pos) = content_lower.find(query) {
+        // Find the line containing the match
+        let line_start = content[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let line_end = content[pos..]
+            .find('\n')
+            .map(|p| pos + p)
+            .unwrap_or(content.len());
+
+        let line = content[line_start..line_end].trim();
+
+        // Skip code fences and headings
+        if line.starts_with("```") || line.is_empty() {
+            return String::new();
+        }
+
+        // Truncate long lines
+        if line.len() > 80 {
+            format!("{}...", &line[..77])
+        } else {
+            line.to_string()
+        }
+    } else {
+        String::new()
+    }
 }
 
 /// Return all doc pages as `(title, raw_content, preamble)` triples for doc-testing.

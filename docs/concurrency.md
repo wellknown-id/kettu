@@ -4,6 +4,7 @@
 // order: 2
 // title: "Concurrency"
 // file: "concurrency"
+// keywords: "concurrency, thread, shared, atomic, spawn, mutex, parallel, sync"
 ---
 # Concurrency in Kettu
 
