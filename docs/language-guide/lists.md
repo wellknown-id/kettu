@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 7
+// title: "Lists & Collections"
+// file: "lists"
+---
 # Lists & Collections
 
 ## List Literals

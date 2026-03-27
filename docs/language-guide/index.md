@@ -1,3 +1,8 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// index: true
+// file: "index"
+---
 # Kettu Language Guide
 
 Kettu is a programming language that extends [WIT (WebAssembly Interface Types)](https://github.com/WebAssembly/component-model/blob/main/design/mvp/WIT.md) with function bodies, enabling both interface definitions and implementation in a single file.

@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 11
+// title: "Testing"
+// file: "testing"
+---
 # Testing
 
 Kettu has a built-in test framework.

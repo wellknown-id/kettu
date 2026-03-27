@@ -119,6 +119,11 @@ Foundation (C): `shared<dtype>` with method syntax. Sugar (B): `shared let` + `a
 - [ ] Automatic rewrite of scalar `for item in list` loops to SIMD when safe
 - [ ] Scalar epilogue generation for remainders
 
+### Phase 16: CLI Enhancements
+
+- [ ] `kettu docs` — embedded, navigable language guide (browse topics from the terminal)
+- [ ] `kettu mcp` — Model Context Protocol mode (expose compiler and select CLI capabilities to AI tooling; docs, check, test etc)
+
 [^1]: Syntactic sugar for atomic operations:
 
 ```kettu

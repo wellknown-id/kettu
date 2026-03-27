@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 5
+// title: "Loops & Iteration"
+// file: "loops"
+---
 # Loops & Iteration
 
 ## While Loop

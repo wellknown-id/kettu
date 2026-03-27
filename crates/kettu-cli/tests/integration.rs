@@ -212,3 +212,47 @@ fn test_check_type_error() {
         combined
     );
 }
+
+#[test]
+fn test_docs_command() {
+    let output = Command::new("cargo")
+        .args(["run", "-p", "kettu-cli", "--", "docs"])
+        .output()
+        .expect("Failed to run kettu docs");
+
+    assert!(output.status.success(), "Docs command should succeed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Language Topics"),
+        "Output should contain 'Language Topics' section"
+    );
+    assert!(
+        stdout.contains("Advanced Topics"),
+        "Output should contain 'Advanced Topics' section"
+    );
+    assert!(
+        stdout.contains("1.1"),
+        "Output should contain numbered sub-topics"
+    );
+}
+
+#[test]
+fn test_docs_topic_command() {
+    let output = Command::new("cargo")
+        .args(["run", "-p", "kettu-cli", "--", "docs", "1.1"])
+        .output()
+        .expect("Failed to run kettu docs 1.1");
+
+    assert!(
+        output.status.success(),
+        "Docs topic command should succeed"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Packages"),
+        "Output should contain the Packages topic content"
+    );
+}
+

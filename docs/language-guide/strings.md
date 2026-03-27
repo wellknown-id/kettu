@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 9
+// title: "Strings"
+// file: "strings"
+---
 # Strings
 
 ## String Literals

@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 4
+// title: "Expressions"
+// file: "expressions"
+---
 # Expressions
 
 ## Literals

@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 12
+// title: "Feature Gates"
+// file: "gates"
+---
 # Feature Gates
 
 Feature gates control API stability and deprecation.

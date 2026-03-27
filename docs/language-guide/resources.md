@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 10
+// title: "Resources"
+// file: "resources"
+---
 # Resources
 
 Resources are handle types that represent external objects with lifetimes.

@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 6
+// title: "Pattern Matching"
+// file: "match"
+---
 # Pattern Matching
 
 ## Match Expression

@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Advanced Topics"
+// order: 3
+// title: "Async/Await"
+// file: "wasip3"
+---
 # WASI Preview 3 Support
 
 Kettu supports WASI Preview 3 async functions via the `--wasip3` flag. This enables stackless async/await with proper Component Model integration.

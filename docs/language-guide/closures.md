@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 8
+// title: "Closures & HOFs"
+// file: "closures"
+---
 # Closures & Higher-Order Functions
 
 ## Lambdas

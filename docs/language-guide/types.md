@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 2
+// title: "Data Types"
+// file: "types"
+---
 # Data Types
 
 ## Primitive Types

@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Advanced Topics"
+// order: 4
+// title: "Language Server"
+// file: "lsp"
+---
 # Kettu LSP Hover Capabilities
 
 This document describes what hover currently supports in `kettu-lsp`.

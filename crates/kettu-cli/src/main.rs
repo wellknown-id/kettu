@@ -6,6 +6,8 @@ use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
 
+mod docs;
+
 fn load_imported_asts(
     file: &PathBuf,
     ast: &kettu_parser::WitFile,
@@ -100,6 +102,11 @@ enum Commands {
     EmitWit {
         /// Input file
         file: PathBuf,
+    },
+    /// Browse the embedded language guide
+    Docs {
+        /// Topic number (e.g. 1.2) — omit to see the index
+        topic: Option<String>,
     },
 }
 
@@ -358,6 +365,13 @@ async fn main() {
                     std::process::exit(1);
                 }
                 let _ = (passed, failed); // Suppress unused warning
+            }
+        }
+
+        Commands::Docs { topic } => {
+            match topic {
+                Some(selector) => docs::print_topic(&selector),
+                None => docs::print_index(),
             }
         }
     }

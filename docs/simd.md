@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Advanced Topics"
+// order: 1
+// title: "SIMD"
+// file: "simd"
+---
 # SIMD Support
 
 Kettu provides full WebAssembly SIMD support through an ergonomic `interpretation.op(args)` syntax pattern. SIMD operations work on 128-bit vectors (v128) with 6 typed interpretations.

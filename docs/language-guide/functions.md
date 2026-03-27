@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 3
+// title: "Functions"
+// file: "functions"
+---
 # Functions
 
 ## Function Signatures

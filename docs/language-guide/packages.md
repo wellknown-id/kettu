@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 1
+// title: "Packages & Interfaces"
+// file: "packages"
+---
 # Packages & Interfaces
 
 ## Package Declaration

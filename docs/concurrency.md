@@ -1,3 +1,10 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Advanced Topics"
+// order: 2
+// title: "Concurrency"
+// file: "concurrency"
+---
 # Concurrency in Kettu
 
 Kettu provides first-class concurrency support via the WASM Threads proposal. All concurrency primitives compile to standard WebAssembly atomics and shared memory — no runtime or GC required.
