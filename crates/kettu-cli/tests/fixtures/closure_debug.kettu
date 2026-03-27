@@ -1,0 +1,10 @@
+package local:closure_debug;
+
+interface tests {
+    @test
+    step_into_closure: func() -> bool {
+        let base = 10;
+        let total = reduce([1, 2, 3], 0) |acc, n| acc + n + base;
+        return total > 0;
+    }
+}

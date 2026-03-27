@@ -552,18 +552,16 @@ fn parse_closures(source_lines: &[String]) -> Vec<ClosureRange> {
     let mut active_start: Option<i64> = None;
     let mut depth: i64 = 0;
     let mut counter = 1;
+    let mut saw_pipe = false;
 
     for (index, line) in source_lines.iter().enumerate() {
         let line_no = (index + 1) as i64;
+        let trimmed = line.trim();
 
-        if active_start.is_none() && line.contains('|') && line.contains('{') {
-            active_start = Some(line_no);
-            depth = 0;
-        }
-
+        // Track whether we're inside a closure body by brace depth once started.
         if active_start.is_some() {
-            depth += line.chars().filter(|c| *c == '{').count() as i64;
-            depth -= line.chars().filter(|c| *c == '}').count() as i64;
+            depth += trimmed.chars().filter(|c| *c == '{').count() as i64;
+            depth -= trimmed.chars().filter(|c| *c == '}').count() as i64;
 
             if depth <= 0 {
                 let start_line = active_start.unwrap_or(line_no);
@@ -573,6 +571,46 @@ fn parse_closures(source_lines: &[String]) -> Vec<ClosureRange> {
                     name: format!("closure#{}", counter),
                 });
                 counter += 1;
+                active_start = None;
+                depth = 0;
+            }
+            continue;
+        }
+
+        // Detect the start of a closure header: a pipe indicates parameters.
+        if trimmed.contains('|') {
+            saw_pipe = true;
+        }
+
+        // Start counting when we see an opening brace after a header with a pipe
+        // (can be on the same line or the following line). If there is no brace,
+        // treat it as a single-line closure body on that line.
+        if saw_pipe {
+            if trimmed.contains('{') {
+                active_start = Some(line_no);
+                depth = trimmed.chars().filter(|c| *c == '{').count() as i64;
+                depth -= trimmed.chars().filter(|c| *c == '}').count() as i64;
+                saw_pipe = false;
+                if depth <= 0 {
+                    // Single-line closure like `|x| { x + 1 }`.
+                    closures.push(ClosureRange {
+                        start_line: line_no,
+                        end_line: line_no,
+                        name: format!("closure#{}", counter),
+                    });
+                    counter += 1;
+                    active_start = None;
+                    depth = 0;
+                }
+            } else {
+                // No braces: treat as inline expression closure on this line.
+                closures.push(ClosureRange {
+                    start_line: line_no,
+                    end_line: line_no,
+                    name: format!("closure#{}", counter),
+                });
+                counter += 1;
+                saw_pipe = false;
                 active_start = None;
                 depth = 0;
             }
@@ -763,6 +801,8 @@ fn read_dap_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
 #[cfg(test)]
 mod tests {
     use super::{infer_locals, parse_closures, DebugSession, ListedTest};
+    use serde_json::json;
+    use std::path::PathBuf;
 
     #[test]
     fn closure_ranges_are_detected() {
@@ -821,5 +861,36 @@ mod tests {
 
         assert_eq!(a.value, "2");
         assert_eq!(b.value, "\"ok\"");
+    }
+
+    #[test]
+    fn stack_trace_includes_closure_frame() {
+        let lines = vec![
+            "interface t {".to_string(),
+            "  @test fn t() -> bool {".to_string(),
+            "    let y = reduce([1,2], 0) |acc, n| {".to_string(),
+            "      acc + n".to_string(),
+            "    }".to_string(),
+            "    true".to_string(),
+            "  }".to_string(),
+            "}".to_string(),
+        ];
+
+        let closures = parse_closures(&lines);
+        let mut session = DebugSession::new();
+        session.program = Some(PathBuf::from("/tmp/file.kettu"));
+        session.source_lines = lines;
+        session.tests = vec![ListedTest {
+            name: "t".into(),
+            line: 2,
+            end_line: 7,
+        }];
+        session.current_line = 4; // inside closure
+        session.closures = closures;
+
+        let frames = super::build_stack_frames(&session);
+        assert!(frames.len() >= 2);
+        assert_eq!(frames[0].get("name"), Some(&json!("closure#1")));
+        assert_eq!(frames[1].get("name"), Some(&json!('@'.to_string() + "test t")));
     }
 }
