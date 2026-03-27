@@ -72,7 +72,7 @@ interface demo-types {
 
     // Functions can work with these types.
     origin: func() -> point {
-        return point { x: 0, y: 0 };
+        return { x: 0, y: 0 };
     }
 }
 ```

@@ -1,0 +1,14 @@
+package example:hello;
+
+/// A simple greeter interface.
+interface greeter {
+    /// Return a friendly greeting.
+    greet: func(name: string) -> string {
+        return "Hello, " + name + "!";
+    }
+}
+
+/// The world defines what this component exports.
+world hello-world {
+    export greeter;
+}

@@ -251,8 +251,8 @@ fn test_docs_topic_command() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Packages"),
-        "Output should contain the Packages topic content"
+        stdout.contains("Hello World"),
+        "Output should contain the Hello World topic content"
     );
 }
 
