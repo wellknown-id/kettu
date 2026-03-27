@@ -43,6 +43,11 @@ kettu build example.kettu
 kettu build --threads example.kettu   # with concurrency
 ```
 
+## Debugging
+
+- VS Code: the bundled extension launches `kettu dap` as a Debug Adapter executable. Use the `Kettu: Debug tests in current file` command or a `"type": "kettu"` launch config.
+- CLI: run `kettu dap` to start a DAP server over stdio (for editors/clients that speak raw DAP).
+
 ## Documentation
 
 - [Language Overview](docs/language-overview.md) — types, control flow, functions

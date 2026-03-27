@@ -49,6 +49,9 @@ kettu check file.kettu
 # Start LSP server
 kettu lsp
 
+# Start Debug Adapter Protocol server (stdio)
+kettu dap
+
 # Emit pure WIT (strip function bodies)
 kettu emit-wit file.kettu
 ```
