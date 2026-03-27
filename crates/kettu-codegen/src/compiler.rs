@@ -1381,7 +1381,7 @@ impl<'a> ModuleCompiler<'a> {
             match expr {
                 Expr::Await { expr, .. } => 1 + count_in_expr(expr),
                 Expr::Binary { lhs, rhs, .. } => count_in_expr(lhs) + count_in_expr(rhs),
-                Expr::Not(inner, _) => count_in_expr(inner),
+                Expr::Not(inner, _) | Expr::Neg(inner, _) => count_in_expr(inner),
                 Expr::If {
                     cond,
                     then_branch,
@@ -2439,6 +2439,12 @@ impl<'a> ModuleCompiler<'a> {
                 self.compile_expr(function, expr)?;
                 // Negate: 0 -> 1, non-zero -> 0
                 function.instruction(&Instruction::I32Eqz);
+            }
+            Expr::Neg(expr, _) => {
+                // Unary negation: 0 - expr
+                function.instruction(&Instruction::I32Const(0));
+                self.compile_expr(function, expr)?;
+                function.instruction(&Instruction::I32Sub);
             }
             Expr::StrLen(expr, _) => {
                 // Compile string expression (pushes pointer)
@@ -3698,6 +3704,12 @@ impl<'a> ModuleCompiler<'a> {
                 self.compile_expr_with_locals(function, expr, locals, locals_types)?;
                 // Negate: 0 -> 1, non-zero -> 0
                 function.instruction(&Instruction::I32Eqz);
+            }
+            Expr::Neg(expr, _) => {
+                // Unary negation: 0 - expr
+                function.instruction(&Instruction::I32Const(0));
+                self.compile_expr_with_locals(function, expr, locals, locals_types)?;
+                function.instruction(&Instruction::I32Sub);
             }
             Expr::StrLen(expr, _) => {
                 // Compile string expression (pushes pointer)

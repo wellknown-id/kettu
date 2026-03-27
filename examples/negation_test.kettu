@@ -1,0 +1,38 @@
+package local:negation-test;
+
+interface negation-tests {
+    @test
+    test-neg-literal: func() -> bool {
+        let x = -5;
+        return x == 0 - 5;
+    }
+
+    @test
+    test-neg-variable: func() -> bool {
+        let a = 10;
+        let b = -a;
+        return b == 0 - 10;
+    }
+
+    @test
+    test-neg-in-expr: func() -> bool {
+        return (-5) + 10 == 5;
+    }
+
+    @test
+    test-double-neg: func() -> bool {
+        let a = 5;
+        return -(-a) == 5;
+    }
+
+    @test
+    test-sub-neg: func() -> bool {
+        let a = 10;
+        let b = 3;
+        return a - -b == 13;
+    }
+}
+
+world tests {
+    export negation-tests;
+}

@@ -586,6 +586,7 @@ fn expr_with_span(cst: &grammar::Expr, outer_span: Range<usize>) -> ast::Expr {
         grammar::Expr::Ident(name) => ast::Expr::Ident(spanned_id(name)),
         grammar::Expr::Parens(p) => sexpr(&p.inner),
         grammar::Expr::Not(_, e) => ast::Expr::Not(Box::new(sexpr(e)), outer_span),
+        grammar::Expr::Neg(_, e) => ast::Expr::Neg(Box::new(sexpr(e)), outer_span),
         grammar::Expr::Assert(_, e) => ast::Expr::Assert(Box::new(sexpr(e)), outer_span),
         grammar::Expr::Await(_, e) => ast::Expr::Await {
             expr: Box::new(sexpr(e)),

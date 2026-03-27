@@ -87,7 +87,7 @@
     "operators": {
       "patterns": [
         {
-          "match": ";|:|@|/|@since|\\(|=|\\)|@unstable|@deprecated|@test|\\{|\\}|\\.|,|<|>|u8|u16|u32|u64|s8|s16|s32|s64|f32|f64|->|\\+=|-=|!|\\|\\||&&|==|!=|<=|>=|\\+|-|\\*|\\?|\\?\\.|\\[|\\]|\\.\\.|#|=>|str-len|str-eq|list-len|list-set|list-push|\\||v128|i8x16|i16x8|i32x4|i64x2|f32x4|f64x2",
+          "match": ";|:|@|/|@since|\\(|=|\\)|@unstable|@deprecated|@test|\\{|\\}|\\.|,|<|>|u8|u16|u32|u64|s8|s16|s32|s64|f32|f64|->|\\+=|-=|!|-|\\|\\||&&|==|!=|<=|>=|\\+|\\*|\\?|\\?\\.|\\[|\\]|\\.\\.|#|=>|str-len|str-eq|list-len|list-set|list-push|\\||v128|i8x16|i16x8|i32x4|i64x2|f32x4|f64x2",
           "name": "keyword.operator.kettu"
         }
       ]

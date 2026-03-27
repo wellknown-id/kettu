@@ -333,6 +333,8 @@ pub enum Expr {
     Assert(Box<Expr>, Span),
     /// Negation: `!expr`
     Not(Box<Expr>, Span),
+    /// Unary negation: `-expr`
+    Neg(Box<Expr>, Span),
     /// String length: `str-len(expr)`
     StrLen(Box<Expr>, Span),
     /// String equality: `str-eq(a, b)`

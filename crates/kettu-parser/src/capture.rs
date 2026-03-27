@@ -172,7 +172,7 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
                 }
             }
         }
-        Expr::Assert(e, _) | Expr::Not(e, _) | Expr::StrLen(e, _) | Expr::ListLen(e, _) => {
+        Expr::Assert(e, _) | Expr::Not(e, _) | Expr::Neg(e, _) | Expr::StrLen(e, _) | Expr::ListLen(e, _) => {
             analyze_captures(e, scope);
         }
         Expr::StrEq(a, b, _) => {
@@ -416,7 +416,7 @@ fn collect_free_variables(expr: &Expr, bound: &HashSet<String>, free: &mut HashS
                 }
             }
         }
-        Expr::Assert(e, _) | Expr::Not(e, _) | Expr::StrLen(e, _) | Expr::ListLen(e, _) => {
+        Expr::Assert(e, _) | Expr::Not(e, _) | Expr::Neg(e, _) | Expr::StrLen(e, _) | Expr::ListLen(e, _) => {
             collect_free_variables(e, bound, free);
         }
         Expr::StrEq(a, b, _) => {

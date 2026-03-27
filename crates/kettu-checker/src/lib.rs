@@ -1042,6 +1042,17 @@ impl Checker {
                 }
                 CheckedType::Bool
             }
+            Expr::Neg(expr, span) => {
+                let expr_ty = self.check_expr(expr);
+                if !self.is_numeric(&expr_ty) && expr_ty != CheckedType::Unknown {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("Unary minus requires numeric type, got {:?}", expr_ty),
+                        span.clone(),
+                        DiagnosticCode::TypeMismatch,
+                    ));
+                }
+                CheckedType::I32
+            }
             Expr::StrLen(expr, span) => {
                 let expr_ty = self.check_expr(expr);
                 if expr_ty != CheckedType::String && expr_ty != CheckedType::Unknown {

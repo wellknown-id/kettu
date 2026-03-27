@@ -896,6 +896,9 @@ pub enum Expr {
     /// `!expr`
     #[prec_left(7)]
     Not(#[leaf("!")] (), Spanned<Box<Expr>>),
+    /// `-expr` (unary negation)
+    #[prec_left(7)]
+    Neg(#[leaf("-")] (), Spanned<Box<Expr>>),
     /// `assert expr`
     #[prec_left(7)]
     Assert(#[leaf("assert")] (), Spanned<Box<Expr>>),
