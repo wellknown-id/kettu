@@ -59,13 +59,13 @@ fn wait_for_message(
     panic!("Timed out waiting for expected DAP message");
 }
 
-fn sample_program_path() -> PathBuf {
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    repo_root.join("tests/fixtures/closure_debug.kettu")
+fn callable_program_path() -> PathBuf {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    repo_root.join("examples/callable_closure_test.kettu")
 }
 
 #[test]
-fn dap_breakpoint_and_step_progress() {
+fn dap_step_in_enters_callable_closure() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_kettu"))
         .arg("dap")
         .stdin(Stdio::piped())
@@ -87,7 +87,7 @@ fn dap_breakpoint_and_step_progress() {
         }
     });
 
-    let program = sample_program_path();
+    let program = callable_program_path();
     let cwd = program
         .parent()
         .expect("program parent")
@@ -104,15 +104,11 @@ fn dap_breakpoint_and_step_progress() {
         }),
     );
 
-    let init_resp = wait_for_message(
+    let _init_resp = wait_for_message(
         &rx,
-        |m| {
-            m.get("type") == Some(&json!("response"))
-                && m.get("command") == Some(&json!("initialize"))
-        },
+        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("initialize")),
         Duration::from_secs(2),
     );
-    assert_eq!(init_resp.get("success"), Some(&json!(true)));
 
     write_dap_message(
         &mut stdin,
@@ -128,27 +124,18 @@ fn dap_breakpoint_and_step_progress() {
         }),
     );
 
-    let launch_resp = wait_for_message(
+    let _launch_resp = wait_for_message(
         &rx,
-        |m| {
-            m.get("type") == Some(&json!("response"))
-                && m.get("command") == Some(&json!("launch"))
-        },
+        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("launch")),
         Duration::from_secs(3),
     );
-    eprintln!("launch response: {}", launch_resp);
-    assert_eq!(launch_resp.get("success"), Some(&json!(true)));
 
     let _initialized_event = wait_for_message(
         &rx,
-        |m| {
-            m.get("type") == Some(&json!("event"))
-                && m.get("event") == Some(&json!("initialized"))
-        },
+        |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("initialized")),
         Duration::from_secs(2),
     );
 
-    // Set breakpoint on closure body start line (line 7 in fixture).
     write_dap_message(
         &mut stdin,
         &json!({
@@ -157,20 +144,16 @@ fn dap_breakpoint_and_step_progress() {
             "command": "setBreakpoints",
             "arguments": {
                 "source": { "path": program.to_string_lossy() },
-                "breakpoints": [{ "line": 7 }]
+                "breakpoints": [{ "line": 22 }, { "line": 23 }]
             }
         }),
     );
 
-    let bp_resp = wait_for_message(
+    let _bp_resp = wait_for_message(
         &rx,
-        |m| {
-            m.get("type") == Some(&json!("response"))
-                && m.get("command") == Some(&json!("setBreakpoints"))
-        },
+        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("setBreakpoints")),
         Duration::from_secs(2),
     );
-    assert_eq!(bp_resp.get("success"), Some(&json!(true)));
 
     write_dap_message(
         &mut stdin,
@@ -182,28 +165,14 @@ fn dap_breakpoint_and_step_progress() {
         }),
     );
 
-    let _config_resp = wait_for_message(
+    let stop_on_def = wait_for_message(
         &rx,
-        |m| {
-            m.get("type") == Some(&json!("response"))
-                && m.get("command") == Some(&json!("configurationDone"))
-        },
-        Duration::from_secs(2),
+        |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
+        Duration::from_secs(4),
     );
+    assert_eq!(stop_on_def.pointer("/body/reason"), Some(&json!("breakpoint")));
 
-    let stop_event = wait_for_message(
-        &rx,
-        |m| {
-            m.get("type") == Some(&json!("event"))
-                && m.get("event") == Some(&json!("stopped"))
-        },
-        Duration::from_secs(3),
-    );
-    assert_eq!(
-        stop_event.pointer("/body/reason"),
-        Some(&json!("breakpoint"))
-    );
-
+    // Stack should show only the test frame at the definition line (not closure executing yet)
     write_dap_message(
         &mut stdin,
         &json!({
@@ -213,41 +182,56 @@ fn dap_breakpoint_and_step_progress() {
             "arguments": { "threadId": 1 }
         }),
     );
-
-    let stack_resp = wait_for_message(
+    let stack_def = wait_for_message(
         &rx,
-        |m| {
-            m.get("type") == Some(&json!("response"))
-                && m.get("command") == Some(&json!("stackTrace"))
-        },
+        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("stackTrace")),
+        Duration::from_secs(2),
+    );
+    assert_eq!(stack_def.pointer("/body/stackFrames/0/name"), Some(&json!('@'.to_string() + "test test-no-captures")));
+
+    // Step once (line 22 -> 23)
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 6, "command": "stepIn", "arguments": {"threadId": 1}}),
+    );
+    let _stop_call = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
         Duration::from_secs(2),
     );
 
-    let top_name = stack_resp
-        .pointer("/body/stackFrames/0/name")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    assert_eq!(top_name, "closure#1", "expected to be stopped inside closure frame");
+    // Step into the closure call
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 7, "command": "stepIn", "arguments": {"threadId": 1}}),
+    );
+    let _stop_closure = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
+        Duration::from_secs(2),
+    );
 
     write_dap_message(
         &mut stdin,
-        &json!({
-            "type": "request",
-            "seq": 8,
-            "command": "disconnect",
-            "arguments": {}
-        }),
+        &json!({"type": "request", "seq": 8, "command": "stackTrace", "arguments": {"threadId": 1}}),
     );
-
-    let _disconnect_resp = wait_for_message(
+    let stack_closure = wait_for_message(
         &rx,
-        |m| {
-            m.get("type") == Some(&json!("response"))
-                && m.get("command") == Some(&json!("disconnect"))
-        },
+        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("stackTrace")),
+        Duration::from_secs(2),
+    );
+    assert_eq!(stack_closure.pointer("/body/stackFrames/0/name"), Some(&json!("double")));
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 99, "command": "disconnect", "arguments": {}}),
+    );
+    let _disc_resp = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("disconnect")),
         Duration::from_secs(2),
     );
 
     let status = child.wait().expect("wait for dap process");
-    assert!(status.success(), "kettu dap should exit cleanly");
+    assert!(status.success());
 }

@@ -39,6 +39,8 @@ struct DebugSession {
     current_line: i64,
     breakpoints: HashMap<String, BTreeSet<i64>>,
     locals: Vec<Variable>,
+    active_closure: Option<ClosureRange>,
+    resume_line_after_closure: Option<i64>,
 }
 
 impl DebugSession {
@@ -56,6 +58,8 @@ impl DebugSession {
             current_line: 0,
             breakpoints: HashMap::new(),
             locals: Vec::new(),
+            active_closure: None,
+            resume_line_after_closure: None,
         }
     }
 
@@ -96,6 +100,21 @@ impl DebugSession {
         }
 
         loop {
+            // If we're stepping inside a closure body, stay within its range and then resume
+            if let Some(active) = &self.active_closure {
+                if self.current_line < active.end_line {
+                    self.current_line += 1;
+                    self.set_current_locals();
+                    return true;
+                } else {
+                    // Exiting closure: resume after the call site
+                    self.active_closure = None;
+                    let resume = self.resume_line_after_closure.take().unwrap_or(self.current_line + 1);
+                    self.current_line = resume - 1;
+                    continue;
+                }
+            }
+
             if self.current_test >= self.tests.len() {
                 return false;
             }
@@ -127,13 +146,36 @@ impl DebugSession {
     fn run_until_breakpoint_or_end(&mut self) -> StopOutcome {
         while self.advance_one_line() {
             if self.breakpoint_hit(self.current_line) {
+                if self.active_closure.is_none() {
+                    if let Some(cl) = self
+                        .closures
+                        .iter()
+                        .find(|c| self.current_line >= c.start_line && self.current_line <= c.end_line)
+                        .cloned()
+                    {
+                        if cl.start_line != cl.end_line || self.resume_line_after_closure.is_some() {
+                            self.active_closure = Some(cl);
+                        }
+                    }
+                }
                 return StopOutcome::Stopped("breakpoint");
             }
         }
         StopOutcome::Terminated
     }
 
-    fn step_once_or_end(&mut self) -> StopOutcome {
+    fn step_once_or_end(&mut self, action: &str) -> StopOutcome {
+        // If stepping into and we're at a call site to a known inline closure, enter it
+        if action == "stepIn" && self.active_closure.is_none() {
+            if let Some((closure, resume_line)) = find_invoked_closure(&self.source_lines, self.current_line, &self.closures) {
+                self.active_closure = Some(closure);
+                self.resume_line_after_closure = Some(resume_line);
+                self.current_line = self.active_closure.as_ref().unwrap().start_line;
+                self.set_current_locals();
+                return StopOutcome::Stopped("step");
+            }
+        }
+
         if self.advance_one_line() {
             if self.breakpoint_hit(self.current_line) {
                 StopOutcome::Stopped("breakpoint")
@@ -388,7 +430,7 @@ pub fn run_server() -> io::Result<()> {
                     continue;
                 }
 
-                match session.step_once_or_end() {
+                match session.step_once_or_end(command) {
                     StopOutcome::Stopped(reason) => send_stopped_event(&mut writer, reason)?,
                     StopOutcome::Terminated => {
                         session.terminated = true;
@@ -452,11 +494,7 @@ fn build_stack_frames(session: &DebugSession) -> Vec<Value> {
     let mut frames = Vec::new();
     let mut frame_id = 1;
 
-    if let Some(closure) = session
-        .closures
-        .iter()
-        .find(|c| session.current_line >= c.start_line && session.current_line <= c.end_line)
-    {
+    if let Some(closure) = session.active_closure.as_ref() {
         frames.push(json!({
             "id": frame_id,
             "name": closure.name,
@@ -565,10 +603,12 @@ fn parse_closures(source_lines: &[String]) -> Vec<ClosureRange> {
 
             if depth <= 0 {
                 let start_line = active_start.unwrap_or(line_no);
+                let name = extract_closure_name(source_lines, start_line)
+                    .unwrap_or_else(|| format!("closure#{}", counter));
                 closures.push(ClosureRange {
                     start_line,
                     end_line: line_no,
-                    name: format!("closure#{}", counter),
+                    name,
                 });
                 counter += 1;
                 active_start = None;
@@ -593,10 +633,12 @@ fn parse_closures(source_lines: &[String]) -> Vec<ClosureRange> {
                 saw_pipe = false;
                 if depth <= 0 {
                     // Single-line closure like `|x| { x + 1 }`.
+                    let name = extract_closure_name(source_lines, line_no)
+                        .unwrap_or_else(|| format!("closure#{}", counter));
                     closures.push(ClosureRange {
                         start_line: line_no,
                         end_line: line_no,
-                        name: format!("closure#{}", counter),
+                        name,
                     });
                     counter += 1;
                     active_start = None;
@@ -604,10 +646,12 @@ fn parse_closures(source_lines: &[String]) -> Vec<ClosureRange> {
                 }
             } else {
                 // No braces: treat as inline expression closure on this line.
+                let name = extract_closure_name(source_lines, line_no)
+                    .unwrap_or_else(|| format!("closure#{}", counter));
                 closures.push(ClosureRange {
                     start_line: line_no,
                     end_line: line_no,
-                    name: format!("closure#{}", counter),
+                    name,
                 });
                 counter += 1;
                 saw_pipe = false;
@@ -618,6 +662,67 @@ fn parse_closures(source_lines: &[String]) -> Vec<ClosureRange> {
     }
 
     closures
+}
+
+fn extract_closure_name(source_lines: &[String], line_no: i64) -> Option<String> {
+    if line_no <= 0 {
+        return None;
+    }
+    let idx = (line_no - 1) as usize;
+    let line = source_lines.get(idx)?.trim();
+    if !line.starts_with("let ") {
+        return None;
+    }
+    let after_let = line.trim_start_matches("let ");
+    let mut parts = after_let.splitn(2, '=');
+    let name_part = parts.next()?.trim();
+    if name_part.is_empty() {
+        return None;
+    }
+    Some(name_part.trim().trim_end_matches(';').to_string())
+}
+
+fn extract_call_name(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut paren = None;
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'(' {
+            paren = Some(i);
+            break;
+        }
+    }
+    let idx = paren?;
+    if idx == 0 {
+        return None;
+    }
+    let mut start = idx;
+    while start > 0 {
+        let c = bytes[start - 1] as char;
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    if start == idx {
+        return None;
+    }
+    Some(line[start..idx].trim().to_string())
+}
+
+fn find_invoked_closure(
+    source_lines: &[String],
+    current_line: i64,
+    closures: &[ClosureRange],
+) -> Option<(ClosureRange, i64)> {
+    if current_line <= 0 {
+        return None;
+    }
+    let idx = (current_line - 1) as usize;
+    let line = source_lines.get(idx)?;
+    let call_name = extract_call_name(line)?;
+    let closure = closures.iter().find(|c| c.name == call_name)?.clone();
+    Some((closure, current_line + 1))
 }
 
 fn infer_locals(source_lines: &[String], current_line: i64) -> Vec<Variable> {
@@ -886,11 +991,12 @@ mod tests {
             end_line: 7,
         }];
         session.current_line = 4; // inside closure
-        session.closures = closures;
+        session.closures = closures.clone();
+        session.active_closure = Some(closures[0].clone());
 
         let frames = super::build_stack_frames(&session);
         assert!(frames.len() >= 2);
-        assert_eq!(frames[0].get("name"), Some(&json!("closure#1")));
+        assert_eq!(frames[0].get("name"), Some(&json!("y")));
         assert_eq!(frames[1].get("name"), Some(&json!('@'.to_string() + "test t")));
     }
 }
