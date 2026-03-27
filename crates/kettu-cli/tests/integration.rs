@@ -4,6 +4,10 @@ use std::io::Write;
 use std::process::Command;
 use tempfile::NamedTempFile;
 
+fn kettu_cmd() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_kettu"))
+}
+
 #[test]
 fn test_parse_command() {
     let mut file = NamedTempFile::new().unwrap();
@@ -12,15 +16,8 @@ fn test_parse_command() {
     writeln!(file, "    greet: func(name: string) -> string;").unwrap();
     writeln!(file, "}}").unwrap();
 
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "-p",
-            "kettu-cli",
-            "--",
-            "parse",
-            file.path().to_str().unwrap(),
-        ])
+    let output = kettu_cmd()
+        .args(["parse", file.path().to_str().unwrap()])
         .output()
         .expect("Failed to run kettu parse");
 
@@ -35,15 +32,8 @@ fn test_check_command() {
     writeln!(file, "    greet: func(name: string) -> string;").unwrap();
     writeln!(file, "}}").unwrap();
 
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "-p",
-            "kettu-cli",
-            "--",
-            "check",
-            file.path().to_str().unwrap(),
-        ])
+    let output = kettu_cmd()
+        .args(["check", file.path().to_str().unwrap()])
         .output()
         .expect("Failed to run kettu check");
 
@@ -60,15 +50,8 @@ fn test_emit_wit_command() {
     writeln!(file, "    }}").unwrap();
     writeln!(file, "}}").unwrap();
 
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "-p",
-            "kettu-cli",
-            "--",
-            "emit-wit",
-            file.path().to_str().unwrap(),
-        ])
+    let output = kettu_cmd()
+        .args(["emit-wit", file.path().to_str().unwrap()])
         .output()
         .expect("Failed to run kettu emit-wit");
 
@@ -102,12 +85,8 @@ fn test_build_core_command() {
 
     let output_file = NamedTempFile::new().unwrap();
 
-    let output = Command::new("cargo")
+    let output = kettu_cmd()
         .args([
-            "run",
-            "-p",
-            "kettu-cli",
-            "--",
             "build",
             "--core",
             file.path().to_str().unwrap(),
@@ -146,12 +125,8 @@ fn test_build_with_expressions() {
 
     let output_file = NamedTempFile::new().unwrap();
 
-    let output = Command::new("cargo")
+    let output = kettu_cmd()
         .args([
-            "run",
-            "-p",
-            "kettu-cli",
-            "--",
             "build",
             "--core",
             file.path().to_str().unwrap(),
@@ -186,15 +161,8 @@ fn test_check_type_error() {
     writeln!(file, "    }}").unwrap();
     writeln!(file, "}}").unwrap();
 
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "-p",
-            "kettu-cli",
-            "--",
-            "check",
-            file.path().to_str().unwrap(),
-        ])
+    let output = kettu_cmd()
+        .args(["check", file.path().to_str().unwrap()])
         .output()
         .expect("Failed to run kettu check");
 
@@ -215,8 +183,8 @@ fn test_check_type_error() {
 
 #[test]
 fn test_docs_command() {
-    let output = Command::new("cargo")
-        .args(["run", "-p", "kettu-cli", "--", "docs"])
+    let output = kettu_cmd()
+        .args(["docs"])
         .output()
         .expect("Failed to run kettu docs");
 
@@ -239,8 +207,8 @@ fn test_docs_command() {
 
 #[test]
 fn test_docs_topic_command() {
-    let output = Command::new("cargo")
-        .args(["run", "-p", "kettu-cli", "--", "docs", "1.1"])
+    let output = kettu_cmd()
+        .args(["docs", "1.1"])
         .output()
         .expect("Failed to run kettu docs 1.1");
 
@@ -258,8 +226,8 @@ fn test_docs_topic_command() {
 
 #[test]
 fn test_docs_check_command() {
-    let output = Command::new("cargo")
-        .args(["run", "-p", "kettu-cli", "--", "docs", "--check"])
+    let output = kettu_cmd()
+        .args(["docs", "--check"])
         .output()
         .expect("Failed to run kettu docs --check");
 
@@ -282,8 +250,8 @@ fn test_docs_check_command() {
 
 #[test]
 fn test_docs_search_command() {
-    let output = Command::new("cargo")
-        .args(["run", "-p", "kettu-cli", "--", "docs", "search", "lists"])
+    let output = kettu_cmd()
+        .args(["docs", "search", "lists"])
         .output()
         .expect("Failed to run kettu docs search");
 
@@ -306,8 +274,8 @@ fn test_docs_search_command() {
 
 #[test]
 fn test_mcp_initialize() {
-    let mut child = Command::new("cargo")
-        .args(["run", "-p", "kettu-cli", "--", "mcp"])
+    let mut child = kettu_cmd()
+        .args(["mcp"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -340,8 +308,8 @@ fn test_mcp_initialize() {
 #[test]
 fn test_mcp_tools_call_check() {
 
-    let mut child = Command::new("cargo")
-        .args(["run", "-p", "kettu-cli", "--", "mcp"])
+    let mut child = kettu_cmd()
+        .args(["mcp"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
