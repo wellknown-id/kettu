@@ -760,6 +760,8 @@ pub enum Stmt {
     Break(BreakStmt),
     Continue(ContinueStmt),
     Expr(ExprStmt),
+    /// Trailing expression without semicolon (last item in a block)
+    TailExpr(TailExprStmt),
 }
 
 #[derive(Debug, Clone, PartialEq, Rule)]
@@ -863,6 +865,12 @@ pub struct ExprStmt {
     pub expr: Spanned<Expr>,
     #[leaf(";")]
     _semi: (),
+}
+
+/// Trailing expression without semicolon (for block final values like `{ 42 }`)
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct TailExprStmt {
+    pub expr: Spanned<Expr>,
 }
 
 // ============================================================================
@@ -993,6 +1001,7 @@ pub enum Expr {
     /// `#case` — variant literal (payload handled via Call if needed)
     VariantLiteral(#[leaf("#")] (), #[leaf(KIdent)] Spanned<String>),
     /// `type#case` — qualified variant literal (payload handled via Call if needed)
+    #[prec_left(10)]
     QualifiedVariantLiteral(
         #[leaf(KIdent)] Spanned<String>,
         #[leaf("#")] (),

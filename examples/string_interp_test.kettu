@@ -1,0 +1,36 @@
+package local:string-interp-test;
+
+interface string-interp-tests {
+    @test
+    test-interp-basic: func() -> bool {
+        let name = "world";
+        let greeting = "hello {name}";
+        return str-eq(greeting, "hello world");
+    }
+
+    @test
+    test-interp-concat: func() -> bool {
+        let a = "foo";
+        let b = "bar";
+        let c = "{a}{b}";
+        return str-eq(c, "foobar");
+    }
+
+    @test
+    test-interp-length: func() -> bool {
+        let name = "world";
+        let greeting = "hello {name}";
+        return str-len(greeting) == 11;
+    }
+
+    @test
+    test-str-eq-same-content: func() -> bool {
+        let a = "hello";
+        let b = "hello";
+        return str-eq(a, b);
+    }
+
+}
+world tests {
+    export string-interp-tests;
+}

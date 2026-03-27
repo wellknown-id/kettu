@@ -113,6 +113,8 @@ struct ModuleCompiler<'a> {
     alloc_func_idx: Option<u32>,
     /// Index of the built-in string concat function (if emitted)
     str_concat_func_idx: Option<u32>,
+    /// Index of the built-in string equality function (if emitted)
+    str_eq_func_idx: Option<u32>,
     /// Index of the built-in arena reset function (if emitted)
     arena_reset_func_idx: Option<u32>,
     /// Lambda functions: (type_idx, func_idx, captures, params, body) for each lambda emitted
@@ -142,6 +144,11 @@ struct ModuleCompiler<'a> {
     next_spawn_id: u32,
     /// Tracks which variables are shared memory handles (for atomic block desugaring)
     shared_locals: std::collections::HashSet<String>,
+    /// Break target depth: how many wasm blocks to `br` past to reach the break target.
+    /// Set to Some when inside a while/for loop body.
+    loop_break_depth: Option<u32>,
+    /// Continue target depth: how many wasm blocks to `br` past to reach the continue target.
+    loop_continue_depth: Option<u32>,
 }
 
 impl<'a> ModuleCompiler<'a> {
@@ -158,6 +165,7 @@ impl<'a> ModuleCompiler<'a> {
             string_offset: 0,
             alloc_func_idx: None,
             str_concat_func_idx: None,
+            str_eq_func_idx: None,
             arena_reset_func_idx: None,
             lambda_bodies: Vec::new(),
             next_lambda_id: 0,
@@ -174,6 +182,8 @@ impl<'a> ModuleCompiler<'a> {
             thread_spawn_idx: None,
             next_spawn_id: 0,
             shared_locals: std::collections::HashSet::new(),
+            loop_break_depth: None,
+            loop_continue_depth: None,
         }
     }
     /// Register an imported interface's functions for qualified calls
@@ -494,6 +504,10 @@ impl<'a> ModuleCompiler<'a> {
         if let Some(&(type_idx, _, false)) = self.functions.get("$str_concat") {
             funcs.function(type_idx);
         }
+        // Add str_eq function
+        if let Some(&(type_idx, _, false)) = self.functions.get("$str_eq") {
+            funcs.function(type_idx);
+        }
         // Add arena_reset function
         if let Some(&(type_idx, _, false)) = self.functions.get("$arena_reset") {
             funcs.function(type_idx);
@@ -601,6 +615,9 @@ impl<'a> ModuleCompiler<'a> {
         }
         if self.str_concat_func_idx.is_some() {
             code.function(&self.build_str_concat_function());
+        }
+        if self.str_eq_func_idx.is_some() {
+            code.function(&self.build_str_eq_function());
         }
         if self.arena_reset_func_idx.is_some() {
             code.function(&self.build_arena_reset_function(initial_heap_offset));
@@ -1089,6 +1106,118 @@ impl<'a> ModuleCompiler<'a> {
         function.instruction(&Instruction::LocalGet(4));
         function.instruction(&Instruction::I32Const(4));
         function.instruction(&Instruction::I32Add);
+        function.instruction(&Instruction::End);
+
+        function
+    }
+
+    /// Ensure the str_eq function exists and return its index
+    fn ensure_str_eq_func(&mut self) -> u32 {
+        if let Some(idx) = self.str_eq_func_idx {
+            return idx;
+        }
+
+        // Add str_eq type: (ptr1: i32, ptr2: i32) -> i32
+        let type_idx = self.types.len() as u32;
+        self.types
+            .push((vec![ValType::I32, ValType::I32], vec![ValType::I32]));
+
+        // Add function
+        let func_idx = self.import_count + self.local_func_count;
+        self.local_func_count += 1;
+        self.str_eq_func_idx = Some(func_idx);
+        self.functions
+            .insert("$str_eq".to_string(), (type_idx, func_idx, false));
+
+        func_idx
+    }
+
+    /// Build the str_eq function body
+    /// String format: [4-byte length LE][data bytes], pointer points to data (length at ptr-4)
+    /// str_eq(ptr1: i32, ptr2: i32) -> i32 (1=equal, 0=not equal)
+    fn build_str_eq_function(&self) -> Function {
+        // Locals: 0=ptr1, 1=ptr2, 2=len1, 3=idx
+        let mut function = Function::new(vec![(2, ValType::I32)]); // 2 extra locals: len1, idx
+
+        // Fast path: if ptr1 == ptr2, return 1
+        function.instruction(&Instruction::LocalGet(0));
+        function.instruction(&Instruction::LocalGet(1));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::Return);
+        function.instruction(&Instruction::End);
+
+        // Load len1 = i32.load(ptr1 - 4)
+        function.instruction(&Instruction::LocalGet(0));
+        function.instruction(&Instruction::I32Const(4));
+        function.instruction(&Instruction::I32Sub);
+        function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0, align: 2, memory_index: 0,
+        }));
+        function.instruction(&Instruction::LocalSet(2));
+
+        // Load len2 = i32.load(ptr2 - 4)
+        function.instruction(&Instruction::LocalGet(1));
+        function.instruction(&Instruction::I32Const(4));
+        function.instruction(&Instruction::I32Sub);
+        function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0, align: 2, memory_index: 0,
+        }));
+
+        // If len1 != len2, return 0
+        function.instruction(&Instruction::LocalGet(2));
+        function.instruction(&Instruction::I32Ne);
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::Return);
+        function.instruction(&Instruction::End);
+
+        // idx = 0
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::LocalSet(3));
+
+        // Byte comparison loop
+        function.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        function.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+        // if idx >= len1, break (equal)
+        function.instruction(&Instruction::LocalGet(3));
+        function.instruction(&Instruction::LocalGet(2));
+        function.instruction(&Instruction::I32GeU);
+        function.instruction(&Instruction::BrIf(1));
+
+        // Compare bytes: ptr1[idx] vs ptr2[idx]
+        function.instruction(&Instruction::LocalGet(0));
+        function.instruction(&Instruction::LocalGet(3));
+        function.instruction(&Instruction::I32Add);
+        function.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
+            offset: 0, align: 0, memory_index: 0,
+        }));
+        function.instruction(&Instruction::LocalGet(1));
+        function.instruction(&Instruction::LocalGet(3));
+        function.instruction(&Instruction::I32Add);
+        function.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
+            offset: 0, align: 0, memory_index: 0,
+        }));
+        function.instruction(&Instruction::I32Ne);
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::Return);
+        function.instruction(&Instruction::End);
+
+        // idx++
+        function.instruction(&Instruction::LocalGet(3));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::I32Add);
+        function.instruction(&Instruction::LocalSet(3));
+
+        function.instruction(&Instruction::Br(0));
+        function.instruction(&Instruction::End); // end loop
+        function.instruction(&Instruction::End); // end block
+
+        // All bytes matched
+        function.instruction(&Instruction::I32Const(1));
         function.instruction(&Instruction::End);
 
         function
@@ -1917,8 +2046,15 @@ impl<'a> ModuleCompiler<'a> {
                     function.instruction(&Instruction::LocalSet(idx));
                 }
             }
-            Statement::Break { .. } | Statement::Continue { .. } => {
-                // These only make sense inside while loops; handled there
+            Statement::Break { .. } => {
+                if let Some(depth) = self.loop_break_depth {
+                    function.instruction(&Instruction::Br(depth));
+                }
+            }
+            Statement::Continue { .. } => {
+                if let Some(depth) = self.loop_continue_depth {
+                    function.instruction(&Instruction::Br(depth));
+                }
             }
             Statement::SharedLet { name, initial_value } => {
                 let offset = self.string_offset;
@@ -2317,11 +2453,11 @@ impl<'a> ModuleCompiler<'a> {
                 }));
             }
             Expr::StrEq(a, b, _) => {
-                // Compare two strings: first check lengths, then bytes
-                // For now, just compare pointers (optimization: proper comparison later)
+                // Compare two strings by content using builtin str_eq function
+                let str_eq_idx = self.ensure_str_eq_func();
                 self.compile_expr(function, a)?;
                 self.compile_expr(function, b)?;
-                function.instruction(&Instruction::I32Eq);
+                function.instruction(&Instruction::Call(str_eq_idx));
             }
             Expr::ListLen(expr, _) => {
                 // Compile list expression (pushes pointer)
@@ -2572,17 +2708,11 @@ impl<'a> ModuleCompiler<'a> {
                 function.instruction(&Instruction::I32Const(offset as i32));
             }
             Expr::InterpolatedString(parts, _) => {
-                // Build string by concatenating all parts
-                // For each part, we emit the string pointer, then concatenate with previous
-                let has_str_concat = self.functions.get("str-concat").is_some();
-
+                // Build string by concatenating all parts using the built-in str_concat
                 if parts.is_empty() {
-                    // Empty string
                     let (offset, _len) = self.register_string("");
                     function.instruction(&Instruction::I32Const(offset as i32));
-                } else if !has_str_concat || parts.len() == 1 {
-                    // No str-concat or single part: emit first part only
-                    // (concatenation requires a str-concat function to be defined)
+                } else if parts.len() == 1 {
                     match &parts[0] {
                         StringPart::Literal(s) => {
                             let (offset, _len) = self.register_string(s);
@@ -2593,8 +2723,8 @@ impl<'a> ModuleCompiler<'a> {
                         }
                     }
                 } else {
-                    // Multiple parts with str-concat available
-                    let str_concat_idx = self.functions.get("str-concat").map(|(_, idx, _)| *idx);
+                    // Multiple parts: ensure str_concat is available
+                    let concat_idx = self.ensure_str_concat_func();
                     let mut first = true;
                     for part in parts {
                         match part {
@@ -2612,9 +2742,7 @@ impl<'a> ModuleCompiler<'a> {
                             }
                         }
                         if !first {
-                            if let Some(func_idx) = str_concat_idx {
-                                function.instruction(&Instruction::Call(func_idx));
-                            }
+                            function.instruction(&Instruction::Call(concat_idx));
                         }
                         first = false;
                     }
@@ -3503,14 +3631,30 @@ impl<'a> ModuleCompiler<'a> {
                                 locals_types,
                             )?;
                         }
-                        Statement::Break { .. } | Statement::Continue { .. }
-                        | Statement::SharedLet { .. } => {
-                            // These shouldn't appear in if branches; push 0 for stack balance
+                        Statement::Break { .. } => {
+                            // Break as last statement in if branch
+                            if let Some(depth) = compiler.loop_break_depth {
+                                function.instruction(&Instruction::Br(depth));
+                            }
+                            function.instruction(&Instruction::I32Const(0));
+                        }
+                        Statement::Continue { .. } => {
+                            // Continue as last statement in if branch
+                            if let Some(depth) = compiler.loop_continue_depth {
+                                function.instruction(&Instruction::Br(depth));
+                            }
+                            function.instruction(&Instruction::I32Const(0));
+                        }
+                        Statement::SharedLet { .. } => {
                             function.instruction(&Instruction::I32Const(0));
                         }
                     }
                     Ok(())
                 }
+
+                // Bump loop depths for if-block nesting (+1 for the if block)
+                if let Some(d) = self.loop_break_depth.as_mut() { *d += 1; }
+                if let Some(d) = self.loop_continue_depth.as_mut() { *d += 1; }
 
                 // Need mutable clone since helper needs mut ref
                 let mut types_clone = locals_types.clone();
@@ -3531,6 +3675,10 @@ impl<'a> ModuleCompiler<'a> {
                     function.instruction(&Instruction::I32Const(0));
                 }
                 function.instruction(&Instruction::End);
+
+                // Restore loop depths after if-block
+                if let Some(d) = self.loop_break_depth.as_mut() { *d -= 1; }
+                if let Some(d) = self.loop_continue_depth.as_mut() { *d -= 1; }
             }
             Expr::Assert(cond, _) => {
                 // Compile condition
@@ -3564,11 +3712,11 @@ impl<'a> ModuleCompiler<'a> {
                 }));
             }
             Expr::StrEq(a, b, _) => {
-                // Compare two strings: first check lengths, then bytes
-                // For now, just compare pointers (optimization: proper comparison later)
+                // Compare two strings by content using builtin str_eq function
+                let str_eq_idx = self.ensure_str_eq_func();
                 self.compile_expr_with_locals(function, a, locals, locals_types)?;
                 self.compile_expr_with_locals(function, b, locals, locals_types)?;
-                function.instruction(&Instruction::I32Eq);
+                function.instruction(&Instruction::Call(str_eq_idx));
             }
             Expr::ListLen(expr, _) => {
                 // Compile list expression (pushes pointer)
@@ -3835,13 +3983,17 @@ impl<'a> ModuleCompiler<'a> {
                 // Inner loop for continue
                 function.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
 
+                // Save and set loop depths: at body level, break=Br(1), continue=Br(0)
+                let prev_break = self.loop_break_depth;
+                let prev_continue = self.loop_continue_depth;
+                self.loop_break_depth = Some(1);
+                self.loop_continue_depth = Some(0);
+
                 // Evaluate condition
                 self.compile_expr_with_locals(function, condition, locals, locals_types)?;
                 // If condition is false (eqz), break out
                 function.instruction(&Instruction::I32Eqz);
                 function.instruction(&Instruction::BrIf(1)); // break to outer block
-
-                // Compile body statements
                 for stmt in body {
                     match stmt {
                         Statement::Expr(e) => {
@@ -3922,6 +4074,10 @@ impl<'a> ModuleCompiler<'a> {
                 function.instruction(&Instruction::End); // end loop
                 function.instruction(&Instruction::End); // end block
 
+                // Restore loop depths
+                self.loop_break_depth = prev_break;
+                self.loop_continue_depth = prev_continue;
+
                 // While returns unit (push 0)
                 function.instruction(&Instruction::I32Const(0));
             }
@@ -3997,6 +4153,13 @@ impl<'a> ModuleCompiler<'a> {
 
                     // Inner block for body (continue target) - depth 0 from body
                     function.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+
+                    // Save and set loop depths for for-range:
+                    // From body: break=Br(2) to outer block, continue=Br(0) to body block end
+                    let prev_break = self.loop_break_depth;
+                    let prev_continue = self.loop_continue_depth;
+                    self.loop_break_depth = Some(2);
+                    self.loop_continue_depth = Some(0);
 
                     // Compile body statements
                     for stmt in body {
@@ -4104,6 +4267,10 @@ impl<'a> ModuleCompiler<'a> {
                     function.instruction(&Instruction::Br(0));
                     function.instruction(&Instruction::End); // end loop
                     function.instruction(&Instruction::End); // end block
+
+                    // Restore loop depths
+                    self.loop_break_depth = prev_break;
+                    self.loop_continue_depth = prev_continue;
                 }
 
                 // For returns unit (push 0)
@@ -4454,6 +4621,12 @@ impl<'a> ModuleCompiler<'a> {
                 // Inner loop for iteration
                 function.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
 
+                // Save and set loop depths: at body level, break=Br(1), continue=Br(0)
+                let prev_break = self.loop_break_depth;
+                let prev_continue = self.loop_continue_depth;
+                self.loop_break_depth = Some(1);
+                self.loop_continue_depth = Some(0);
+
                 // Check termination: idx >= length => break
                 function.instruction(&Instruction::LocalGet(idx_local));
                 // Load length from list_ptr[0]
@@ -4561,6 +4734,10 @@ impl<'a> ModuleCompiler<'a> {
                 function.instruction(&Instruction::Br(0));
                 function.instruction(&Instruction::End); // end loop
                 function.instruction(&Instruction::End); // end block
+
+                // Restore loop depths
+                self.loop_break_depth = prev_break;
+                self.loop_continue_depth = prev_continue;
 
                 // For-each returns unit (push 0)
                 function.instruction(&Instruction::I32Const(0));

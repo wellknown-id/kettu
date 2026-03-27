@@ -528,6 +528,7 @@ fn stmt(cst: &grammar::Stmt) -> ast::Statement {
         grammar::Stmt::Break(_) => ast::Statement::Break { condition: None },
         grammar::Stmt::Continue(_) => ast::Statement::Continue { condition: None },
         grammar::Stmt::Expr(e) => ast::Statement::Expr(sexpr_flat(&e.expr)),
+        grammar::Stmt::TailExpr(e) => ast::Statement::Expr(sexpr_flat(&e.expr)),
         grammar::Stmt::SharedLet(s) => ast::Statement::SharedLet {
             name: spanned_id(&s.name),
             initial_value: sexpr_flat(&s.value),
@@ -550,7 +551,35 @@ fn expr_with_span(cst: &grammar::Expr, outer_span: Range<usize>) -> ast::Expr {
             } else {
                 lit
             };
-            ast::Expr::String(inner.to_string(), outer_span)
+            // Check for string interpolation: {identifier} patterns
+            if inner.contains('{') {
+                let mut parts = Vec::new();
+                let mut rest = inner;
+                while let Some(open) = rest.find('{') {
+                    if open > 0 {
+                        parts.push(ast::StringPart::Literal(rest[..open].to_string()));
+                    }
+                    let after_open = &rest[open + 1..];
+                    if let Some(close) = after_open.find('}') {
+                        let ident = after_open[..close].trim().to_string();
+                        parts.push(ast::StringPart::Expr(Box::new(ast::Expr::Ident(
+                            ast::Id { name: ident, span: outer_span.clone() },
+                        ))));
+                        rest = &after_open[close + 1..];
+                    } else {
+                        // No closing brace — treat rest as literal
+                        parts.push(ast::StringPart::Literal(rest[open..].to_string()));
+                        rest = "";
+                        break;
+                    }
+                }
+                if !rest.is_empty() {
+                    parts.push(ast::StringPart::Literal(rest.to_string()));
+                }
+                ast::Expr::InterpolatedString(parts, outer_span)
+            } else {
+                ast::Expr::String(inner.to_string(), outer_span)
+            }
         }
         grammar::Expr::True => ast::Expr::Bool(true, outer_span),
         grammar::Expr::False => ast::Expr::Bool(false, outer_span),
