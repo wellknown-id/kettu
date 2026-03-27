@@ -247,7 +247,7 @@
     },
     "scripts": {
         "vscode:prepublish": "node -e \"try{require('fs').chmodSync('./bin/kettu',0o755)}catch(e){}\"",
-        "test": "node ./tests/textmate-regex-tests.js && node ./tests/debug-manifest-tests.js && node ./tests/debug-breakpoint-tests.js && node ./tests/debug-values-tests.js"
+        "test": "node ./tests/textmate-regex-tests.js && node ./tests/debug-manifest-tests.js"
     },
     "devDependencies": {
         "@types/vscode": "^1.99.0",

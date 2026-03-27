@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 mod docs;
 mod doctest;
+mod dap;
 mod mcp;
 
 fn load_imported_asts(
@@ -130,6 +131,8 @@ enum Commands {
     },
     /// Start the MCP server (stdio)
     Mcp,
+    /// Start the Debug Adapter Protocol (DAP) server over stdio
+    Dap,
 }
 
 #[tokio::main]
@@ -460,6 +463,13 @@ async fn main() {
 
         Commands::Mcp => {
             mcp::run_server();
+        }
+
+        Commands::Dap => {
+            if let Err(err) = dap::run_server() {
+                eprintln!("DAP server error: {}", err);
+                std::process::exit(1);
+            }
         }
     }
 }
