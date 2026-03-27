@@ -4,6 +4,10 @@
 // order: 6
 // title: "Pattern Matching"
 // file: "match"
+// preamble-start
+//   let value = #some(42);
+//   let status = #some(1);
+// preamble-end
 ---
 # Pattern Matching
 
@@ -11,7 +15,7 @@
 
 Match a value against variant patterns:
 
-```kettu nocheck
+```kettu
 let result = match value {
     #ok => 42,
     #err => 0,
@@ -24,7 +28,7 @@ Match is an expression — it returns a value.
 
 Extract data from variant payloads:
 
-```kettu nocheck
+```kettu
 let v = #ok(42);
 let result = match v {
     #ok(x) => x,       // x binds to 42
@@ -35,7 +39,7 @@ let result = match v {
 
 Use the bound variable in the arm body:
 
-```kettu nocheck
+```kettu
 let v = #ok(21);
 match v {
     #ok(x) => x * 2,   // 42
@@ -56,7 +60,7 @@ match status {
 
 ## Multiple Arms
 
-```kettu nocheck
+```kettu
 let v = #err(99);
 let code = match v {
     #ok(x) => 0,
@@ -68,7 +72,7 @@ let code = match v {
 
 Works naturally with variant constructors:
 
-```kettu nocheck
+```kettu
 let maybe = #some(42);
 match maybe {
     #some(v) => v,

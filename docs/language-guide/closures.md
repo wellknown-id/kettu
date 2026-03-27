@@ -4,6 +4,12 @@
 // order: 8
 // title: "Closures & HOFs"
 // file: "closures"
+// preamble-start
+//   let a = 1;
+//   let b = 2;
+//   let n = 5;
+//   let arr = [1, 2, 3, 4, 5];
+// preamble-end
 ---
 # Closures & Higher-Order Functions
 
@@ -11,7 +17,7 @@
 
 Anonymous functions with `|params| body` syntax:
 
-```kettu nocheck
+```kettu
 let double = |x| x * 2;
 double(21)  // 42
 
@@ -23,7 +29,7 @@ add(10, 20) // 30
 
 Lambdas capture variables from the enclosing scope:
 
-```kettu nocheck
+```kettu
 let x = 10;
 let add-x = |n| n + x;
 add-x(5)  // 15
@@ -40,7 +46,7 @@ sum-with-ab(5)  // 35
 
 Apply a function to every element, returning a new list:
 
-```kettu nocheck
+```kettu
 let arr = [1, 2, 3];
 let doubled = map(arr, |x| x * 2);
 // doubled == [2, 4, 6]
@@ -50,7 +56,7 @@ let doubled = map(arr, |x| x * 2);
 
 Keep elements where the predicate returns true:
 
-```kettu nocheck
+```kettu
 let arr = [1, 10, 2, 20, 3, 30];
 let big = filter(arr, |x| x > 5);
 // big == [10, 20, 30]
@@ -60,7 +66,7 @@ let big = filter(arr, |x| x > 5);
 
 Accumulate a single value from a list:
 
-```kettu nocheck
+```kettu
 let arr = [1, 2, 3, 4, 5];
 let sum = reduce(arr, 0, |acc, x| acc + x);
 // sum == 15
@@ -74,7 +80,7 @@ let product = reduce(arr, 1, |acc, x| acc * x);
 
 Lambdas can be stored and passed like any value:
 
-```kettu nocheck
+```kettu
 let triple = |x| x * 3;
 let tripled = map([1, 2, 3], triple);
 // tripled == [3, 6, 9]
@@ -88,7 +94,7 @@ let big = filter([2, 4, 6, 8, 10], pred);
 
 When the last argument to a function is a lambda, you can place it **after** the parentheses:
 
-```kettu nocheck
+```kettu
 // Standard syntax
 let doubled = map(arr, |x| x * 2);
 
@@ -98,14 +104,14 @@ let doubled = map(arr) |x| x * 2;
 
 Works with all HOFs:
 
-```kettu nocheck
+```kettu
 let bigs = filter(arr) |x| x > 3;
 let sum = reduce(arr, 0) |acc, x| acc + x;
 ```
 
 Even functions with a single lambda argument can omit parentheses:
 
-```kettu nocheck
+```kettu
 let apply = |f| f(10);
 let result = apply |x| x * 2;
 // result == 20

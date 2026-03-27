@@ -375,9 +375,9 @@ async fn main() {
         Commands::Docs { topic, check } => {
             if check {
                 let pages = docs::get_pages_for_testing(topic.as_deref());
-                let refs: Vec<(&str, &str)> = pages
+                let refs: Vec<(&str, &str, Option<&str>)> = pages
                     .iter()
-                    .map(|(t, c)| (t.as_str(), c.as_str()))
+                    .map(|(t, c, p)| (t.as_str(), c.as_str(), p.as_deref()))
                     .collect();
                 let (passed, failed, skipped) = doctest::run_doctests(&refs);
                 println!();

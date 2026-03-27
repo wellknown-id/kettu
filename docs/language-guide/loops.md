@@ -4,6 +4,10 @@
 // order: 5
 // title: "Loops & Iteration"
 // file: "loops"
+// preamble-start
+//   let sum = 0;
+//   let a = 1;
+// preamble-end
 ---
 # Loops & Iteration
 

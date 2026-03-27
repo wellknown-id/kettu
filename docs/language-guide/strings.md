@@ -4,12 +4,15 @@
 // order: 9
 // title: "Strings"
 // file: "strings"
+// preamble-start
+//   let name = "kettu";
+// preamble-end
 ---
 # Strings
 
 ## String Literals
 
-```kettu nocheck
+```kettu
 let greeting = "hello";
 let empty = "";
 ```
@@ -18,7 +21,7 @@ let empty = "";
 
 Join strings with `+`:
 
-```kettu nocheck
+```kettu
 let s = "hello" + " " + "world";
 // s == "hello world"
 ```
@@ -27,7 +30,7 @@ let s = "hello" + " " + "world";
 
 Embed expressions inside strings with `{}`:
 
-```kettu nocheck
+```kettu
 let name = "kettu";
 let msg = "Hello, {name}!";
 // msg == "Hello, kettu!"

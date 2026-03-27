@@ -4,6 +4,12 @@
 // order: 3
 // title: "Functions"
 // file: "functions"
+// preamble-start
+//   let a = 1;
+//   let b = 2;
+//   let x = 10;
+//   let y = 20;
+// preamble-end
 ---
 # Functions
 
@@ -11,7 +17,7 @@
 
 Functions are declared with parameters and optional return type:
 
-```kettu nocheck
+```kettu
 // No parameters, no return
 do-something: func();
 
@@ -45,7 +51,7 @@ interface math {
 
 ### Let Bindings
 
-```kettu nocheck
+```kettu
 let x = 10;
 let result = a + b;
 let flag = x > 0;
@@ -53,7 +59,7 @@ let flag = x > 0;
 
 ### Return
 
-```kettu nocheck
+```kettu
 return 42;
 return x + y;
 return;  // For functions with no return type
@@ -89,7 +95,7 @@ See [WASI Preview 3](../wasip3.md) for details on async/await.
 
 See [Closures & HOFs](./closures.md) for anonymous functions and higher-order patterns:
 
-```kettu nocheck
+```kettu
 let double = |x| x * 2;
 let arr = map([1, 2, 3], |x| x + 1);
 ```

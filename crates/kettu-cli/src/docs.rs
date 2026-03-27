@@ -28,6 +28,8 @@ struct DocPage {
     content: String,
     /// Original filename stem, used for link rewriting (e.g. "simd", "types").
     filename: String,
+    /// Optional preamble code to prepend when doc-testing snippets.
+    preamble: Option<String>,
 }
 
 /// Parse a kettu-style frontmatter value from a `// key: "value"` or `// key: value` line.
@@ -75,6 +77,41 @@ fn extract_filename(front: &str, title: &str) -> String {
         .to_string()
 }
 
+/// Extract a preamble block from frontmatter delimited by
+/// `// preamble-start` and `// preamble-end`.
+fn extract_preamble(front: &str) -> Option<String> {
+    let mut in_preamble = false;
+    let mut lines = Vec::new();
+
+    for line in front.lines() {
+        let trimmed = line.trim().trim_start_matches("//").trim();
+        if trimmed == "preamble-start" {
+            in_preamble = true;
+            continue;
+        }
+        if trimmed == "preamble-end" {
+            break;
+        }
+        if in_preamble {
+            // Strip the leading `//` comment marker and at most one space
+            let code = line
+                .trim()
+                .trim_start_matches("//")
+                .strip_prefix(' ')
+                .unwrap_or(
+                    line.trim().trim_start_matches("//"),
+                );
+            lines.push(code.to_string());
+        }
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 /// Parse a single source string into a `DocPage`, extracting frontmatter metadata.
 fn parse_page(source: &str) -> Option<DocPage> {
     if !source.starts_with("---") {
@@ -112,6 +149,7 @@ fn parse_page(source: &str) -> Option<DocPage> {
 
     let title_str = title?;
     let filename = extract_filename(front, &title_str);
+    let preamble = extract_preamble(front);
 
     Some(DocPage {
         section: section?,
@@ -119,6 +157,7 @@ fn parse_page(source: &str) -> Option<DocPage> {
         title: title_str,
         content: strip_frontmatter(source).to_string(),
         filename,
+        preamble,
     })
 }
 
@@ -335,9 +374,9 @@ pub fn print_topic(selector: &str) {
     println!("{}", rewritten);
 }
 
-/// Return all doc pages as `(title, raw_content)` pairs for doc-testing.
+/// Return all doc pages as `(title, raw_content, preamble)` triples for doc-testing.
 /// If `selector` is provided, filter to that specific topic/section.
-pub fn get_pages_for_testing(selector: Option<&str>) -> Vec<(String, String)> {
+pub fn get_pages_for_testing(selector: Option<&str>) -> Vec<(String, String, Option<String>)> {
     let pages = load_docs();
 
     if let Some(sel) = selector {
@@ -350,10 +389,9 @@ pub fn get_pages_for_testing(selector: Option<&str>) -> Vec<(String, String)> {
         let (_section_name, topics) = &groups[sec_num - 1];
 
         if parts.len() == 1 {
-            // Whole section
             topics
                 .iter()
-                .map(|p| (p.title.clone(), p.content.clone()))
+                .map(|p| (p.title.clone(), p.content.clone(), p.preamble.clone()))
                 .collect()
         } else {
             let topic_num: usize = match parts[1].parse::<usize>() {
@@ -361,12 +399,12 @@ pub fn get_pages_for_testing(selector: Option<&str>) -> Vec<(String, String)> {
                 _ => return vec![],
             };
             let topic = topics[topic_num - 1];
-            vec![(topic.title.clone(), topic.content.clone())]
+            vec![(topic.title.clone(), topic.content.clone(), topic.preamble.clone())]
         }
     } else {
         pages
             .iter()
-            .map(|p| (p.title.clone(), p.content.clone()))
+            .map(|p| (p.title.clone(), p.content.clone(), p.preamble.clone()))
             .collect()
     }
 }

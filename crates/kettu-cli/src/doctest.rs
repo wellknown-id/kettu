@@ -88,8 +88,11 @@ fn parse_mode(info: &str) -> Mode {
 }
 
 /// Wrap a partial snippet in a valid kettu file structure.
-fn wrap_snippet(code: &str) -> String {
+/// If `preamble` is provided, it's prepended inside the function body
+/// to provide variable/function declarations needed by the snippet.
+fn wrap_snippet(code: &str, preamble: Option<&str>) -> String {
     let trimmed = code.trim();
+    let preamble_block = preamble.unwrap_or("");
 
     // Type-only: record, variant, enum, flags, type alias — put inside interface directly
     let is_type_decl = trimmed.starts_with("record ")
@@ -137,11 +140,19 @@ fn wrap_snippet(code: &str) -> String {
         );
     }
 
-    // Statements — wrap in a function body
-    format!(
-        "package local:doctest;\n\ninterface snippet {{\n    run: func() {{\n{}\n    }}\n}}\n",
-        indent(trimmed, 8)
-    )
+    // Statements — wrap in a function body, with optional preamble
+    if preamble_block.is_empty() {
+        format!(
+            "package local:doctest;\n\ninterface snippet {{\n    run: func() {{\n{}\n    }}\n}}\n",
+            indent(trimmed, 8)
+        )
+    } else {
+        format!(
+            "package local:doctest;\n\ninterface snippet {{\n    run: func() {{\n{}\n{}\n    }}\n}}\n",
+            indent(preamble_block, 8),
+            indent(trimmed, 8)
+        )
+    }
 }
 
 /// Check if code looks like bare function signature(s).
@@ -172,14 +183,14 @@ fn indent(text: &str, n: usize) -> String {
         .join("\n")
 }
 
-/// Run doc-tests for a list of (title, content) pages.
+/// Run doc-tests for a list of (title, content, preamble) pages.
 /// Returns (passed, failed, skipped).
-pub fn run_doctests(pages: &[(&str, &str)]) -> (usize, usize, usize) {
+pub fn run_doctests(pages: &[(&str, &str, Option<&str>)]) -> (usize, usize, usize) {
     let mut passed = 0;
     let mut failed = 0;
     let mut skipped = 0;
 
-    for (title, content) in pages {
+    for (title, content, preamble) in pages {
         let blocks = extract_blocks(content);
         let checkable: Vec<&CodeBlock> = blocks
             .iter()
@@ -204,7 +215,7 @@ pub fn run_doctests(pages: &[(&str, &str)]) -> (usize, usize, usize) {
                     let source = if block.standalone {
                         block.code.clone()
                     } else {
-                        wrap_snippet(&block.code)
+                        wrap_snippet(&block.code, *preamble)
                     };
 
                     let (_ast, errors) = kettu_parser::parse_file(&source);
@@ -213,7 +224,7 @@ pub fn run_doctests(pages: &[(&str, &str)]) -> (usize, usize, usize) {
                     } else {
                         file_failed += 1;
                         eprintln!(
-                            "  \x1b[31m✗\x1b[0m {} line {} (parse error)",
+                            "  \x1b[31m\u{2717}\x1b[0m {} line {} (parse error)",
                             title, block.line
                         );
                         for e in &errors {
@@ -225,14 +236,14 @@ pub fn run_doctests(pages: &[(&str, &str)]) -> (usize, usize, usize) {
                     let source = if block.standalone {
                         block.code.clone()
                     } else {
-                        wrap_snippet(&block.code)
+                        wrap_snippet(&block.code, *preamble)
                     };
 
                     let (ast, parse_errors) = kettu_parser::parse_file(&source);
                     if !parse_errors.is_empty() {
                         file_failed += 1;
                         eprintln!(
-                            "  \x1b[31m✗\x1b[0m {} line {} (parse error)",
+                            "  \x1b[31m\u{2717}\x1b[0m {} line {} (parse error)",
                             title, block.line
                         );
                         for e in &parse_errors {
@@ -255,7 +266,7 @@ pub fn run_doctests(pages: &[(&str, &str)]) -> (usize, usize, usize) {
                         } else {
                             file_failed += 1;
                             eprintln!(
-                                "  \x1b[31m✗\x1b[0m {} line {} (check error)",
+                                "  \x1b[31m\u{2717}\x1b[0m {} line {} (check error)",
                                 title, block.line
                             );
                             for e in &errors {
@@ -265,7 +276,7 @@ pub fn run_doctests(pages: &[(&str, &str)]) -> (usize, usize, usize) {
                     } else {
                         file_failed += 1;
                         eprintln!(
-                            "  \x1b[31m✗\x1b[0m {} line {} (no AST produced)",
+                            "  \x1b[31m\u{2717}\x1b[0m {} line {} (no AST produced)",
                             title, block.line
                         );
                     }

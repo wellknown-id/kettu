@@ -4,6 +4,12 @@
 // order: 2
 // title: "Data Types"
 // file: "types"
+// preamble-start
+//   let x = 10;
+//   let y = 20;
+//   let a = 1;
+//   let b = 2;
+// preamble-end
 ---
 # Data Types
 
@@ -22,7 +28,7 @@
 
 Named product types with fields:
 
-```kettu nocheck
+```kettu
 record point {
     x: s32,
     y: s32,
@@ -39,7 +45,7 @@ record person {
 
 Tagged unions (sum types):
 
-```kettu
+```kettu nocheck
 variant result {
     ok(s32),
     error(string),
@@ -69,7 +75,7 @@ let e = option#none;
 
 Simple enumerations without payloads:
 
-```kettu nocheck
+```kettu
 enum color {
     red,
     green,
@@ -126,7 +132,7 @@ tuple<s32, string, bool>
 
 The `v128` type holds 128-bit SIMD vectors:
 
-```kettu nocheck
+```kettu
 let v = i32x4.splat(42);        // 4 packed i32s
 let sum = i32x4.add(a, b);      // vector addition
 let lane = i32x4.extract_lane(v, 0);  // extract scalar

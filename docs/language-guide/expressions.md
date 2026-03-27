@@ -4,12 +4,20 @@
 // order: 4
 // title: "Expressions"
 // file: "expressions"
+// preamble-start
+//   let a = 1;
+//   let b = 2;
+//   let x = 10;
+//   let y = 20;
+//   let c = true;
+//   let maybe = #some(5);
+// preamble-end
 ---
 # Expressions
 
 ## Literals
 
-```kettu nocheck
+```kettu
 42           // Integer
 true false   // Boolean
 "hello"      // String
@@ -24,7 +32,7 @@ true false   // Boolean
 
 ## Arithmetic Operators
 
-```kettu nocheck
+```kettu
 a + b   // Addition
 a - b   // Subtraction
 a * b   // Multiplication
@@ -33,7 +41,7 @@ a / b   // Division
 
 ## Comparison Operators
 
-```kettu nocheck
+```kettu
 a == b  // Equal
 a != b  // Not equal
 a < b   // Less than
@@ -55,7 +63,7 @@ a || b  // Or (skips b if a is true)
 
 Conditional branching:
 
-```kettu nocheck
+```kettu
 if x > 0 {
     return x;
 } else {
@@ -65,7 +73,7 @@ if x > 0 {
 
 Nested conditionals:
 
-```kettu nocheck
+```kettu
 if x > 20 {
     return 3;
 } else {
@@ -119,7 +127,7 @@ From highest to lowest:
 
 ## Negation
 
-```kettu nocheck
+```kettu
 !true       // false
 !(x > 5)    // negate a comparison
 ```
@@ -135,7 +143,7 @@ x = 20;      // reassignment
 
 ### Compound Assignment
 
-```kettu nocheck
+```kettu
 x += 5;   // x = x + 5
 x -= 2;   // x = x - 2
 ```
@@ -144,7 +152,7 @@ x -= 2;   // x = x - 2
 
 Access record fields with `.`:
 
-```kettu nocheck
+```kettu
 let point = { x: 10, y: 20 };
 point.x    // 10
 point.y    // 20
@@ -157,7 +165,7 @@ point.y    // 20
 
 Safely access fields on optional values with `?.`:
 
-```kettu nocheck
+```kettu
 let maybe = some({ x: 10 });
 maybe?.x   // some(10) if maybe is some, none if none
 ```
@@ -166,7 +174,7 @@ maybe?.x   // some(10) if maybe is some, none if none
 
 Unwrap `some`/`ok` or propagate `none`/`err`:
 
-```kettu nocheck
+```kettu
 let val = maybe?;  // unwraps or early-returns none
 ```
 
@@ -174,7 +182,7 @@ let val = maybe?;  // unwraps or early-returns none
 
 Construct records inline:
 
-```kettu nocheck
+```kettu
 let point = { x: 10, y: 20 };
 let r = { a: 1, b: 2, c: 3 };
 ```
