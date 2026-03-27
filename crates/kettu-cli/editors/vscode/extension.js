@@ -4,6 +4,7 @@ const fs = require('fs');
 const cp = require('child_process');
 const { LanguageClient, TransportKind } = require('vscode-languageclient/node');
 const { normalizePath, hasBreakpointInRange, getBreakpointLinesInRange } = require('./debug-breakpoints');
+const { collectVisibleLocals } = require('./debug-values');
 
 let client;
 let passDecorationType;
@@ -298,7 +299,9 @@ class KettuInlineDebugAdapter {
         this.continueResolver = null;
         this.resumeAction = 'continue';
         this.threadId = 1;
-        this.variablesRef = 1;
+        this.contextVariablesRef = 1;
+        this.localsVariablesRef = 2;
+        this.sourceText = '';
     }
 
     dispose() {
@@ -407,8 +410,13 @@ class KettuInlineDebugAdapter {
                 this.sendResponse(message, {
                     scopes: [
                         {
-                            name: 'Test',
-                            variablesReference: this.variablesRef,
+                            name: 'Locals',
+                            variablesReference: this.localsVariablesRef,
+                            expensive: false,
+                        },
+                        {
+                            name: 'Context',
+                            variablesReference: this.contextVariablesRef,
                             expensive: false,
                         },
                     ],
@@ -419,9 +427,21 @@ class KettuInlineDebugAdapter {
             case 'variables': {
                 const vars = [];
                 if (this.currentStop) {
-                    vars.push({ name: 'test', value: this.currentStop.name, variablesReference: 0 });
-                    vars.push({ name: 'line', value: String(this.currentStop.line), variablesReference: 0 });
-                    vars.push({ name: 'status', value: this.currentStop.status, variablesReference: 0 });
+                    if (message.arguments?.variablesReference === this.localsVariablesRef) {
+                        const locals = this.currentStop.locals || {};
+                        for (const [name, value] of Object.entries(locals)) {
+                            vars.push({
+                                name,
+                                value: String(value),
+                                type: typeof value,
+                                variablesReference: 0,
+                            });
+                        }
+                    } else {
+                        vars.push({ name: 'test', value: this.currentStop.name, variablesReference: 0 });
+                        vars.push({ name: 'line', value: String(this.currentStop.line), variablesReference: 0 });
+                        vars.push({ name: 'status', value: this.currentStop.status, variablesReference: 0 });
+                    }
                 }
                 this.sendResponse(message, { variables: vars });
                 break;
@@ -474,6 +494,12 @@ class KettuInlineDebugAdapter {
         }
         this.started = true;
 
+        try {
+            this.sourceText = fs.readFileSync(this.program, 'utf8');
+        } catch {
+            this.sourceText = '';
+        }
+
         const discovery = await runCommandJson(this.kettuPath, ['test', this.program, '--list', '--json'], this.cwd);
         const tests = Array.isArray(discovery.tests) ? discovery.tests : [];
 
@@ -484,7 +510,9 @@ class KettuInlineDebugAdapter {
         }
 
         if (this.stopOnEntry) {
-            await this.stopAndWait('entry', { name: tests[0].name, line: tests[0].line, status: 'ready' });
+            const entryLine = Number.isInteger(tests[0].line) ? tests[0].line : 1;
+            const locals = this.collectLocalsForStop(entryLine, entryLine);
+            await this.stopAndWait('entry', { name: tests[0].name, line: entryLine, status: 'ready', locals });
         }
 
         for (const test of tests) {
@@ -498,7 +526,12 @@ class KettuInlineDebugAdapter {
             const breakpointLines = this.getBreakpointLines(this.program, startLine, endLine);
             if (breakpointLines.length > 0) {
                 let stopLine = breakpointLines[0];
-                let action = await this.stopAndWait('breakpoint', { name: test.name, line: stopLine, status: 'paused' });
+                let action = await this.stopAndWait('breakpoint', {
+                    name: test.name,
+                    line: stopLine,
+                    status: 'paused',
+                    locals: this.collectLocalsForStop(startLine, stopLine),
+                });
 
                 while (!this.terminated && (action === 'next' || action === 'stepIn' || action === 'stepOut')) {
                     const nextBreakpoint = breakpointLines.find((line) => line > stopLine);
@@ -514,6 +547,7 @@ class KettuInlineDebugAdapter {
                         name: test.name,
                         line: stopLine,
                         status: 'stepping',
+                        locals: this.collectLocalsForStop(startLine, stopLine),
                     });
                 }
             }
@@ -540,6 +574,7 @@ class KettuInlineDebugAdapter {
                     name: test.name,
                     line: startLine,
                     status: 'failed',
+                    locals: this.collectLocalsForStop(startLine, startLine),
                 });
             }
         }
@@ -555,6 +590,13 @@ class KettuInlineDebugAdapter {
 
     getBreakpointLines(filePath, startLine, endLine) {
         return getBreakpointLinesInRange(this.breakpoints, filePath, startLine, endLine);
+    }
+
+    collectLocalsForStop(startLine, stopLine) {
+        if (!this.sourceText) {
+            return {};
+        }
+        return collectVisibleLocals(this.sourceText, startLine, stopLine);
     }
 
     async stopAndWait(reason, stop) {
