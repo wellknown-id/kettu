@@ -11,7 +11,7 @@
 
 Every Kettu file starts with a package declaration:
 
-```kettu
+```kettu nocheck
 package namespace:name;
 package namespace:name@1.0.0;  // With version
 ```
@@ -36,7 +36,7 @@ interface math {
 
 Import types from other interfaces:
 
-```kettu
+```kettu nocheck
 interface consumer {
     use types.{my-type, other as alias};
     
@@ -48,7 +48,7 @@ interface consumer {
 
 Worlds define component boundaries with imports and exports:
 
-```kettu
+```kettu nocheck
 world my-component {
     import console;
     export math;
@@ -59,7 +59,7 @@ world my-component {
 
 Compose worlds by including others:
 
-```kettu
+```kettu nocheck
 world base {
     import logging;
 }
@@ -72,7 +72,7 @@ world extended {
 
 ### Inline Imports/Exports
 
-```kettu
+```kettu nocheck
 world inline-example {
     import run: func();
     export get-value: func() -> s32;

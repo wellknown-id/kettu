@@ -35,7 +35,7 @@ for i in 0 to 4 {
 
 Control the increment with `step`:
 
-```kettu
+```kettu nocheck
 // 0, 2, 4, 6, 8, 10
 for i in 0 to 10 step 2 {
     sum = sum + i;
@@ -51,7 +51,7 @@ for i in 0 to 9 step 3 {
 
 Count down with `downto`:
 
-```kettu
+```kettu nocheck
 // 5, 4, 3, 2, 1
 for i in 5 downto 1 {
     sum = sum + i;
@@ -80,7 +80,7 @@ for item in arr {
 
 > **Note:** `break` and `continue` are recognized by the parser but codegen support is not yet complete. Use loop conditions instead:
 
-```kettu
+```kettu nocheck
 // Instead of break, use the while condition
 let i = 0;
 while i < 10 {
@@ -99,7 +99,7 @@ for i in 0 to 10 {
 
 For vectorized processing, see [SIMD](../simd.md):
 
-```kettu
+```kettu nocheck
 simd for v in numbers {
     i32x4.mul(v, i32x4.splat(2))
 };

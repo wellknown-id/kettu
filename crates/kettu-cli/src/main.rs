@@ -7,6 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 
 mod docs;
+mod doctest;
 
 fn load_imported_asts(
     file: &PathBuf,
@@ -107,6 +108,9 @@ enum Commands {
     Docs {
         /// Topic number (e.g. 1.2) — omit to see the index
         topic: Option<String>,
+        /// Verify code snippets in the docs (doc-testing)
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -368,10 +372,27 @@ async fn main() {
             }
         }
 
-        Commands::Docs { topic } => {
-            match topic {
-                Some(selector) => docs::print_topic(&selector),
-                None => docs::print_index(),
+        Commands::Docs { topic, check } => {
+            if check {
+                let pages = docs::get_pages_for_testing(topic.as_deref());
+                let refs: Vec<(&str, &str)> = pages
+                    .iter()
+                    .map(|(t, c)| (t.as_str(), c.as_str()))
+                    .collect();
+                let (passed, failed, skipped) = doctest::run_doctests(&refs);
+                println!();
+                println!(
+                    "Doc-tests: {} passed, {} failed, {} skipped",
+                    passed, failed, skipped
+                );
+                if failed > 0 {
+                    std::process::exit(1);
+                }
+            } else {
+                match topic {
+                    Some(selector) => docs::print_topic(&selector),
+                    None => docs::print_index(),
+                }
             }
         }
     }

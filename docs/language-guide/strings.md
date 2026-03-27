@@ -9,7 +9,7 @@
 
 ## String Literals
 
-```kettu
+```kettu nocheck
 let greeting = "hello";
 let empty = "";
 ```
@@ -18,7 +18,7 @@ let empty = "";
 
 Join strings with `+`:
 
-```kettu
+```kettu nocheck
 let s = "hello" + " " + "world";
 // s == "hello world"
 ```
@@ -27,7 +27,7 @@ let s = "hello" + " " + "world";
 
 Embed expressions inside strings with `{}`:
 
-```kettu
+```kettu nocheck
 let name = "kettu";
 let msg = "Hello, {name}!";
 // msg == "Hello, kettu!"

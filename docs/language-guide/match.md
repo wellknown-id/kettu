@@ -11,7 +11,7 @@
 
 Match a value against variant patterns:
 
-```kettu
+```kettu nocheck
 let result = match value {
     #ok => 42,
     #err => 0,
@@ -24,7 +24,7 @@ Match is an expression — it returns a value.
 
 Extract data from variant payloads:
 
-```kettu
+```kettu nocheck
 let v = #ok(42);
 let result = match v {
     #ok(x) => x,       // x binds to 42
@@ -35,7 +35,7 @@ let result = match v {
 
 Use the bound variable in the arm body:
 
-```kettu
+```kettu nocheck
 let v = #ok(21);
 match v {
     #ok(x) => x * 2,   // 42
@@ -47,7 +47,7 @@ match v {
 
 The `_` pattern matches anything:
 
-```kettu
+```kettu nocheck
 match status {
     #ok => handle_success(),
     _ => 0,               // catch-all
@@ -56,7 +56,7 @@ match status {
 
 ## Multiple Arms
 
-```kettu
+```kettu nocheck
 let v = #err(99);
 let code = match v {
     #ok(x) => 0,
@@ -68,7 +68,7 @@ let code = match v {
 
 Works naturally with variant constructors:
 
-```kettu
+```kettu nocheck
 let maybe = #some(42);
 match maybe {
     #some(v) => v,

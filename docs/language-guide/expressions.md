@@ -9,7 +9,7 @@
 
 ## Literals
 
-```kettu
+```kettu nocheck
 42           // Integer
 true false   // Boolean
 "hello"      // String
@@ -24,7 +24,7 @@ true false   // Boolean
 
 ## Arithmetic Operators
 
-```kettu
+```kettu nocheck
 a + b   // Addition
 a - b   // Subtraction
 a * b   // Multiplication
@@ -33,7 +33,7 @@ a / b   // Division
 
 ## Comparison Operators
 
-```kettu
+```kettu nocheck
 a == b  // Equal
 a != b  // Not equal
 a < b   // Less than
@@ -46,7 +46,7 @@ a >= b  // Greater or equal
 
 Short-circuit evaluation:
 
-```kettu
+```kettu nocheck
 a && b  // And (skips b if a is false)
 a || b  // Or (skips b if a is true)
 ```
@@ -55,7 +55,7 @@ a || b  // Or (skips b if a is true)
 
 Conditional branching:
 
-```kettu
+```kettu nocheck
 if x > 0 {
     return x;
 } else {
@@ -65,7 +65,7 @@ if x > 0 {
 
 Nested conditionals:
 
-```kettu
+```kettu nocheck
 if x > 20 {
     return 3;
 } else {
@@ -79,7 +79,7 @@ if x > 20 {
 
 ## Function Calls
 
-```kettu
+```kettu nocheck
 add(1, 2)
 greet("world")
 get_value()
@@ -89,14 +89,14 @@ get_value()
 
 Assert panics if the condition is false:
 
-```kettu
+```kettu nocheck
 assert 2 + 2 == 4;
 assert x > 0;
 ```
 
 Useful in tests:
 
-```kettu
+```kettu nocheck
 @test
 test-math: func() -> bool {
     assert 10 / 2 == 5;
@@ -119,7 +119,7 @@ From highest to lowest:
 
 ## Negation
 
-```kettu
+```kettu nocheck
 !true       // false
 !(x > 5)    // negate a comparison
 ```
@@ -135,7 +135,7 @@ x = 20;      // reassignment
 
 ### Compound Assignment
 
-```kettu
+```kettu nocheck
 x += 5;   // x = x + 5
 x -= 2;   // x = x - 2
 ```
@@ -144,7 +144,7 @@ x -= 2;   // x = x - 2
 
 Access record fields with `.`:
 
-```kettu
+```kettu nocheck
 let point = { x: 10, y: 20 };
 point.x    // 10
 point.y    // 20
@@ -157,7 +157,7 @@ point.y    // 20
 
 Safely access fields on optional values with `?.`:
 
-```kettu
+```kettu nocheck
 let maybe = some({ x: 10 });
 maybe?.x   // some(10) if maybe is some, none if none
 ```
@@ -166,7 +166,7 @@ maybe?.x   // some(10) if maybe is some, none if none
 
 Unwrap `some`/`ok` or propagate `none`/`err`:
 
-```kettu
+```kettu nocheck
 let val = maybe?;  // unwraps or early-returns none
 ```
 
@@ -174,7 +174,7 @@ let val = maybe?;  // unwraps or early-returns none
 
 Construct records inline:
 
-```kettu
+```kettu nocheck
 let point = { x: 10, y: 20 };
 let r = { a: 1, b: 2, c: 3 };
 ```
@@ -193,7 +193,7 @@ arr[1..3]  // [2, 3]
 
 See [Data Types](./types.md#variant-literals):
 
-```kettu
+```kettu nocheck
 let x = #some(42);
 let y = #none;
 let r = result#ok(10);

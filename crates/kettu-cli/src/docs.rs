@@ -334,3 +334,40 @@ pub fn print_topic(selector: &str) {
     let rewritten = rewrite_links(&topic.content, &link_map);
     println!("{}", rewritten);
 }
+
+/// Return all doc pages as `(title, raw_content)` pairs for doc-testing.
+/// If `selector` is provided, filter to that specific topic/section.
+pub fn get_pages_for_testing(selector: Option<&str>) -> Vec<(String, String)> {
+    let pages = load_docs();
+
+    if let Some(sel) = selector {
+        let groups = grouped(&pages);
+        let parts: Vec<&str> = sel.split('.').collect();
+        let sec_num: usize = match parts[0].parse::<usize>() {
+            Ok(n) if n >= 1 && n <= groups.len() => n,
+            _ => return vec![],
+        };
+        let (_section_name, topics) = &groups[sec_num - 1];
+
+        if parts.len() == 1 {
+            // Whole section
+            topics
+                .iter()
+                .map(|p| (p.title.clone(), p.content.clone()))
+                .collect()
+        } else {
+            let topic_num: usize = match parts[1].parse::<usize>() {
+                Ok(n) if n >= 1 && n <= topics.len() => n,
+                _ => return vec![],
+            };
+            let topic = topics[topic_num - 1];
+            vec![(topic.title.clone(), topic.content.clone())]
+        }
+    } else {
+        pages
+            .iter()
+            .map(|p| (p.title.clone(), p.content.clone()))
+            .collect()
+    }
+}
+

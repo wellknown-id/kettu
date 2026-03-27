@@ -22,7 +22,7 @@
 
 Named product types with fields:
 
-```kettu
+```kettu nocheck
 record point {
     x: s32,
     y: s32,
@@ -55,7 +55,7 @@ variant option {
 
 Construct variant values using the `#` prefix:
 
-```kettu
+```kettu nocheck
 // Unqualified (inferred type)
 let n = #none;
 let s = #some(42);
@@ -69,7 +69,7 @@ let e = option#none;
 
 Simple enumerations without payloads:
 
-```kettu
+```kettu nocheck
 enum color {
     red,
     green,
@@ -108,7 +108,7 @@ type name = string;
 
 Built-in generic types:
 
-```kettu
+```kettu nocheck
 // Optional value
 option<string>
 
@@ -126,7 +126,7 @@ tuple<s32, string, bool>
 
 The `v128` type holds 128-bit SIMD vectors:
 
-```kettu
+```kettu nocheck
 let v = i32x4.splat(42);        // 4 packed i32s
 let sum = i32x4.add(a, b);      // vector addition
 let lane = i32x4.extract_lane(v, 0);  // extract scalar

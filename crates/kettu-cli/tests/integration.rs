@@ -256,3 +256,28 @@ fn test_docs_topic_command() {
     );
 }
 
+#[test]
+fn test_docs_check_command() {
+    let output = Command::new("cargo")
+        .args(["run", "-p", "kettu-cli", "--", "docs", "--check"])
+        .output()
+        .expect("Failed to run kettu docs --check");
+
+    assert!(
+        output.status.success(),
+        "Doc-tests should all pass: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("passed"),
+        "Output should contain test results"
+    );
+    assert!(
+        !stdout.contains("failed, ") || stdout.contains("0 failed"),
+        "No doc-tests should fail"
+    );
+}
+
+

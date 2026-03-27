@@ -15,7 +15,7 @@ Kettu provides first-class concurrency support via the WASM Threads proposal. Al
 
 Use `spawn { ... }` to run code on a new thread. It returns an opaque `thread-id`:
 
-```kettu
+```kettu nocheck
 let tid = spawn {
     // runs on a new wasi thread
     expensive_computation();
@@ -28,7 +28,7 @@ The `thread-id` type is opaque — you can't accidentally do arithmetic on it.
 
 Two equivalent ways to wait for a thread to complete:
 
-```kettu
+```kettu nocheck
 // Method syntax
 thread.join(tid);
 
@@ -54,7 +54,7 @@ This auto-allocates 4-byte aligned shared memory and initializes it with an atom
 
 For fine-grained control, use the `atomic.*` built-ins directly:
 
-```kettu
+```kettu nocheck
 shared let x = 0;
 
 atomic.store(x, 42);
@@ -72,7 +72,7 @@ atomic.notify(addr, count);
 
 Wrap shared-variable operations in `atomic { ... }` for automatic desugaring:
 
-```kettu
+```kettu nocheck
 shared let counter = 0;
 
 // Increment — compiles to i32.atomic.rmw.add
@@ -104,7 +104,7 @@ Inside `atomic { }` blocks on shared variables, these are promoted to atomic rea
 
 ## Complete Example
 
-```kettu
+```kettu nocheck
 package local:demo;
 
 interface counter {

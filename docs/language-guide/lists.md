@@ -11,7 +11,7 @@
 
 Create lists with square brackets:
 
-```kettu
+```kettu nocheck
 let arr = [10, 20, 30];
 let single = [42];
 let nums = [1, 2, 3, 4, 5];
@@ -35,7 +35,7 @@ arr[idx] // 30
 
 Extract a sub-list with `[start..end]`:
 
-```kettu
+```kettu nocheck
 let arr = [10, 20, 30, 40, 50];
 let sub = arr[1..4];
 // sub == [20, 30, 40], length 3
@@ -45,7 +45,7 @@ let sub = arr[1..4];
 
 ### `list-len(list)` — Length
 
-```kettu
+```kettu nocheck
 let arr = [1, 2, 3, 4, 5];
 list-len(arr)  // 5
 ```
