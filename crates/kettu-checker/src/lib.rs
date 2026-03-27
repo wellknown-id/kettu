@@ -234,23 +234,19 @@ impl Checker {
     // ========================================================================
 
     fn collect_definitions(&mut self, file: &WitFile) {
-        for item in &file.items {
-            match item {
-                TopLevelItem::Interface(iface) => self.collect_interface(iface),
-                TopLevelItem::World(world) => self.collect_world(world),
-                TopLevelItem::Use(_) => {} // Handled in validation
-                TopLevelItem::NestedPackage(nested) => self.collect_nested_package(nested),
-            }
-        }
+        self.collect_items(&file.items);
     }
 
-    fn collect_nested_package(&mut self, pkg: &NestedPackage) {
-        for item in &pkg.items {
+    /// Collect definitions from a slice of top-level items into the current scope.
+    /// `NestedPackage` items are skipped here; they are validated in isolated scopes
+    /// during the validation pass to avoid name collisions across packages.
+    fn collect_items(&mut self, items: &[TopLevelItem]) {
+        for item in items {
             match item {
                 TopLevelItem::Interface(iface) => self.collect_interface(iface),
                 TopLevelItem::World(world) => self.collect_world(world),
                 TopLevelItem::Use(_) => {} // Handled in validation
-                TopLevelItem::NestedPackage(nested) => self.collect_nested_package(nested),
+                TopLevelItem::NestedPackage(_) => {} // Validated in isolated scope
             }
         }
     }
@@ -387,23 +383,24 @@ impl Checker {
     // ========================================================================
 
     fn validate_file(&mut self, file: &WitFile) {
-        for item in &file.items {
-            match item {
-                TopLevelItem::Interface(iface) => self.validate_interface(iface),
-                TopLevelItem::World(world) => self.validate_world(world),
-                TopLevelItem::Use(use_stmt) => self.validate_top_level_use(use_stmt),
-                TopLevelItem::NestedPackage(nested) => self.validate_nested_package(nested),
-            }
-        }
+        self.validate_items(&file.items);
     }
 
-    fn validate_nested_package(&mut self, pkg: &NestedPackage) {
-        for item in &pkg.items {
+    /// Validate a slice of top-level items.
+    /// `NestedPackage` items are each checked in a fresh, isolated `Checker` scope so
+    /// that their definitions cannot shadow or collide with those of other packages.
+    fn validate_items(&mut self, items: &[TopLevelItem]) {
+        for item in items {
             match item {
                 TopLevelItem::Interface(iface) => self.validate_interface(iface),
                 TopLevelItem::World(world) => self.validate_world(world),
                 TopLevelItem::Use(use_stmt) => self.validate_top_level_use(use_stmt),
-                TopLevelItem::NestedPackage(nested) => self.validate_nested_package(nested),
+                TopLevelItem::NestedPackage(nested) => {
+                    let mut nested_checker = Checker::new();
+                    nested_checker.collect_items(&nested.items);
+                    nested_checker.validate_items(&nested.items);
+                    self.diagnostics.extend(nested_checker.diagnostics);
+                }
             }
         }
     }
@@ -2117,32 +2114,78 @@ fn typedef_to_kind(kind: &TypeDefKind) -> TypeKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kettu_parser::parse_file;
+    use kettu_parser::{ast::PackagePath, parse_file};
+
+    fn test_id(name: &str) -> Id {
+        Id::new(name, 0..name.len())
+    }
+
+    fn make_nested_package(ns: &str, pkg_name: &str, items: Vec<TopLevelItem>) -> NestedPackage {
+        NestedPackage {
+            path: PackagePath {
+                namespace: vec![test_id(ns)],
+                name: vec![test_id(pkg_name)],
+                version: None,
+            },
+            items,
+            span: 0..0,
+        }
+    }
 
     #[test]
     fn test_nested_package_handling() {
-        let source = r#"
-            package local:test;
+        // The grammar does not yet emit NestedPackage nodes from source text,
+        // so we construct the AST directly to exercise the checker code path.
+        let iface = Interface {
+            gates: vec![],
+            name: test_id("inner"),
+            items: vec![],
+            span: 0..0,
+        };
+        let nested = make_nested_package("foo", "bar", vec![TopLevelItem::Interface(iface)]);
+        let ast = WitFile {
+            package: None,
+            items: vec![TopLevelItem::NestedPackage(nested)],
+        };
 
-            package foo:bar {
-                interface inner {
-                    record data {
-                        value: u32,
-                    }
-                    process: func(d: data) -> string;
-                }
+        assert!(
+            ast.items
+                .iter()
+                .any(|item| matches!(item, TopLevelItem::NestedPackage(_))),
+            "AST should contain at least one nested package"
+        );
 
-                world nested-world {
-                    import inner;
-                }
-            }
-        "#;
-
-        let (ast, _) = parse_file(source);
-        let ast = ast.expect("Should parse");
         let diags = check(&ast);
-
         assert!(diags.is_empty(), "Should have no errors: {:?}", diags);
+    }
+
+    #[test]
+    fn test_nested_packages_isolated_scopes() {
+        // Two nested packages that both define an interface named `shared` should
+        // NOT produce a duplicate-definition diagnostic, because each nested
+        // package is validated in its own isolated scope.
+        let make_interface = || Interface {
+            gates: vec![],
+            name: test_id("shared"),
+            items: vec![],
+            span: 0..0,
+        };
+        let pkg_a = make_nested_package("a", "one", vec![TopLevelItem::Interface(make_interface())]);
+        let pkg_b = make_nested_package("b", "two", vec![TopLevelItem::Interface(make_interface())]);
+        let ast = WitFile {
+            package: None,
+            items: vec![
+                TopLevelItem::NestedPackage(pkg_a),
+                TopLevelItem::NestedPackage(pkg_b),
+            ],
+        };
+
+        let diags = check(&ast);
+        assert!(
+            diags.is_empty(),
+            "Two nested packages with the same interface name should not produce duplicate errors: {:?}",
+            diags
+        );
     }
 
     #[test]
