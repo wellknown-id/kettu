@@ -1,116 +1,110 @@
 # Kettu Examples
 
-This directory contains example `.kettu` files demonstrating various features of the Kettu language.
+This directory contains `.kettu` files demonstrating the features of the Kettu language. Run `cargo run -p kettu-cli test examples/` from the repo root to execute all tests.
 
 ## Examples
 
-| File                                   | Description                                                            |
-| -------------------------------------- | ---------------------------------------------------------------------- |
-| [hello.kettu](hello.kettu)             | Basic hello world - packages, interfaces, imports                      |
-| [math.kettu](math.kettu)               | Arithmetic operators, local variables, return statements               |
-| [control.kettu](control.kettu)         | If/else expressions, comparisons                                       |
-| [types.kettu](types.kettu)             | Records, enums, type aliases                                           |
-| [resources.kettu](resources.kettu)     | Interface with resource-like operations                                |
-| [versioned.kettu](versioned.kettu)     | Versioned package paths (`package/use/import/include` with `@version`) |
-| [composition.kettu](composition.kettu) | World composition with include                                         |
-| [math_test.kettu](math_test.kettu)     | Unit tests with @test annotations                                      |
+### Core Language
 
-## Running Examples
+| File | Description |
+| --- | --- |
+| [hello.kettu](hello.kettu) | Packages, interfaces, imports |
+| [math.kettu](math.kettu) | Arithmetic operators, local variables, return statements |
+| [math_test.kettu](math_test.kettu) | Unit tests with `@test` annotations |
+| [control.kettu](control.kettu) | If/else expressions, comparisons |
+| [control_test.kettu](control_test.kettu) | Control flow tests |
+| [types.kettu](types.kettu) | Records, enums, type aliases |
+| [assignment_test.kettu](assignment_test.kettu) | Reassignment and compound assignment (`+=`, `-=`) |
+| [negation_test.kettu](negation_test.kettu) | Unary negation (`-expr`, `-5`, `-(-x)`) |
 
-### Parse and display AST
+### Data Structures
+
+| File | Description |
+| --- | --- |
+| [record_test.kettu](record_test.kettu) | Record construction and field access |
+| [variant_test.kettu](variant_test.kettu) | Variant types, `#case` / `type#case(payload)` construction |
+| [match_test.kettu](match_test.kettu) | Pattern matching on variants |
+| [list_test.kettu](list_test.kettu) | Lists, indexing, slicing, `list-push`, `list-set` |
+| [option_result_test.kettu](option_result_test.kettu) | `some(x)` / `none`, `ok(x)` / `err(e)` |
+| [try_test.kettu](try_test.kettu) | Try operator (`?`) and optional chaining (`?.`) |
+
+### Strings
+
+| File | Description |
+| --- | --- |
+| [string_test.kettu](string_test.kettu) | String concatenation, `str-len`, `str-eq` |
+| [string_interp_test.kettu](string_interp_test.kettu) | String interpolation (`"hello {name}"`) |
+
+### Loops
+
+| File | Description |
+| --- | --- |
+| [loop_test.kettu](loop_test.kettu) | `for x in range(...)` loops |
+| [while_test.kettu](while_test.kettu) | `while` loops |
+| [if_expr_test.kettu](if_expr_test.kettu) | If-as-expression, `break`, `continue` in loops |
+
+### Functions & Closures
+
+| File | Description |
+| --- | --- |
+| [hof_test.kettu](hof_test.kettu) | `map`, `filter`, `reduce` with lambdas |
+| [callable_closure_test.kettu](callable_closure_test.kettu) | Closures capturing outer variables |
+| [trailing_closure_test.kettu](trailing_closure_test.kettu) | Trailing closure syntax (`func \|x\| expr`) |
+
+### Resources & Modules
+
+| File | Description |
+| --- | --- |
+| [resources.kettu](resources.kettu) | Resource types, constructors, instance/static methods |
+| [resource_test.kettu](resource_test.kettu) | Resource tests |
+| [versioned.kettu](versioned.kettu) | Versioned package paths (`@version`) |
+| [composition.kettu](composition.kettu) | World composition with `include` |
+| [modules/](modules/) | Multi-file compilation (`main.kettu` + `helper/lib.kettu`) |
+
+### Concurrency
+
+| File | Description |
+| --- | --- |
+| [async_test.kettu](async_test.kettu) | Async functions and `await` |
+| [async_callback_test.kettu](async_callback_test.kettu) | Async callbacks |
+| [thread_test.kettu](thread_test.kettu) | `spawn { }`, `thread.join`, `shared let`, `atomic { }` |
+
+### SIMD
+
+| File | Description |
+| --- | --- |
+| [simd_test.kettu](simd_test.kettu) | `v128` ops, `simd for`, lane operations |
+
+## Running
 
 ```bash
-cargo run -p kettu-cli -- parse examples/hello.kettu
+# Run all tests
+cargo run -p kettu-cli test examples/
+
+# Run a specific test file
+cargo run -p kettu-cli test examples/math_test.kettu
+
+# Parse and display AST
+cargo run -p kettu-cli parse examples/hello.kettu
+
+# Type check
+cargo run -p kettu-cli check examples/math.kettu
+
+# Emit pure WIT (strips function bodies)
+cargo run -p kettu-cli emit-wit examples/hello.kettu
+
+# Compile to WASM
+cargo run -p kettu-cli build --core examples/math.kettu -o output.wasm
 ```
 
-### Type check
+## Language Quick Reference
 
-```bash
-cargo run -p kettu-cli -- check examples/math.kettu
-```
+### Operators
+`+`, `-`, `*`, `/`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&&`, `||`, `!`, `-` (unary)
 
-### Emit pure WIT (strips function bodies)
+### Subtraction vs Hyphens
+Identifiers use kebab-case (`my-var`, `str-len`). The `-` character is part of the identifier when adjacent to letters: `a-b` is one identifier. **Use spaces for subtraction:** `a - b`.
 
-```bash
-cargo run -p kettu-cli -- emit-wit examples/hello.kettu
-```
-
-### Compile to WASM
-
-```bash
-cargo run -p kettu-cli -- build --core examples/math.kettu -o output.wasm
-```
-
-### Run tests
-
-```bash
-cargo run -p kettu-cli -- test examples/math_test.kettu
-
-# Filter tests by name
-cargo run -p kettu-cli -- test examples/math_test.kettu --filter addition
-```
-
-### Validate all examples recursively
-
-```bash
-cd kettu
-find examples -name '*.kettu' -type f | sort | while read -r f; do
-    /mnt/faststorage/repos/kodus/target/debug/kettu check "$f" || exit 1
-done
-```
-
-## Kettu Language Overview
-
-Kettu is a WASM-first language that extends WIT (WebAssembly Interface Types) with executable function bodies:
-
-### WIT Compatibility
-
-- Full WIT syntax support (packages, interfaces, worlds, types)
-- Package-qualified and versioned paths (`pkg:ns/name@version`)
-- World composition with `include`
-
-### Kettu Extensions
-
-- Function bodies with expressions
-- Local variables (`let x = expr;`)
-- Return statements (`return expr;`)
-- Binary operators (`+`, `-`, `*`, `/`, `==`, `!=`, `<`, `>`, `<=`, `>=`)
-- If/else expressions (`if cond { expr } else { expr }`)
-- Function calls
-- Test functions with `@test` annotation
-
-### Example Test Function
-
-```kettu
-interface math-tests {
-    @test
-    test-addition: func() -> bool {
-        return 2 + 3 == 5;
-    }
-
-    @test
-    test-let-binding: func() -> bool {
-        let a = 10;
-        let b = 20;
-        return a + b == 30;
-    }
-}
-```
-
-## Current Limitations
-
-The examples in this folder are kept parse/check clean with the current parser/checker.
-
-Known rough edges to keep in mind:
-
-- Feature-gate coverage in examples is intentionally light (most examples focus on executable bodies and type-checking paths).
-- Some examples are semantics-oriented (parser/check demos) and do not imply full runtime/resource backing behavior.
-
-### Quick Syntax Notes (Current Parser Behavior)
-
-| Topic                            | Works Reliably in Examples               | Notes                                                                                  |
-| -------------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------------- |
-| Versioned package paths          | `package/use/import/include ...@version` | See `versioned.kettu`                                                                  |
-| Variant construction             | `#case`, `#case(payload)`                | Preferred form in examples                                                             |
-| Qualified variant construction   | `type#case`, `type#case(payload)`        | Supported for constructors and `match` patterns (see `variant_test.kettu`)             |
-| Qualified pattern payload checks | `type#case(binding)` for payload cases   | Checker enforces arity: payload cases require binding; non-payload cases must not bind |
+### Variant Syntax
+- Construction: `#case`, `#case(payload)`, `type#case`, `type#case(payload)`
+- Pattern matching: `type#case(binding)` in `match` arms
