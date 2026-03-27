@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::process::Command;
 use tempfile::NamedTempFile;
+use wasmparser::{Parser, Payload};
 
 fn kettu_cmd() -> Command {
     Command::new(env!("CARGO_BIN_EXE_kettu"))
@@ -149,6 +150,65 @@ fn test_build_with_expressions() {
         b"\0asm",
         "Output should have WASM magic number"
     );
+}
+
+#[test]
+fn test_build_debug_sections() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(file, "package local:test;").unwrap();
+    writeln!(file, "interface api {{").unwrap();
+    writeln!(file, "    add: func(a: s32, b: s32) -> s32 {{").unwrap();
+    writeln!(file, "        return a + b;").unwrap();
+    writeln!(file, "    }}").unwrap();
+    writeln!(file, "}}").unwrap();
+
+    let output_file = NamedTempFile::new().unwrap();
+
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "-p",
+            "kettu-cli",
+            "--",
+            "build",
+            "--core",
+            "--debug",
+            file.path().to_str().unwrap(),
+            "-o",
+            output_file.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run kettu build --debug");
+
+    assert!(
+        output.status.success(),
+        "Debug build should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let wasm = std::fs::read(output_file.path()).unwrap();
+    let mut has_debug_info = false;
+    let mut has_debug_line = false;
+    let mut has_name = false;
+
+    for payload in Parser::new(0).parse_all(&wasm) {
+        match payload.expect("valid wasm payload") {
+            Payload::CustomSection(section) => {
+                if section.name() == ".debug_info" {
+                    has_debug_info = true;
+                } else if section.name() == ".debug_line" {
+                    has_debug_line = true;
+                } else if section.name() == "name" {
+                    has_name = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(has_debug_info, "should emit .debug_info section");
+    assert!(has_debug_line, "should emit .debug_line section");
+    assert!(has_name, "should emit name section for debugging");
 }
 
 #[test]

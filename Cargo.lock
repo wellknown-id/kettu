@@ -859,6 +859,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "walkdir",
+ "wasmparser 0.245.1",
  "wasmtime",
 ]
 
@@ -881,6 +882,7 @@ dependencies = [
  "kettu-checker",
  "kettu-codegen",
  "kettu-parser",
+ "serde_json",
  "tokio",
  "tower-lsp",
 ]

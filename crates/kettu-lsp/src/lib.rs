@@ -12,6 +12,7 @@ use kettu_parser::{
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::RwLock;
+use serde_json::json;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -1830,6 +1831,10 @@ impl LanguageServer for Backend {
                     ]),
                     ..Default::default()
                 }),
+                experimental: Some(json!({
+                    "dap": true,
+                    "supportsDebugAdapter": true
+                })),
                 ..Default::default()
             },
             ..Default::default()

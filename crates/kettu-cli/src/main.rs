@@ -82,6 +82,12 @@ enum Commands {
         /// Enable WASM threads (shared memory + atomics)
         #[arg(long)]
         threads: bool,
+        /// Emit DWARF debug info and keep names (useful for DAP)
+        #[arg(long)]
+        debug: bool,
+        /// Keep function names even without DWARF sections
+        #[arg(long, default_value_t = false)]
+        keep_names: bool,
     },
     /// Run tests in a .kettu file
     Test {
@@ -201,6 +207,8 @@ async fn main() {
             core,
             wasip3,
             threads,
+            debug,
+            keep_names,
         } => {
             let content = match fs::read_to_string(&file) {
                 Ok(c) => c,
@@ -263,6 +271,9 @@ async fn main() {
                 memory_pages: 1,
                 wasip3,
                 threads,
+                emit_dwarf: debug,
+                keep_names: keep_names || debug,
+                debug_source: Some(content.clone()),
             };
 
             let wasm = if core {
@@ -502,6 +513,9 @@ fn run_tests(file: &PathBuf, filter: Option<&str>, threads: bool) -> (usize, usi
         memory_pages: 1,
         wasip3: false,
         threads,
+        emit_dwarf: false,
+        keep_names: false,
+        debug_source: Some(content.clone()),
     };
 
     let wasm_bytes = match kettu_codegen::build_core_module(&ast, &compile_options) {
