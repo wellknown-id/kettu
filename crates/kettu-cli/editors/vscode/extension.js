@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const cp = require('child_process');
 const { LanguageClient, TransportKind } = require('vscode-languageclient/node');
+const { normalizePath, hasBreakpointInRange } = require('./debug-breakpoints');
 
 let client;
 let passDecorationType;
@@ -162,6 +163,44 @@ function activate(context) {
         );
     });
 
+    const debugConfigProvider = new KettuDebugConfigurationProvider(serverPath);
+    const debugAdapterFactory = new KettuDebugAdapterFactory(serverPath);
+    context.subscriptions.push(
+        vscode.debug.registerDebugConfigurationProvider('kettu', debugConfigProvider)
+    );
+    context.subscriptions.push(
+        vscode.debug.registerDebugAdapterDescriptorFactory('kettu', debugAdapterFactory)
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('kettu.debugCurrentFileTests', async () => {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor || editor.document.languageId !== 'kettu') {
+                vscode.window.showErrorMessage('Open a .kettu file to debug tests.');
+                return;
+            }
+
+            const program = editor.document.uri.fsPath;
+            const folder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
+            const cwd = folder ? folder.uri.fsPath : path.dirname(program);
+
+            const config = {
+                type: 'kettu',
+                request: 'launch',
+                name: 'Debug Kettu Tests',
+                program,
+                cwd,
+                stopOnEntry: false,
+                kettuPath: serverPath,
+            };
+
+            const ok = await vscode.debug.startDebugging(folder, config);
+            if (!ok) {
+                vscode.window.showErrorMessage('Failed to start Kettu debug session.');
+            }
+        })
+    );
+
     // ─── MCP Tool Implementations (CoPilot Chat tools) ──────────────────
     // These invoke `kettu mcp` via JSON-RPC tools/call over stdio.
 
@@ -200,6 +239,400 @@ function activate(context) {
             resolveMcpServerDefinition: async (server) => server,
         })
     );
+}
+
+class KettuDebugConfigurationProvider {
+    constructor(defaultKettuPath) {
+        this.defaultKettuPath = defaultKettuPath;
+    }
+
+    resolveDebugConfiguration(_folder, config) {
+        if (!config.type) {
+            config.type = 'kettu';
+        }
+        if (!config.request) {
+            config.request = 'launch';
+        }
+
+        if (!config.program) {
+            const editor = vscode.window.activeTextEditor;
+            if (editor && editor.document.languageId === 'kettu') {
+                config.program = editor.document.uri.fsPath;
+            }
+        }
+
+        if (!config.program) {
+            vscode.window.showErrorMessage('Kettu debug: set a .kettu file in launch.json "program".');
+            return undefined;
+        }
+
+        config.cwd = config.cwd || path.dirname(config.program);
+        config.kettuPath = config.kettuPath || this.defaultKettuPath;
+        config.stopOnEntry = !!config.stopOnEntry;
+        return config;
+    }
+}
+
+class KettuDebugAdapterFactory {
+    constructor(defaultKettuPath) {
+        this.defaultKettuPath = defaultKettuPath;
+    }
+
+    createDebugAdapterDescriptor(session) {
+        const adapter = new KettuInlineDebugAdapter(session.configuration, this.defaultKettuPath);
+        return new vscode.DebugAdapterInlineImplementation(adapter);
+    }
+}
+
+class KettuInlineDebugAdapter {
+    constructor(configuration, defaultKettuPath) {
+        this.configuration = configuration || {};
+        this.defaultKettuPath = defaultKettuPath;
+        this.eventEmitter = new vscode.EventEmitter();
+        this.onDidSendMessage = this.eventEmitter.event;
+
+        this.breakpoints = new Map();
+        this.currentStop = null;
+        this.started = false;
+        this.terminated = false;
+        this.continueResolver = null;
+        this.threadId = 1;
+        this.variablesRef = 1;
+    }
+
+    dispose() {
+        this.terminated = true;
+        if (this.continueResolver) {
+            this.continueResolver();
+            this.continueResolver = null;
+        }
+        this.eventEmitter.dispose();
+    }
+
+    async handleMessage(message) {
+        if (message.type !== 'request') {
+            return;
+        }
+
+        switch (message.command) {
+            case 'initialize': {
+                this.sendResponse(message, {
+                    supportsConfigurationDoneRequest: true,
+                    supportsConditionalBreakpoints: false,
+                    supportsLogPoints: false,
+                    supportsEvaluateForHovers: false,
+                    supportsSetVariable: false,
+                    supportsTerminateRequest: true,
+                });
+                break;
+            }
+
+            case 'launch': {
+                const args = message.arguments || {};
+                this.program = path.resolve(args.program || this.configuration.program || '');
+                this.cwd = path.resolve(args.cwd || this.configuration.cwd || path.dirname(this.program));
+                this.kettuPath = args.kettuPath || this.configuration.kettuPath || this.defaultKettuPath;
+                this.stopOnEntry = !!(args.stopOnEntry ?? this.configuration.stopOnEntry);
+
+                if (!this.program) {
+                    this.sendErrorResponse(message, 'Missing launch argument: program');
+                    return;
+                }
+
+                this.sendResponse(message);
+                this.sendEvent('initialized');
+                break;
+            }
+
+            case 'setBreakpoints': {
+                const sourcePath = message.arguments?.source?.path;
+                const resolved = sourcePath ? normalizePath(sourcePath) : normalizePath(this.program);
+                const lines = (message.arguments?.breakpoints || [])
+                    .map((bp) => bp.line)
+                    .filter((line) => Number.isInteger(line));
+
+                this.breakpoints.set(resolved, new Set(lines));
+
+                this.sendResponse(message, {
+                    breakpoints: lines.map((line) => ({
+                        verified: true,
+                        line,
+                    })),
+                });
+                break;
+            }
+
+            case 'configurationDone': {
+                this.sendResponse(message);
+                this.startExecution().catch((err) => {
+                    this.sendOutput(`Kettu debug error: ${err.message}\n`, 'stderr');
+                    this.sendEvent('terminated');
+                });
+                break;
+            }
+
+            case 'threads': {
+                this.sendResponse(message, {
+                    threads: [{ id: this.threadId, name: 'Kettu Tests' }],
+                });
+                break;
+            }
+
+            case 'stackTrace': {
+                if (!this.currentStop) {
+                    this.sendResponse(message, { stackFrames: [], totalFrames: 0 });
+                    break;
+                }
+
+                this.sendResponse(message, {
+                    stackFrames: [
+                        {
+                            id: 1,
+                            name: `test ${this.currentStop.name}`,
+                            source: {
+                                name: path.basename(this.program),
+                                path: this.program,
+                            },
+                            line: this.currentStop.line,
+                            column: 1,
+                        },
+                    ],
+                    totalFrames: 1,
+                });
+                break;
+            }
+
+            case 'scopes': {
+                this.sendResponse(message, {
+                    scopes: [
+                        {
+                            name: 'Test',
+                            variablesReference: this.variablesRef,
+                            expensive: false,
+                        },
+                    ],
+                });
+                break;
+            }
+
+            case 'variables': {
+                const vars = [];
+                if (this.currentStop) {
+                    vars.push({ name: 'test', value: this.currentStop.name, variablesReference: 0 });
+                    vars.push({ name: 'line', value: String(this.currentStop.line), variablesReference: 0 });
+                    vars.push({ name: 'status', value: this.currentStop.status, variablesReference: 0 });
+                }
+                this.sendResponse(message, { variables: vars });
+                break;
+            }
+
+            case 'continue': {
+                if (this.continueResolver) {
+                    this.continueResolver();
+                    this.continueResolver = null;
+                }
+                this.sendResponse(message, { allThreadsContinued: true });
+                break;
+            }
+
+            case 'next':
+            case 'stepIn':
+            case 'stepOut': {
+                if (this.continueResolver) {
+                    this.continueResolver();
+                    this.continueResolver = null;
+                }
+                this.sendResponse(message);
+                break;
+            }
+
+            case 'disconnect':
+            case 'terminate': {
+                this.terminated = true;
+                if (this.continueResolver) {
+                    this.continueResolver();
+                    this.continueResolver = null;
+                }
+                this.sendResponse(message);
+                this.sendEvent('terminated');
+                break;
+            }
+
+            default: {
+                this.sendResponse(message);
+            }
+        }
+    }
+
+    async startExecution() {
+        if (this.started || this.terminated) {
+            return;
+        }
+        this.started = true;
+
+        const discovery = await runCommandJson(this.kettuPath, ['test', this.program, '--list', '--json'], this.cwd);
+        const tests = Array.isArray(discovery.tests) ? discovery.tests : [];
+
+        if (tests.length === 0) {
+            this.sendOutput('No tests found.\n');
+            this.sendEvent('terminated');
+            return;
+        }
+
+        if (this.stopOnEntry) {
+            await this.stopAndWait('entry', { name: tests[0].name, line: tests[0].line, status: 'ready' });
+        }
+
+        for (const test of tests) {
+            if (this.terminated) {
+                break;
+            }
+
+            const startLine = Number.isInteger(test.line) ? test.line : 1;
+            const endLine = Number.isInteger(test.endLine) ? test.endLine : startLine;
+            const stopLine = startLine;
+
+            const isBreakpoint = this.hasBreakpoint(this.program, startLine, endLine);
+            if (isBreakpoint) {
+                await this.stopAndWait('breakpoint', { name: test.name, line: stopLine, status: 'paused' });
+            }
+
+            if (this.terminated) {
+                break;
+            }
+
+            const runResult = await runCommand(
+                this.kettuPath,
+                ['test', this.program, '--filter', test.name, '--exact'],
+                this.cwd
+            );
+
+            if (runResult.stdout) {
+                this.sendOutput(runResult.stdout);
+            }
+            if (runResult.stderr) {
+                this.sendOutput(runResult.stderr, 'stderr');
+            }
+
+            if (runResult.exitCode !== 0) {
+                await this.stopAndWait('exception', {
+                    name: test.name,
+                    line: stopLine,
+                    status: 'failed',
+                });
+            }
+        }
+
+        if (!this.terminated) {
+            this.sendEvent('terminated');
+        }
+    }
+
+    hasBreakpoint(filePath, startLine, endLine) {
+        return hasBreakpointInRange(this.breakpoints, filePath, startLine, endLine);
+    }
+
+    async stopAndWait(reason, stop) {
+        this.currentStop = stop;
+        this.sendEvent('stopped', {
+            reason,
+            threadId: this.threadId,
+            allThreadsStopped: true,
+            description: `${stop.name} (${stop.status})`,
+        });
+
+        await new Promise((resolve) => {
+            this.continueResolver = resolve;
+        });
+    }
+
+    sendEvent(event, body = {}) {
+        this.eventEmitter.fire({
+            type: 'event',
+            event,
+            body,
+        });
+    }
+
+    sendResponse(request, body = {}) {
+        this.eventEmitter.fire({
+            type: 'response',
+            seq: 0,
+            request_seq: request.seq,
+            success: true,
+            command: request.command,
+            body,
+        });
+    }
+
+    sendErrorResponse(request, message) {
+        this.eventEmitter.fire({
+            type: 'response',
+            seq: 0,
+            request_seq: request.seq,
+            success: false,
+            command: request.command,
+            message,
+            body: {
+                error: {
+                    id: 1,
+                    format: message,
+                },
+            },
+        });
+    }
+
+    sendOutput(output, category = 'stdout') {
+        this.sendEvent('output', {
+            category,
+            output,
+        });
+    }
+}
+
+function runCommand(command, args, cwd) {
+    return new Promise((resolve, reject) => {
+        const child = cp.spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+        let stdout = '';
+        let stderr = '';
+
+        child.stdout.on('data', (chunk) => {
+            stdout += chunk.toString();
+        });
+        child.stderr.on('data', (chunk) => {
+            stderr += chunk.toString();
+        });
+
+        child.on('error', (err) => {
+            reject(err);
+        });
+
+        child.on('close', (code) => {
+            resolve({
+                exitCode: code ?? 1,
+                stdout,
+                stderr,
+            });
+        });
+    });
+}
+
+async function runCommandJson(command, args, cwd) {
+    const result = await runCommand(command, args, cwd);
+    if (result.exitCode !== 0) {
+        throw new Error(result.stderr || result.stdout || `Command failed: ${command} ${args.join(' ')}`);
+    }
+
+    const text = (result.stdout || '').trim();
+    if (!text) {
+        throw new Error('Expected JSON output, got empty output');
+    }
+
+    try {
+        return JSON.parse(text);
+    } catch (err) {
+        throw new Error(`Failed to parse JSON output: ${err.message}\n${text}`);
+    }
 }
 
 /**

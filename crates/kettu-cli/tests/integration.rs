@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::process::Command;
+use serde_json::Value;
 use tempfile::NamedTempFile;
 use wasmparser::{Parser, Payload};
 
@@ -164,12 +165,8 @@ fn test_build_debug_sections() {
 
     let output_file = NamedTempFile::new().unwrap();
 
-    let output = Command::new("cargo")
+    let output = kettu_cmd()
         .args([
-            "run",
-            "-p",
-            "kettu-cli",
-            "--",
             "build",
             "--core",
             "--debug",
@@ -209,6 +206,75 @@ fn test_build_debug_sections() {
     assert!(has_debug_info, "should emit .debug_info section");
     assert!(has_debug_line, "should emit .debug_line section");
     assert!(has_name, "should emit name section for debugging");
+}
+
+#[test]
+fn test_test_list_json() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(file, "package local:test;").unwrap();
+    writeln!(file, "interface tests {{").unwrap();
+    writeln!(file, "    @test").unwrap();
+    writeln!(file, "    smoke: func() -> bool {{ return true; }}").unwrap();
+    writeln!(file, "    @test").unwrap();
+    writeln!(file, "    smoke-extra: func() -> bool {{ return true; }}").unwrap();
+    writeln!(file, "}}").unwrap();
+
+    let output = kettu_cmd()
+        .args(["test", file.path().to_str().unwrap(), "--list", "--json"])
+        .output()
+        .expect("Failed to run kettu test --list --json");
+
+    assert!(
+        output.status.success(),
+        "List tests should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_str(&stdout).expect("valid json output");
+    let tests = parsed["tests"].as_array().expect("tests should be array");
+    assert_eq!(tests.len(), 2, "should list two tests");
+    for test in tests {
+        let line = test["line"].as_u64().expect("line should be number");
+        let end_line = test["endLine"].as_u64().expect("endLine should be number");
+        assert!(end_line >= line, "endLine should be >= line");
+    }
+}
+
+#[test]
+fn test_test_exact_filter_runs_one() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(file, "package local:test;").unwrap();
+    writeln!(file, "interface tests {{").unwrap();
+    writeln!(file, "    @test").unwrap();
+    writeln!(file, "    smoke: func() -> bool {{ return true; }}").unwrap();
+    writeln!(file, "    @test").unwrap();
+    writeln!(file, "    smoke-extra: func() -> bool {{ return true; }}").unwrap();
+    writeln!(file, "}}").unwrap();
+
+    let output = kettu_cmd()
+        .args([
+            "test",
+            file.path().to_str().unwrap(),
+            "--filter",
+            "smoke",
+            "--exact",
+        ])
+        .output()
+        .expect("Failed to run kettu test --exact");
+
+    assert!(
+        output.status.success(),
+        "Exact test run should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Running 1 test(s)"),
+        "Exact filter should run one test: {}",
+        stdout
+    );
 }
 
 #[test]

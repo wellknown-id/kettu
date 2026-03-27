@@ -13,10 +13,97 @@
         "Chat"
     ],
     "activationEvents": [
-        "onStartupFinished"
+        "onStartupFinished",
+        "onDebugResolve:kettu",
+        "onDebugInitialConfigurations",
+        "onCommand:kettu.debugCurrentFileTests"
     ],
     "main": "./extension.js",
     "contributes": {
+        "commands": [
+            {
+                "command": "kettu.debugCurrentFileTests",
+                "title": "Kettu: Debug Tests in Current File",
+                "category": "Kettu",
+                "icon": {
+                    "light": "./icons/kettu-file.svg",
+                    "dark": "./icons/kettu-file.svg"
+                }
+            }
+        ],
+        "menus": {
+            "editor/title": [
+                {
+                    "command": "kettu.debugCurrentFileTests",
+                    "when": "resourceLangId == kettu",
+                    "group": "navigation@9"
+                }
+            ]
+        },
+        "breakpoints": [
+            {
+                "language": "kettu"
+            }
+        ],
+        "debuggers": [
+            {
+                "type": "kettu",
+                "label": "Kettu",
+                "languages": [
+                    "kettu"
+                ],
+                "configurationAttributes": {
+                    "launch": {
+                        "required": [
+                            "program"
+                        ],
+                        "properties": {
+                            "program": {
+                                "type": "string",
+                                "description": "Absolute path to the .kettu file containing tests to debug"
+                            },
+                            "cwd": {
+                                "type": "string",
+                                "description": "Working directory for running tests"
+                            },
+                            "stopOnEntry": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Stop before the first test executes"
+                            },
+                            "kettuPath": {
+                                "type": "string",
+                                "description": "Path to kettu binary. Defaults to kettu.serverPath resolution"
+                            }
+                        }
+                    }
+                },
+                "initialConfigurations": [
+                    {
+                        "name": "Debug Kettu tests (current file)",
+                        "type": "kettu",
+                        "request": "launch",
+                        "program": "${file}",
+                        "cwd": "${workspaceFolder}",
+                        "stopOnEntry": false
+                    }
+                ],
+                "configurationSnippets": [
+                    {
+                        "label": "Kettu: Debug tests in current file",
+                        "description": "Run Kettu tests in debug mode and stop on Kettu breakpoints",
+                        "body": {
+                            "name": "Debug Kettu tests (current file)",
+                            "type": "kettu",
+                            "request": "launch",
+                            "program": "${file}",
+                            "cwd": "${workspaceFolder}",
+                            "stopOnEntry": false
+                        }
+                    }
+                ]
+            }
+        ],
         "languages": [
             {
                 "id": "kettu",
@@ -160,7 +247,7 @@
     },
     "scripts": {
         "vscode:prepublish": "node -e \"try{require('fs').chmodSync('./bin/kettu',0o755)}catch(e){}\"",
-        "test": "node ./tests/textmate-regex-tests.js"
+        "test": "node ./tests/textmate-regex-tests.js && node ./tests/debug-manifest-tests.js && node ./tests/debug-breakpoint-tests.js"
     },
     "devDependencies": {
         "@types/vscode": "^1.99.0",

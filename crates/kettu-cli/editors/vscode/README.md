@@ -49,6 +49,18 @@ Example `settings.json`:
 - **Completion** — Keywords, primitive types, and user-defined types
 - **Document Symbols** — Outline view (Ctrl+Shift+O)
 - **Go to Definition** — Jump to definitions (F12)
+- **Test Debugging** — Run `@test` functions in the current `.kettu` file with breakpoints
+
+## Debugging Kettu Tests
+
+1. Open a `.kettu` file containing `@test` functions.
+2. Set breakpoints on test function definition lines.
+3. Run **Kettu: Debug Tests in Current File** from the Command Palette.
+4. Start debugging and use Continue/Step to advance between paused tests.
+
+Notes:
+- Breakpoints map to discovered test function lines.
+- The debug adapter runs one test at a time via `kettu test --filter <name> --exact`.
 
 ## Development
 

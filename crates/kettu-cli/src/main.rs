@@ -96,6 +96,15 @@ enum Commands {
         /// Filter tests by name
         #[arg(long)]
         filter: Option<String>,
+        /// Match filter exactly instead of substring
+        #[arg(long, default_value_t = false)]
+        exact: bool,
+        /// List discovered tests without running them
+        #[arg(long, default_value_t = false)]
+        list: bool,
+        /// Emit machine-readable JSON output (with --list)
+        #[arg(long, default_value_t = false)]
+        json: bool,
         /// Enable WASM threads (shared memory + atomics)
         #[arg(long)]
         threads: bool,
@@ -344,7 +353,39 @@ async fn main() {
             }
         }
 
-        Commands::Test { file, filter, threads } => {
+        Commands::Test {
+            file,
+            filter,
+            exact,
+            list,
+            json,
+            threads,
+        } => {
+            if list {
+                let tests = list_tests(&file, filter.as_deref(), exact);
+                if json {
+                    let json_tests: Vec<_> = tests
+                        .iter()
+                        .map(|t| {
+                            serde_json::json!({
+                                "name": t.name,
+                                "line": t.line,
+                                "endLine": t.end_line,
+                                "file": t.file.display().to_string(),
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::json!({ "tests": json_tests }));
+                } else if tests.is_empty() {
+                    println!("No tests found");
+                } else {
+                    for t in tests {
+                        println!("{}:{} {}", t.file.display(), t.line, t.name);
+                    }
+                }
+                return;
+            }
+
             if file.is_dir() {
                 // Recursively find all .kettu files
                 use walkdir::WalkDir;
@@ -358,7 +399,7 @@ async fn main() {
                     .filter(|e| e.path().extension().map_or(false, |ext| ext == "kettu"))
                 {
                     let path = entry.path().to_path_buf();
-                    let (passed, failed) = run_tests(&path, filter.as_deref(), threads);
+                    let (passed, failed) = run_tests(&path, filter.as_deref(), exact, threads);
                     total_passed += passed;
                     total_failed += failed;
                     files_tested += 1;
@@ -378,7 +419,7 @@ async fn main() {
                     std::process::exit(1);
                 }
             } else {
-                let (passed, failed) = run_tests(&file, filter.as_deref(), threads);
+                let (passed, failed) = run_tests(&file, filter.as_deref(), exact, threads);
                 if failed > 0 {
                     std::process::exit(1);
                 }
@@ -432,8 +473,94 @@ fn offset_to_line(source: &str, offset: usize) -> usize {
         + 1
 }
 
+struct ListedTest {
+    file: PathBuf,
+    name: String,
+    line: usize,
+    end_line: usize,
+}
+
+fn list_tests(file: &PathBuf, filter: Option<&str>, exact: bool) -> Vec<ListedTest> {
+    if file.is_dir() {
+        use walkdir::WalkDir;
+        let mut all = Vec::new();
+
+        for entry in WalkDir::new(file)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "kettu"))
+        {
+            let path = entry.path().to_path_buf();
+            all.extend(list_tests_single_file(&path, filter, exact));
+        }
+
+        return all;
+    }
+
+    list_tests_single_file(file, filter, exact)
+}
+
+fn list_tests_single_file(file: &PathBuf, filter: Option<&str>, exact: bool) -> Vec<ListedTest> {
+    use kettu_parser::{Gate, InterfaceItem, TopLevelItem};
+
+    let content = match fs::read_to_string(file) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error reading file: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let (ast, parse_errors) = kettu_parser::parse_file(&content);
+    if !parse_errors.is_empty() {
+        for error in &parse_errors {
+            eprintln!("Parse error: {}", error);
+        }
+        std::process::exit(1);
+    }
+
+    let ast = match ast {
+        Some(a) => a,
+        None => {
+            eprintln!("Failed to parse file");
+            std::process::exit(1);
+        }
+    };
+
+    let mut listed = Vec::new();
+    for item in &ast.items {
+        if let TopLevelItem::Interface(iface) = item {
+            for iface_item in &iface.items {
+                if let InterfaceItem::Func(func) = iface_item {
+                    let is_test = func.gates.iter().any(|g| matches!(g, Gate::Test));
+                    if !is_test {
+                        continue;
+                    }
+
+                    let name = &func.name.name;
+                    if let Some(f) = filter {
+                        let matches = if exact { name == f } else { name.contains(f) };
+                        if !matches {
+                            continue;
+                        }
+                    }
+
+                    listed.push(ListedTest {
+                        file: file.clone(),
+                        name: name.clone(),
+                        line: offset_to_line(&content, func.span.start),
+                        end_line: offset_to_line(&content, func.span.end),
+                    });
+                }
+            }
+        }
+    }
+
+    listed
+}
+
 /// Run tests in a Kettu file, returns (passed, failed) counts
-fn run_tests(file: &PathBuf, filter: Option<&str>, threads: bool) -> (usize, usize) {
+fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -> (usize, usize) {
     use kettu_parser::{Gate, InterfaceItem, TopLevelItem};
     use std::time::Instant;
     use wasmtime::{Engine, Instance, Module, Store};
@@ -490,7 +617,8 @@ fn run_tests(file: &PathBuf, filter: Option<&str>, threads: bool) -> (usize, usi
                         let name = &func.name.name;
                         // Apply filter if specified
                         if let Some(f) = filter {
-                            if !name.contains(f) {
+                            let matches = if exact { name == f } else { name.contains(f) };
+                            if !matches {
                                 continue;
                             }
                         }
