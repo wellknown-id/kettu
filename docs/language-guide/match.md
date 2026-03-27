@@ -1,3 +1,15 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 6
+// title: "Pattern Matching"
+// file: "match"
+// preamble-start
+//   let value = #some(42);
+//   let status = #some(1);
+// preamble-end
+// keywords: "match, pattern, switch, case, variant, option, result, wildcard"
+---
 # Pattern Matching
 
 ## Match Expression
@@ -40,7 +52,7 @@ match v {
 
 The `_` pattern matches anything:
 
-```kettu
+```kettu nocheck
 match status {
     #ok => handle_success(),
     _ => 0,               // catch-all

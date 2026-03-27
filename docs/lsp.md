@@ -1,3 +1,11 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Advanced Topics"
+// order: 4
+// title: "Language Server"
+// file: "lsp"
+// keywords: "lsp, language server, ide, completion, hover, diagnostic, editor, vscode"
+---
 # Kettu LSP Hover Capabilities
 
 This document describes what hover currently supports in `kettu-lsp`.

@@ -1,3 +1,11 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 11
+// title: "Testing"
+// file: "testing"
+// keywords: "test, assert, testing, expect, check, verify, unit"
+---
 # Testing
 
 Kettu has a built-in test framework.
@@ -29,7 +37,7 @@ interface math-tests {
 
 Use `assert` for cleaner tests:
 
-```kettu
+```kettu nocheck
 @test
 test-math-operations: func() -> bool {
     assert 2 + 2 == 4;
@@ -71,7 +79,7 @@ Results: 3 passed, 1 failed
 
 ## Example Test File
 
-```kettu
+```kettu nocheck
 // math_test.kettu
 package example:math-tests;
 

@@ -1,3 +1,14 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 9
+// title: "Strings"
+// file: "strings"
+// preamble-start
+//   let name = "kettu";
+// preamble-end
+// keywords: "string, text, concatenation, interpolation, length, char"
+---
 # Strings
 
 ## String Literals

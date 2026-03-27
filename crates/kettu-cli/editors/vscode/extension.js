@@ -1,6 +1,7 @@
 const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
+const cp = require('child_process');
 const { LanguageClient, TransportKind } = require('vscode-languageclient/node');
 
 let client;
@@ -20,14 +21,8 @@ function findServerPath(extensionPath) {
         return configPath;
     }
 
-    // 2. Try bundled binaries (for self-contained VSIX)
-    let bundledBinary = 'kettu-linux-x86_64';
-    if (process.platform === 'win32') {
-        bundledBinary = 'kettu-windows-x86_64.exe';
-    } else if (process.platform === 'darwin') {
-        bundledBinary = process.arch === 'arm64' ? 'kettu-macos-aarch64' : 'kettu-macos-x86_64';
-    }
-
+    // 2. Try bundled binary (platform-specific VSIX contains just bin/kettu)
+    const bundledBinary = process.platform === 'win32' ? 'kettu.exe' : 'kettu';
     const bundledPath = path.join(extensionPath, 'bin', bundledBinary);
     if (fs.existsSync(bundledPath)) {
         console.log(`Kettu LSP: found bundled binary at ${bundledPath}`);
@@ -166,6 +161,45 @@ function activate(context) {
             `Build with 'cargo build --bin kettu' or set 'kettu.serverPath'.`
         );
     });
+
+    // ─── MCP Tool Implementations (CoPilot Chat tools) ──────────────────
+    // These invoke `kettu mcp` via JSON-RPC tools/call over stdio.
+
+    function registerMcpTool(toolName) {
+        return vscode.lm.registerTool(`kettu-${toolName}`, {
+            async invoke(options, _token) {
+                const result = await callMcpTool(serverPath, toolName, options.input);
+                return new vscode.LanguageModelToolResult([
+                    new vscode.LanguageModelTextPart(result),
+                ]);
+            },
+        });
+    }
+
+    context.subscriptions.push(registerMcpTool('check'));
+    context.subscriptions.push(registerMcpTool('docs-search'));
+    context.subscriptions.push(registerMcpTool('docs-read'));
+    context.subscriptions.push(registerMcpTool('emit-wit'));
+
+    // ─── MCP Server Definition Provider (CoPilot Agent Mode) ────────────
+    // This makes "kettu mcp" appear in the MCP server list.
+
+    const didChangeEmitter = new vscode.EventEmitter();
+    context.subscriptions.push(
+        vscode.lm.registerMcpServerDefinitionProvider('kettuMcpProvider', {
+            onDidChangeMcpServerDefinitions: didChangeEmitter.event,
+            provideMcpServerDefinitions: async () => {
+                return [
+                    new vscode.McpStdioServerDefinition(
+                        'Kettu',
+                        serverPath,
+                        ['mcp'],
+                    ),
+                ];
+            },
+            resolveMcpServerDefinition: async (server) => server,
+        })
+    );
 }
 
 /**
@@ -223,6 +257,50 @@ function applyCoverageDecorations(uriString, coverage) {
     editor.setDecorations(coverageFullDecorationType, full);
     editor.setDecorations(coveragePartialDecorationType, partial);
     editor.setDecorations(coverageNoneDecorationType, none);
+}
+
+/**
+ * Call a single MCP tool by spawning `kettu mcp`, sending a JSON-RPC
+ * tools/call request, and reading the response.
+ */
+function callMcpTool(kettuPath, toolName, args) {
+    return new Promise((resolve, reject) => {
+        const child = cp.spawn(kettuPath, ['mcp'], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+        const request = JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'tools/call',
+            params: { name: toolName, arguments: args },
+        });
+
+        let stdout = '';
+        child.stdout.on('data', (data) => {
+            stdout += data.toString();
+        });
+
+        child.on('close', () => {
+            try {
+                const response = JSON.parse(stdout.trim());
+                if (response.result?.content?.[0]?.text) {
+                    resolve(response.result.content[0].text);
+                } else if (response.error) {
+                    reject(new Error(response.error.message));
+                } else {
+                    resolve(stdout.trim());
+                }
+            } catch {
+                reject(new Error(`Failed to parse MCP response: ${stdout}`));
+            }
+        });
+
+        child.on('error', (err) => {
+            reject(new Error(`Failed to spawn kettu mcp: ${err.message}`));
+        });
+
+        child.stdin.write(request + '\n');
+        child.stdin.end();
+    });
 }
 
 function deactivate() {

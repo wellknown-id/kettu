@@ -963,11 +963,11 @@ impl<'a> ModuleCompiler<'a> {
     }
 
     fn add_func_type(&mut self, func: &Func) -> Result<u32, CompileError> {
-        let params: Vec<ValType> = func
-            .params
-            .iter()
-            .map(|p| self.ty_to_valtype(&p.ty))
-            .collect::<Result<_, _>>()?;
+        // Flatten params using canonical ABI: string/list expand to (ptr, len)
+        let mut params: Vec<ValType> = Vec::new();
+        for p in &func.params {
+            params.extend(self.ty_to_valtypes(&p.ty)?);
+        }
 
         // For async functions using stackless ABI (when --wasip3 is enabled):
         // - Return i32 (status code: 0=done, 1=yield, 2=wait)
@@ -1021,6 +1021,17 @@ impl<'a> ModuleCompiler<'a> {
             | Ty::Borrow { .. }
             | Ty::Own { .. }
             | Ty::Generic { .. } => Ok(ValType::I32), // All reference types are i32 pointers
+        }
+    }
+
+    /// Flatten a WIT type into its canonical ABI core WASM types.
+    /// Unlike ty_to_valtype (single value), this returns the full
+    /// multi-value lowering: string/list → [I32, I32] (ptr + len).
+    fn ty_to_valtypes(&self, ty: &Ty) -> Result<Vec<ValType>, CompileError> {
+        match ty {
+            Ty::Primitive(PrimitiveTy::String, _) => Ok(vec![ValType::I32, ValType::I32]),
+            Ty::List { .. } => Ok(vec![ValType::I32, ValType::I32]),
+            _ => Ok(vec![self.ty_to_valtype(ty)?]),
         }
     }
 
@@ -1745,13 +1756,36 @@ impl<'a> ModuleCompiler<'a> {
         let needs_callback = func.is_async && self.options.wasip3 && Self::has_await_points(func);
 
         // Build local variable map: param_name -> index, let_name -> index
+        // For canonical ABI, string/list params expand to 2 WASM locals (ptr, len).
+        // We map each WIT param name to either:
+        //   - The WASM local directly (for scalar types)
+        //   - A synthetic local that will hold the internal-format ptr (for string/list)
         let mut locals: HashMap<String, u32> = HashMap::new();
         let mut let_count = 0u32;
 
-        // Parameters get indices 0..n
-        for (i, param) in func.params.iter().enumerate() {
-            locals.insert(param.name.name.clone(), i as u32);
+        // Track which params need canonical → internal conversion
+        // (wit_param_name, ptr_local, len_local, synthetic_local will be assigned later)
+        let mut string_param_conversions: Vec<(String, u32, u32)> = Vec::new();
+
+        // Parameters get indices 0..n, but string/list params take 2 WASM locals
+        let mut wasm_local_idx = 0u32;
+        for param in func.params.iter() {
+            let is_wide = matches!(&param.ty,
+                Ty::Primitive(PrimitiveTy::String, _) | Ty::List { .. }
+            );
+            if is_wide {
+                // String/list: 2 WASM locals (ptr, len). Name maps to a synthetic local later.
+                let ptr_local = wasm_local_idx;
+                let len_local = wasm_local_idx + 1;
+                string_param_conversions.push((param.name.name.clone(), ptr_local, len_local));
+                wasm_local_idx += 2;
+                // Don't insert into locals yet - will point to synthetic local
+            } else {
+                locals.insert(param.name.name.clone(), wasm_local_idx);
+                wasm_local_idx += 1;
+            }
         }
+        let wasm_params_len = wasm_local_idx as usize;
 
         let mut v128_locals = std::collections::HashSet::new();
 
@@ -1908,17 +1942,27 @@ impl<'a> ModuleCompiler<'a> {
 
 
             for stmt in &body.statements {
-                collect_locals_from_stmt(stmt, func.params.len(), &mut locals, &mut let_count, &mut v128_locals);
+                collect_locals_from_stmt(stmt, wasm_params_len, &mut locals, &mut let_count, &mut v128_locals);
             }
+        }
+
+        // Add synthetic locals for string/list param conversions
+        let num_string_conversions = string_param_conversions.len() as u32;
+        let string_synth_base = wasm_params_len as u32 + let_count;
+        // Assign synthetic local indices and insert into locals map
+        for (i, (name, _ptr_local, _len_local)) in string_param_conversions.iter().enumerate() {
+            let synth_idx = string_synth_base + i as u32;
+            locals.insert(name.clone(), synth_idx);
         }
 
         // Declare locals with correct types (v128 for SIMD, i32 for everything else)
         // +1 for temp record pointer
         // +3 for match expressions (scrutinee + binding + spare)
         let extra_locals = 4;
-        let local_types: Vec<_> = (0..let_count + extra_locals)
+        let total_declared = let_count + extra_locals + num_string_conversions;
+        let local_types: Vec<_> = (0..total_declared)
             .map(|i| {
-                let idx = func.params.len() as u32 + i;
+                let idx = wasm_params_len as u32 + i;
                 if v128_locals.contains(&idx) {
                     (1, ValType::V128)
                 } else {
@@ -1927,6 +1971,48 @@ impl<'a> ModuleCompiler<'a> {
             })
             .collect();
         let mut function = Function::new(local_types);
+
+        // Emit preamble: convert canonical ABI string/list params to internal format.
+        // Canonical: (ptr, len) where ptr points to raw UTF-8 data
+        // Internal: [4-byte len LE][data], pointer points to data (len at ptr-4)
+        for (name, ptr_local, len_local) in &string_param_conversions {
+            let synth_idx = *locals.get(name).unwrap();
+            let alloc_idx = self.ensure_alloc_func();
+            // new_base = cabi_realloc(0, 0, 1, len + 4)
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::LocalGet(*len_local));
+            function.instruction(&Instruction::I32Const(4));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::Call(alloc_idx));
+            // Stack: new_base
+            // Store new_base in synthetic local temporarily
+            function.instruction(&Instruction::LocalSet(synth_idx));
+            // i32.store(new_base, len) — write length prefix
+            function.instruction(&Instruction::LocalGet(synth_idx));
+            function.instruction(&Instruction::LocalGet(*len_local));
+            function.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+            // memory.copy(new_base + 4, original_ptr, len)
+            function.instruction(&Instruction::LocalGet(synth_idx));
+            function.instruction(&Instruction::I32Const(4));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalGet(*ptr_local));
+            function.instruction(&Instruction::LocalGet(*len_local));
+            function.instruction(&Instruction::MemoryCopy {
+                src_mem: 0,
+                dst_mem: 0,
+            });
+            // synthetic local = new_base + 4 (points to data, length at ptr-4)
+            function.instruction(&Instruction::LocalGet(synth_idx));
+            function.instruction(&Instruction::I32Const(4));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(synth_idx));
+        }
 
         // Track type info for record variables
         let mut locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();

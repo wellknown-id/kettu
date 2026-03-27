@@ -2,3 +2,4 @@
 node_modules/
 *.vsix
 .DS_Store
+crates/kettu-cli/src/docs_generated.rs

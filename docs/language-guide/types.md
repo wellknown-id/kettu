@@ -1,3 +1,17 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 2
+// title: "Data Types"
+// file: "types"
+// preamble-start
+//   let x = 10;
+//   let y = 20;
+//   let a = 1;
+//   let b = 2;
+// preamble-end
+// keywords: "type, record, variant, enum, flags, option, result, tuple, simd, v128"
+---
 # Data Types
 
 ## Primitive Types
@@ -32,7 +46,7 @@ record person {
 
 Tagged unions (sum types):
 
-```kettu
+```kettu nocheck
 variant result {
     ok(s32),
     error(string),
@@ -48,7 +62,7 @@ variant option {
 
 Construct variant values using the `#` prefix:
 
-```kettu
+```kettu nocheck
 // Unqualified (inferred type)
 let n = #none;
 let s = #some(42);
@@ -101,7 +115,7 @@ type name = string;
 
 Built-in generic types:
 
-```kettu
+```kettu nocheck
 // Optional value
 option<string>
 

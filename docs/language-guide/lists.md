@@ -1,3 +1,14 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 7
+// title: "Lists & Collections"
+// file: "lists"
+// preamble-start
+//   let arr = [10, 20, 30];
+// preamble-end
+// keywords: "list, array, collection, index, slice, length, push, pop"
+---
 # Lists & Collections
 
 ## List Literals

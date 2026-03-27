@@ -1,3 +1,11 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Advanced Topics"
+// order: 1
+// title: "SIMD"
+// file: "simd"
+// keywords: "simd, vector, parallel, v128, lane, splat, i32x4, f32x4, performance"
+---
 # SIMD Support
 
 Kettu provides full WebAssembly SIMD support through an ergonomic `interpretation.op(args)` syntax pattern. SIMD operations work on 128-bit vectors (v128) with 6 typed interpretations.
@@ -83,7 +91,7 @@ let bits = i32x4.bitmask(v);     // high bits as i32
 
 Use `simd for` to process list elements 4-at-a-time with vectorized operations:
 
-```kettu
+```kettu nocheck
 // Double every element (processes 4 per iteration)
 simd for v in numbers {
     i32x4.mul(v, i32x4.splat(2))

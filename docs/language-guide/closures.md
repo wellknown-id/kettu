@@ -1,3 +1,17 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 8
+// title: "Closures & HOFs"
+// file: "closures"
+// preamble-start
+//   let a = 1;
+//   let b = 2;
+//   let n = 5;
+//   let arr = [1, 2, 3, 4, 5];
+// preamble-end
+// keywords: "closure, lambda, higher-order, map, filter, reduce, callback, anonymous"
+---
 # Closures & Higher-Order Functions
 
 ## Lambdas

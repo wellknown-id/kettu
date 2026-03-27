@@ -1,3 +1,11 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 10
+// title: "Resources"
+// file: "resources"
+// keywords: "resource, constructor, method, static, lifecycle, handle, own, borrow"
+---
 # Resources
 
 Resources are handle types that represent external objects with lifetimes.
@@ -24,7 +32,7 @@ interface filesystem {
 
 Creates a new resource instance:
 
-```kettu
+```kettu nocheck
 constructor(path: string);
 constructor(name: string, size: u32);
 ```
@@ -33,7 +41,7 @@ constructor(name: string, size: u32);
 
 Called on a resource instance (implicit `self`):
 
-```kettu
+```kettu nocheck
 read: func(bytes: u32) -> list<u8>;
 write: func(data: list<u8>);
 ```
@@ -42,7 +50,7 @@ write: func(data: list<u8>);
 
 Called on the resource type, not an instance:
 
-```kettu
+```kettu nocheck
 exists: static func(path: string) -> bool;
 create: static func(path: string) -> file;
 ```
@@ -51,7 +59,7 @@ create: static func(path: string) -> file;
 
 Resources are passed by handle:
 
-```kettu
+```kettu nocheck
 interface processor {
     use filesystem.{file};
     

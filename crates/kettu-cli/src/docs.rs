@@ -1,0 +1,621 @@
+//! Embedded documentation viewer for `kettu docs`.
+//!
+//! All documentation markdown files from `docs/` are compiled into the binary
+//! at build time.  A `build.rs` script walks the `docs/` tree, discovers `.md`
+//! files with frontmatter, and generates `docs_generated.rs` containing
+//! `include_str!` entries so that new doc files are picked up automatically.
+//!
+//! Frontmatter uses kettu-style `//` comments:
+//! ```text
+//! ---
+//! // section: "Language Topics"
+//! // order: 1
+//! // title: "Packages & Interfaces"
+//! ---
+//! ```
+
+// Pull in the auto-generated include_str! array.
+mod docs_generated {
+    include!("docs_generated.rs");
+}
+
+/// A single documentation page parsed from an embedded markdown file.
+struct DocPage {
+    section: String,
+    order: u32,
+    title: String,
+    /// The markdown body *without* frontmatter.
+    content: String,
+    /// Original filename stem, used for link rewriting (e.g. "simd", "types").
+    filename: String,
+    /// Optional preamble code to prepend when doc-testing snippets.
+    preamble: Option<String>,
+    /// Keywords for search matching.
+    keywords: Vec<String>,
+}
+
+/// Parse a kettu-style frontmatter value from a `// key: "value"` or `// key: value` line.
+fn parse_meta(line: &str, key: &str) -> Option<String> {
+    let trimmed = line.trim().trim_start_matches("//").trim();
+    if let Some(rest) = trimmed.strip_prefix(key) {
+        let rest = rest.trim_start_matches(':').trim();
+        let value = rest.trim_matches('"');
+        Some(value.to_string())
+    } else {
+        None
+    }
+}
+
+/// Strip frontmatter (everything between the first pair of `---` lines) and
+/// return the remaining markdown body.
+fn strip_frontmatter(source: &str) -> &str {
+    if !source.starts_with("---") {
+        return source;
+    }
+    if let Some(end) = source[3..].find("\n---") {
+        let after = end + 3 + 4; // skip "\n---"
+        if after < source.len() {
+            return source[after..].trim_start_matches('\n');
+        }
+    }
+    source
+}
+
+/// Extract the filename stem from embedded source content.
+/// We look at the first `# Heading` line to derive a logical name, but that's
+/// fragile.  Instead, we embed a `// file:` hint in the frontmatter from build.rs.
+/// Fallback: derive from the title.
+fn extract_filename(front: &str, title: &str) -> String {
+    for line in front.lines() {
+        if let Some(v) = parse_meta(line, "file") {
+            return v;
+        }
+    }
+    // Fallback: slugify the title
+    title
+        .to_lowercase()
+        .replace(|c: char| !c.is_alphanumeric(), "-")
+        .trim_matches('-')
+        .to_string()
+}
+
+/// Extract a preamble block from frontmatter delimited by
+/// `// preamble-start` and `// preamble-end`.
+fn extract_preamble(front: &str) -> Option<String> {
+    let mut in_preamble = false;
+    let mut lines = Vec::new();
+
+    for line in front.lines() {
+        let trimmed = line.trim().trim_start_matches("//").trim();
+        if trimmed == "preamble-start" {
+            in_preamble = true;
+            continue;
+        }
+        if trimmed == "preamble-end" {
+            break;
+        }
+        if in_preamble {
+            // Strip the leading `//` comment marker and at most one space
+            let code = line
+                .trim()
+                .trim_start_matches("//")
+                .strip_prefix(' ')
+                .unwrap_or(
+                    line.trim().trim_start_matches("//"),
+                );
+            lines.push(code.to_string());
+        }
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+/// Parse a single source string into a `DocPage`, extracting frontmatter metadata.
+fn parse_page(source: &str) -> Option<DocPage> {
+    if !source.starts_with("---") {
+        return None;
+    }
+    let end = source[3..].find("\n---")?;
+    let front = &source[3..3 + end];
+
+    let mut section = None;
+    let mut order = None;
+    let mut title = None;
+    let mut is_index = false;
+
+    for line in front.lines() {
+        if let Some(v) = parse_meta(line, "section") {
+            section = Some(v);
+        }
+        if let Some(v) = parse_meta(line, "order") {
+            order = v.parse::<u32>().ok();
+        }
+        if let Some(v) = parse_meta(line, "title") {
+            title = Some(v);
+        }
+        if let Some(v) = parse_meta(line, "index") {
+            if v == "true" {
+                is_index = true;
+            }
+        }
+    }
+
+    // Skip index pages — they're not navigable topics.
+    if is_index {
+        return None;
+    }
+
+    let title_str = title?;
+    let filename = extract_filename(front, &title_str);
+    let preamble = extract_preamble(front);
+
+    // Parse keywords: // keywords: "comma, separated, values"
+    let mut keywords = Vec::new();
+    for line in front.lines() {
+        if let Some(v) = parse_meta(line, "keywords") {
+            keywords = v.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+        }
+    }
+
+    Some(DocPage {
+        section: section?,
+        order: order?,
+        title: title_str,
+        content: strip_frontmatter(source).to_string(),
+        filename,
+        preamble,
+        keywords,
+    })
+}
+
+/// Load and parse all embedded doc pages, sorted by section order then page order.
+fn load_docs() -> Vec<DocPage> {
+    let mut pages: Vec<DocPage> = docs_generated::SOURCES
+        .iter()
+        .filter_map(|s| parse_page(s))
+        .collect();
+
+    pages.sort_by(|a, b| {
+        let sec_ord = |s: &str| -> u32 {
+            match s {
+                "Getting Started" => 0,
+                "Language Topics" => 1,
+                "Advanced Topics" => 2,
+                _ => 99,
+            }
+        };
+        sec_ord(&a.section)
+            .cmp(&sec_ord(&b.section))
+            .then(a.order.cmp(&b.order))
+    });
+    pages
+}
+
+/// Group pages by section, preserving order.  Returns `(section_name, pages)` pairs.
+fn grouped(pages: &[DocPage]) -> Vec<(&str, Vec<&DocPage>)> {
+    let mut groups: Vec<(&str, Vec<&DocPage>)> = Vec::new();
+    for page in pages {
+        if let Some(last) = groups.last_mut() {
+            if last.0 == page.section.as_str() {
+                last.1.push(page);
+                continue;
+            }
+        }
+        groups.push((page.section.as_str(), vec![page]));
+    }
+    groups
+}
+
+/// Build a lookup table from filename stem → "X.Y" selector string.
+fn build_link_map(pages: &[DocPage]) -> std::collections::HashMap<String, String> {
+    let groups = grouped(pages);
+    let mut map = std::collections::HashMap::new();
+    for (sec_idx, (_section, topics)) in groups.iter().enumerate() {
+        let sec_num = sec_idx + 1;
+        for (topic_idx, topic) in topics.iter().enumerate() {
+            let sub_num = topic_idx + 1;
+            let selector = format!("{}.{}", sec_num, sub_num);
+            map.insert(topic.filename.clone(), selector);
+        }
+    }
+    map
+}
+
+/// Rewrite markdown links like `[SIMD](../simd.md)` to `SIMD (→ kettu docs 2.1)`.
+fn rewrite_links(content: &str, link_map: &std::collections::HashMap<String, String>) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut remaining = content;
+
+    while let Some(bracket_start) = remaining.find('[') {
+        // Push everything before the `[`
+        result.push_str(&remaining[..bracket_start]);
+
+        let after_bracket = &remaining[bracket_start + 1..];
+
+        // Find closing `]`
+        if let Some(bracket_end) = after_bracket.find(']') {
+            let link_text = &after_bracket[..bracket_end];
+            let after_close = &after_bracket[bracket_end + 1..];
+
+            // Check for `(` immediately after `]`
+            if after_close.starts_with('(') {
+                if let Some(paren_end) = after_close.find(')') {
+                    let url = &after_close[1..paren_end];
+
+                    // Check if this is a local .md link
+                    if url.ends_with(".md") || url.contains(".md#") {
+                        // Extract the filename stem from the URL
+                        let md_part = url.split('#').next().unwrap_or(url);
+                        let stem = md_part
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(md_part)
+                            .trim_end_matches(".md");
+
+                        if let Some(selector) = link_map.get(stem) {
+                            result.push_str(&format!(
+                                "{} (\u{2192} kettu docs {})",
+                                link_text, selector
+                            ));
+                            remaining = &after_close[paren_end + 1..];
+                            continue;
+                        }
+                    }
+
+                    // Not a rewritable link — keep as-is
+                    result.push('[');
+                    result.push_str(link_text);
+                    result.push(']');
+                    result.push('(');
+                    result.push_str(url);
+                    result.push(')');
+                    remaining = &after_close[paren_end + 1..];
+                    continue;
+                }
+            }
+
+            // Not a link — just a bracket. Push `[` and continue after it.
+            result.push('[');
+            remaining = after_bracket;
+        } else {
+            // No closing bracket — push `[` and move on
+            result.push('[');
+            remaining = after_bracket;
+        }
+    }
+
+    result.push_str(remaining);
+    result
+}
+
+/// Print the topic index.
+pub fn print_index() {
+    let pages = load_docs();
+    let groups = grouped(&pages);
+
+    println!("\x1b[1mKettu Language Guide\x1b[0m");
+    println!();
+
+    for (sec_idx, (section, topics)) in groups.iter().enumerate() {
+        let sec_num = sec_idx + 1;
+        println!("  \x1b[1;36m{}\x1b[0m  \x1b[1m{}\x1b[0m", sec_num, section);
+        for (topic_idx, topic) in topics.iter().enumerate() {
+            let sub_num = topic_idx + 1;
+            println!(
+                "     \x1b[36m{}.{}\x1b[0m  {}",
+                sec_num, sub_num, topic.title
+            );
+        }
+        println!();
+    }
+
+    println!(
+        "Run: \x1b[1mkettu docs <number>\x1b[0m  (e.g. \x1b[36mkettu docs 1.2\x1b[0m)"
+    );
+    println!(
+        "     \x1b[1mkettu docs search <query>\x1b[0m  to search topics"
+    );
+}
+
+/// Print a specific topic or section overview.
+pub fn print_topic(selector: &str) {
+    let pages = load_docs();
+    let link_map = build_link_map(&pages);
+    let groups = grouped(&pages);
+
+    let parts: Vec<&str> = selector.split('.').collect();
+    let sec_num: usize = match parts[0].parse::<usize>() {
+        Ok(n) if n >= 1 => n,
+        _ => {
+            eprintln!("Invalid topic number: {}", selector);
+            eprintln!("Run `kettu docs` to see available topics.");
+            std::process::exit(1);
+        }
+    };
+
+    if sec_num > groups.len() {
+        eprintln!(
+            "Section {} does not exist. There are {} section(s).",
+            sec_num,
+            groups.len()
+        );
+        eprintln!("Run `kettu docs` to see available topics.");
+        std::process::exit(1);
+    }
+
+    let (section_name, topics) = &groups[sec_num - 1];
+
+    if parts.len() == 1 {
+        println!("\x1b[1;36m{}\x1b[0m  \x1b[1m{}\x1b[0m", sec_num, section_name);
+        println!();
+        for (i, topic) in topics.iter().enumerate() {
+            println!(
+                "     \x1b[36m{}.{}\x1b[0m  {}",
+                sec_num, i + 1, topic.title
+            );
+        }
+        println!();
+        println!(
+            "Run: \x1b[1mkettu docs {}.N\x1b[0m to read a topic.",
+            sec_num
+        );
+        return;
+    }
+
+    let topic_num: usize = match parts[1].parse::<usize>() {
+        Ok(n) if n >= 1 => n,
+        _ => {
+            eprintln!("Invalid topic number: {}", selector);
+            eprintln!("Run `kettu docs` to see available topics.");
+            std::process::exit(1);
+        }
+    };
+
+    if topic_num > topics.len() {
+        eprintln!(
+            "Topic {}.{} does not exist. Section \"{}\" has {} topic(s).",
+            sec_num,
+            topic_num,
+            section_name,
+            topics.len()
+        );
+        eprintln!("Run `kettu docs {}` to see topics in this section.", sec_num);
+        std::process::exit(1);
+    }
+
+    let topic = topics[topic_num - 1];
+    let rewritten = rewrite_links(&topic.content, &link_map);
+    println!("{}", rewritten);
+}
+
+/// Search docs by keyword/title/content and print matching results.
+pub fn search_docs(query: &str) {
+    let pages = load_docs();
+    let groups = grouped(&pages);
+    let query_lower = query.to_lowercase();
+    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+
+    // Build (selector, title, score, snippet) for each match
+    let mut results: Vec<(String, &str, u32, String)> = Vec::new();
+
+    for (sec_idx, (_section, topics)) in groups.iter().enumerate() {
+        let sec_num = sec_idx + 1;
+        for (topic_idx, page) in topics.iter().enumerate() {
+            let sub_num = topic_idx + 1;
+            let selector = format!("{}.{}", sec_num, sub_num);
+
+            let mut score: u32 = 0;
+
+            // Score: exact keyword match (highest)
+            for kw in &page.keywords {
+                if query_words.iter().any(|q| kw.contains(q)) {
+                    score += 10;
+                }
+            }
+
+            // Score: title match
+            let title_lower = page.title.to_lowercase();
+            if title_lower.contains(&query_lower) {
+                score += 8;
+            } else if query_words.iter().any(|q| title_lower.contains(q)) {
+                score += 5;
+            }
+
+            // Score: content match
+            let content_lower = page.content.to_lowercase();
+            if content_lower.contains(&query_lower) {
+                score += 3;
+            }
+
+            if score == 0 {
+                continue;
+            }
+
+            // Extract a snippet around the first match in content
+            let snippet = extract_snippet(&page.content, &query_lower);
+
+            results.push((selector, &page.title, score, snippet));
+        }
+    }
+
+    // Sort by score descending
+    results.sort_by(|a, b| b.2.cmp(&a.2));
+
+    if results.is_empty() {
+        println!("No results found for \"{}\".", query);
+        println!("Run `kettu docs` to browse all topics.");
+        return;
+    }
+
+    println!(
+        "\x1b[1mSearch results for \"{}\"\x1b[0m\n",
+        query
+    );
+
+    for (selector, title, _score, snippet) in &results {
+        println!(
+            "  \x1b[36m{}\x1b[0m  \x1b[1m{}\x1b[0m",
+            selector, title
+        );
+        if !snippet.is_empty() {
+            println!("      {}", snippet);
+        }
+        println!();
+    }
+
+    println!(
+        "Run: \x1b[1mkettu docs <number>\x1b[0m to read a topic."
+    );
+    println!(
+        "     \x1b[1mkettu docs search <query>\x1b[0m to search topics."
+    );
+}
+
+/// Extract a short snippet around the first occurrence of `query` in `content`.
+fn extract_snippet(content: &str, query: &str) -> String {
+    let content_lower = content.to_lowercase();
+
+    if let Some(pos) = content_lower.find(query) {
+        // Find the line containing the match
+        let line_start = content[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let line_end = content[pos..]
+            .find('\n')
+            .map(|p| pos + p)
+            .unwrap_or(content.len());
+
+        let line = content[line_start..line_end].trim();
+
+        // Skip code fences and headings
+        if line.starts_with("```") || line.is_empty() {
+            return String::new();
+        }
+
+        // Truncate long lines
+        if line.len() > 80 {
+            format!("{}...", &line[..77])
+        } else {
+            line.to_string()
+        }
+    } else {
+        String::new()
+    }
+}
+
+/// Programmatic search: returns `(selector, title, snippet)` triples sorted by relevance.
+pub fn search_docs_results(query: &str) -> Vec<(String, String, String)> {
+    let pages = load_docs();
+    let groups = grouped(&pages);
+    let query_lower = query.to_lowercase();
+    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+
+    let mut results: Vec<(String, String, u32, String)> = Vec::new();
+
+    for (sec_idx, (_section, topics)) in groups.iter().enumerate() {
+        let sec_num = sec_idx + 1;
+        for (topic_idx, page) in topics.iter().enumerate() {
+            let sub_num = topic_idx + 1;
+            let selector = format!("{}.{}", sec_num, sub_num);
+
+            let mut score: u32 = 0;
+
+            for kw in &page.keywords {
+                if query_words.iter().any(|q| kw.contains(q)) {
+                    score += 10;
+                }
+            }
+
+            let title_lower = page.title.to_lowercase();
+            if title_lower.contains(&query_lower) {
+                score += 8;
+            } else if query_words.iter().any(|q| title_lower.contains(q)) {
+                score += 5;
+            }
+
+            let content_lower = page.content.to_lowercase();
+            if content_lower.contains(&query_lower) {
+                score += 3;
+            }
+
+            if score == 0 {
+                continue;
+            }
+
+            let snippet = extract_snippet(&page.content, &query_lower);
+            results.push((selector, page.title.clone(), score, snippet));
+        }
+    }
+
+    results.sort_by(|a, b| b.2.cmp(&a.2));
+    results.into_iter().map(|(s, t, _, sn)| (s, t, sn)).collect()
+}
+
+/// Return the content of a specific topic as a string, or None if not found.
+pub fn get_topic_text(selector: &str) -> Option<String> {
+    let pages = load_docs();
+    let link_map = build_link_map(&pages);
+    let groups = grouped(&pages);
+    let parts: Vec<&str> = selector.split('.').collect();
+
+    let sec_num: usize = parts[0].parse::<usize>().ok()?;
+    if sec_num < 1 || sec_num > groups.len() {
+        return None;
+    }
+    let (_section_name, topics) = &groups[sec_num - 1];
+
+    if parts.len() == 1 {
+        // Whole section overview
+        let mut out = String::new();
+        for (i, t) in topics.iter().enumerate() {
+            out.push_str(&format!("{}.{}  {}\n", sec_num, i + 1, t.title));
+        }
+        return Some(out);
+    }
+
+    let topic_num: usize = parts.get(1)?.parse::<usize>().ok()?;
+    if topic_num < 1 || topic_num > topics.len() {
+        return None;
+    }
+
+    let topic = topics[topic_num - 1];
+    Some(rewrite_links(&topic.content, &link_map))
+}
+
+/// Return all doc pages as `(title, raw_content, preamble)` triples for doc-testing.
+/// If `selector` is provided, filter to that specific topic/section.
+pub fn get_pages_for_testing(selector: Option<&str>) -> Vec<(String, String, Option<String>)> {
+    let pages = load_docs();
+
+    if let Some(sel) = selector {
+        let groups = grouped(&pages);
+        let parts: Vec<&str> = sel.split('.').collect();
+        let sec_num: usize = match parts[0].parse::<usize>() {
+            Ok(n) if n >= 1 && n <= groups.len() => n,
+            _ => return vec![],
+        };
+        let (_section_name, topics) = &groups[sec_num - 1];
+
+        if parts.len() == 1 {
+            topics
+                .iter()
+                .map(|p| (p.title.clone(), p.content.clone(), p.preamble.clone()))
+                .collect()
+        } else {
+            let topic_num: usize = match parts[1].parse::<usize>() {
+                Ok(n) if n >= 1 && n <= topics.len() => n,
+                _ => return vec![],
+            };
+            let topic = topics[topic_num - 1];
+            vec![(topic.title.clone(), topic.content.clone(), topic.preamble.clone())]
+        }
+    } else {
+        pages
+            .iter()
+            .map(|p| (p.title.clone(), p.content.clone(), p.preamble.clone()))
+            .collect()
+    }
+}
+

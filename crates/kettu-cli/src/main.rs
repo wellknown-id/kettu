@@ -6,6 +6,10 @@ use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
 
+mod docs;
+mod doctest;
+mod mcp;
+
 fn load_imported_asts(
     file: &PathBuf,
     ast: &kettu_parser::WitFile,
@@ -107,6 +111,16 @@ enum Commands {
         /// Input file
         file: PathBuf,
     },
+    /// Browse the embedded language guide
+    Docs {
+        /// Topic number (e.g. 1.2), or 'search <query>'
+        topic: Vec<String>,
+        /// Verify code snippets in the docs (doc-testing)
+        #[arg(long)]
+        check: bool,
+    },
+    /// Start the MCP server (stdio)
+    Mcp,
 }
 
 #[tokio::main]
@@ -370,6 +384,41 @@ async fn main() {
                 }
                 let _ = (passed, failed); // Suppress unused warning
             }
+        }
+
+        Commands::Docs { topic, check } => {
+            if check {
+                let selector = topic.first().map(|s| s.as_str());
+                let pages = docs::get_pages_for_testing(selector);
+                let refs: Vec<(&str, &str, Option<&str>)> = pages
+                    .iter()
+                    .map(|(t, c, p)| (t.as_str(), c.as_str(), p.as_deref()))
+                    .collect();
+                let (passed, failed, skipped) = doctest::run_doctests(&refs);
+                println!();
+                println!(
+                    "Doc-tests: {} passed, {} failed, {} skipped",
+                    passed, failed, skipped
+                );
+                if failed > 0 {
+                    std::process::exit(1);
+                }
+            } else if topic.is_empty() {
+                docs::print_index();
+            } else if topic[0] == "search" {
+                if topic.len() < 2 {
+                    eprintln!("Usage: kettu docs search <query>");
+                    std::process::exit(1);
+                }
+                let query = topic[1..].join(" ");
+                docs::search_docs(&query);
+            } else {
+                docs::print_topic(&topic[0]);
+            }
+        }
+
+        Commands::Mcp => {
+            mcp::run_server();
         }
     }
 }

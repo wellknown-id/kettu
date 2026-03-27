@@ -38,7 +38,7 @@ x -= 2;         // compound subtract
 
 ### Control Flow
 
-```kettu
+```kettu nocheck
 // Conditionals
 if x > 0 { x; } else { 0; };
 
@@ -78,7 +78,7 @@ let double = |x| { x * 2; };
 
 See [concurrency.md](concurrency.md) for the full guide.
 
-```kettu
+```kettu nocheck
 shared let counter = 0;
 
 let tid = spawn {

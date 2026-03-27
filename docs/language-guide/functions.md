@@ -1,3 +1,17 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 3
+// title: "Functions"
+// file: "functions"
+// preamble-start
+//   let a = 1;
+//   let b = 2;
+//   let x = 10;
+//   let y = 20;
+// preamble-end
+// keywords: "function, func, return, closure, lambda, async, parameter, argument"
+---
 # Functions
 
 ## Function Signatures
@@ -56,7 +70,7 @@ return;  // For functions with no return type
 
 The last expression in a function body is implicitly returned:
 
-```kettu
+```kettu nocheck
 max: func(a: s32, b: s32) -> s32 {
     if a > b { a } else { b }  // Implicit return
 }
@@ -66,7 +80,7 @@ max: func(a: s32, b: s32) -> s32 {
 
 Mark functions as async for WASI Preview 3:
 
-```kettu
+```kettu nocheck
 fetch: async func(url: string) -> string;
 
 // With body

@@ -1,3 +1,11 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 12
+// title: "Feature Gates"
+// file: "gates"
+// keywords: "gate, annotation, since, deprecated, unstable, feature, version, stability"
+---
 # Feature Gates
 
 Feature gates control API stability and deprecation.
@@ -6,7 +14,7 @@ Feature gates control API stability and deprecation.
 
 Mark when a feature was introduced:
 
-```kettu
+```kettu nocheck
 interface api {
     @since(version = 1.0.0)
     stable-function: func();
@@ -33,7 +41,7 @@ interface legacy {
 
 Mark experimental features:
 
-```kettu
+```kettu nocheck
 interface experimental {
     @unstable(feature = async-io)
     async-read: func() -> string;
@@ -47,7 +55,7 @@ interface experimental {
 
 Gates can be combined:
 
-```kettu
+```kettu nocheck
 @since(version = 1.5.0)
 @deprecated(version = 2.0.0)
 legacy-api: func();
@@ -61,7 +69,7 @@ experimental-api: func();
 
 Gates work on any item:
 
-```kettu
+```kettu nocheck
 @since(version = 1.0.0)
 record point {
     x: s32,
@@ -84,7 +92,7 @@ resource handle {
 
 Special gate for test functions:
 
-```kettu
+```kettu nocheck
 @test
 test-example: func() -> bool {
     return true;

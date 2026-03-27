@@ -1,3 +1,19 @@
+---
+// docs-meta: controls how this page appears in `kettu docs`
+// section: "Language Topics"
+// order: 4
+// title: "Expressions"
+// file: "expressions"
+// preamble-start
+//   let a = 1;
+//   let b = 2;
+//   let x = 10;
+//   let y = 20;
+//   let c = true;
+//   let maybe = #some(5);
+// preamble-end
+// keywords: "expression, operator, arithmetic, comparison, boolean, literal, assignment, if, else, ternary"
+---
 # Expressions
 
 ## Literals
@@ -39,7 +55,7 @@ a >= b  // Greater or equal
 
 Short-circuit evaluation:
 
-```kettu
+```kettu nocheck
 a && b  // And (skips b if a is false)
 a || b  // Or (skips b if a is true)
 ```
@@ -72,7 +88,7 @@ if x > 20 {
 
 ## Function Calls
 
-```kettu
+```kettu nocheck
 add(1, 2)
 greet("world")
 get_value()
@@ -82,14 +98,14 @@ get_value()
 
 Assert panics if the condition is false:
 
-```kettu
+```kettu nocheck
 assert 2 + 2 == 4;
 assert x > 0;
 ```
 
 Useful in tests:
 
-```kettu
+```kettu nocheck
 @test
 test-math: func() -> bool {
     assert 10 / 2 == 5;
@@ -186,7 +202,7 @@ arr[1..3]  // [2, 3]
 
 See [Data Types](./types.md#variant-literals):
 
-```kettu
+```kettu nocheck
 let x = #some(42);
 let y = #none;
 let r = result#ok(10);
