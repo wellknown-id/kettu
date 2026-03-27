@@ -182,6 +182,7 @@ fn load_docs() -> Vec<DocPage> {
     pages.sort_by(|a, b| {
         let sec_ord = |s: &str| -> u32 {
             match s {
+                "Getting Started" => 0,
                 "Language Topics" => 1,
                 "Advanced Topics" => 2,
                 _ => 99,
@@ -349,10 +350,13 @@ pub fn print_topic(selector: &str) {
     let (section_name, topics) = &groups[sec_num - 1];
 
     if parts.len() == 1 {
-        println!("\x1b[1m{}\x1b[0m", section_name);
+        println!("\x1b[1;36m{}\x1b[0m  \x1b[1m{}\x1b[0m", sec_num, section_name);
         println!();
         for (i, topic) in topics.iter().enumerate() {
-            println!("  {}.{}  {}", sec_num, i + 1, topic.title);
+            println!(
+                "     \x1b[36m{}.{}\x1b[0m  {}",
+                sec_num, i + 1, topic.title
+            );
         }
         println!();
         println!(
