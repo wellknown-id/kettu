@@ -190,11 +190,11 @@ function activate(context) {
             onDidChangeMcpServerDefinitions: didChangeEmitter.event,
             provideMcpServerDefinitions: async () => {
                 return [
-                    new vscode.McpStdioServerDefinition({
-                        label: 'Kettu',
-                        command: serverPath,
-                        args: ['mcp'],
-                    }),
+                    new vscode.McpStdioServerDefinition(
+                        'Kettu',
+                        serverPath,
+                        ['mcp'],
+                    ),
                 ];
             },
             resolveMcpServerDefinition: async (server) => server,
