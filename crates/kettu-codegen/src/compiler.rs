@@ -7,10 +7,13 @@ use kettu_parser::{
     SimdLane, SimdOp, Statement, StringPart, TopLevelItem, Ty, TypeDef, TypeDefKind, WitFile,
 };
 use std::collections::HashMap;
+use std::borrow::Cow;
+use std::ops::Range;
 use wasm_encoder::{
-    CodeSection, DataSection, ElementSection, Elements, EntityType, ExportKind, ExportSection,
-    Function, FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction,
-    MemorySection, MemoryType, Module, RefType, TableSection, TableType, TypeSection, ValType,
+    CodeSection, CustomSection, DataSection, ElementSection, Elements, EntityType, ExportKind,
+    ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
+    Instruction, MemorySection, MemoryType, Module, NameMap, NameSection, RefType, TableSection,
+    TableType, TypeSection, ValType,
 };
 
 /// Type information for a record, storing field names and their offsets
@@ -48,6 +51,12 @@ pub struct CompileOptions {
     pub wasip3: bool,
     /// If true, enable shared memory and thread-spawn support
     pub threads: bool,
+    /// If true, emit DWARF debug sections (for DAP/source-level debugging)
+    pub emit_dwarf: bool,
+    /// If true, keep function names via the name section
+    pub keep_names: bool,
+    /// Optional source text used for line mapping in debug sections
+    pub debug_source: Option<String>,
 }
 
 /// Compilation error
@@ -91,6 +100,14 @@ pub fn compile_module_with_imports(
     compiler.compile(file)
 }
 
+fn offset_to_line(source: &str, offset: usize) -> usize {
+    source[..offset.min(source.len())]
+        .bytes()
+        .filter(|b| *b == b'\n')
+        .count()
+        + 1
+}
+
 struct ModuleCompiler<'a> {
     options: &'a CompileOptions,
     /// Type index -> (params, results)
@@ -103,6 +120,8 @@ struct ModuleCompiler<'a> {
     local_func_count: u32,
     /// Exported functions
     exports: Vec<(String, u32)>,
+    /// Source spans for functions (func_idx -> span)
+    func_spans: Vec<(u32, Range<usize>)>,
     /// Function bodies to compile
     func_bodies: Vec<(String, Func)>,
     /// String literal data: (offset, bytes)
@@ -160,6 +179,7 @@ impl<'a> ModuleCompiler<'a> {
             import_count: 0,
             local_func_count: 0,
             exports: Vec::new(),
+            func_spans: Vec::new(),
             func_bodies: Vec::new(),
             string_data: Vec::new(),
             string_offset: 0,
@@ -185,6 +205,83 @@ impl<'a> ModuleCompiler<'a> {
             loop_break_depth: None,
             loop_continue_depth: None,
         }
+    }
+
+    fn emit_name_section(&self, module: &mut Module) {
+        if self.exports.is_empty() {
+            return;
+        }
+
+        let mut func_map = NameMap::new();
+        for (export, idx) in &self.exports {
+            func_map.append(*idx, export);
+        }
+
+        let mut names = NameSection::new();
+        names.functions(&func_map);
+        module.section(&names);
+    }
+
+    fn emit_debug_sections(&self, module: &mut Module) {
+        use std::collections::HashMap;
+
+        let source = self.options.debug_source.as_deref();
+        let mut idx_to_export: HashMap<u32, &str> = HashMap::new();
+        for (name, idx) in &self.exports {
+            idx_to_export.insert(*idx, name);
+        }
+
+        let mut entries = Vec::new();
+        // Custom debug payload format:
+        //   kettu-dwarf\n
+        //   <func_idx>:<export_name_or_placeholder>:<line>:<byte_offset>\n...
+        // This favors readability and keeps enough information for DAP consumers
+        // to correlate exports with spans without introducing a full DWARF encoder.
+        for (idx, span) in &self.func_spans {
+            let line = source.map(|s| offset_to_line(s, span.start)).unwrap_or(1);
+            let name = idx_to_export
+                .get(idx)
+                .copied()
+                .unwrap_or("<unnamed>");
+            entries.push(format!(
+                "{}:{}:{}:{}",
+                idx, name, line, span.start
+            ));
+        }
+
+        let info_payload = format!("kettu-dwarf\n{}", entries.join("\n"));
+        let info_section = CustomSection {
+            name: ".debug_info".into(),
+            data: Cow::from(info_payload.into_bytes()),
+        };
+        module.section(&info_section);
+
+        let line_payload = if let Some(src) = source {
+            let mut offsets = Vec::new();
+            let mut pos = 0usize;
+            offsets.push(0);
+            for b in src.as_bytes() {
+                if *b == b'\n' {
+                    offsets.push(pos + 1);
+                }
+                pos += 1;
+            }
+            format!(
+                "lines:{}",
+                offsets
+                    .iter()
+                    .map(|o| o.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        } else {
+            "lines:unknown".to_string()
+        };
+        let line_section = CustomSection {
+            name: ".debug_line".into(),
+            data: Cow::from(line_payload.into_bytes()),
+        };
+        module.section(&line_section);
     }
     /// Register an imported interface's functions for qualified calls
     fn register_imported_interface(
@@ -230,6 +327,7 @@ impl<'a> ModuleCompiler<'a> {
                             self.func_bodies.push((alias.to_string(), qualified_func));
                             self.functions
                                 .insert(func.name.name.clone(), (type_idx, func_idx, false));
+                            self.func_spans.push((func_idx, func.span.clone()));
                             self.local_func_count += 1;
                         }
                     }
@@ -647,6 +745,14 @@ impl<'a> ModuleCompiler<'a> {
             module.section(&data);
         }
 
+        // 11. Debug metadata
+        if self.options.keep_names || self.options.emit_dwarf {
+            self.emit_name_section(&mut module);
+        }
+        if self.options.emit_dwarf {
+            self.emit_debug_sections(&mut module);
+        }
+
         Ok(module.finish())
     }
 
@@ -691,6 +797,7 @@ impl<'a> ModuleCompiler<'a> {
                             self.exports.push((export_name, func_idx));
                             self.func_bodies
                                 .push((iface.name.name.clone(), func.clone()));
+                            self.func_spans.push((func_idx, func.span.clone()));
                             self.local_func_count += 1;
                         } else {
                             // Imported function
@@ -749,6 +856,7 @@ impl<'a> ModuleCompiler<'a> {
                                     );
                                     self.exports.push((export_name, func_idx));
                                     self.func_bodies.push((iface.name.name.clone(), func));
+                                    self.func_spans.push((func_idx, span.clone()));
                                     self.local_func_count += 1;
                                 }
                                 ResourceMethod::Method(func) => {
@@ -799,7 +907,8 @@ impl<'a> ModuleCompiler<'a> {
                                     );
                                     self.exports.push((export_name, func_idx));
                                     self.func_bodies
-                                        .push((iface.name.name.clone(), method_func));
+                                        .push((iface.name.name.clone(), method_func.clone()));
+                                    self.func_spans.push((func_idx, method_func.span.clone()));
                                     self.local_func_count += 1;
                                 }
                                 ResourceMethod::Static(func) => {
@@ -840,7 +949,8 @@ impl<'a> ModuleCompiler<'a> {
                                     );
                                     self.exports.push((export_name, func_idx));
                                     self.func_bodies
-                                        .push((iface.name.name.clone(), static_func));
+                                        .push((iface.name.name.clone(), static_func.clone()));
+                                    self.func_spans.push((func_idx, static_func.span.clone()));
                                     self.local_func_count += 1;
                                 }
                             }
