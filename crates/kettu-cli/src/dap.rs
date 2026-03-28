@@ -1,8 +1,10 @@
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
+use wasmparser::{Parser, Payload};
 
 #[derive(Clone, Debug)]
 struct ListedTest {
@@ -23,24 +25,114 @@ struct ClosureRange {
     start_line: i64,
     end_line: i64,
     name: String,
+    params: Vec<String>,
+    captures: Vec<String>,
+    inline_invocation_line: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum SimpleValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    Unknown(String),
+}
+
+impl SimpleValue {
+    fn display(&self) -> String {
+        match self {
+            Self::Bool(value) => value.to_string(),
+            Self::Int(value) => value.to_string(),
+            Self::Float(value) => value.to_string(),
+            Self::String(value) => format!("\"{}\"", value),
+            Self::Unknown(value) => value.clone(),
+        }
+    }
+
+    fn type_name(&self) -> &'static str {
+        match self {
+            Self::Bool(_) => "bool",
+            Self::Int(_) => "i64",
+            Self::Float(_) => "f64",
+            Self::String(_) => "string",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+impl Variable {
+    fn from_value(name: impl Into<String>, value: SimpleValue) -> Self {
+        Self {
+            name: name.into(),
+            value: value.display(),
+            var_type: value.type_name().to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ActiveClosure {
+    closure_index: usize,
+    resume_line_after_closure: Option<i64>,
+    param_bindings: HashMap<String, SimpleValue>,
+    capture_bindings: HashMap<String, SimpleValue>,
+}
+
+#[derive(Clone, Debug)]
+struct DebugSymbol {
+    _name: String,
+    start_line: i64,
+    end_line: i64,
+    _byte_offset: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DebugSymbols {
+    functions: HashMap<String, DebugSymbol>,
+    lambdas: Vec<DebugSymbol>,
+}
+
+#[derive(Clone, Debug)]
+enum FrameTarget {
+    Test,
+    Closure(usize),
+}
+
+#[derive(Clone, Debug)]
+struct FrameDescriptor {
+    id: i64,
+    name: String,
+    line: i64,
+    target: FrameTarget,
+}
+
+#[derive(Clone, Debug)]
+struct ProgramState {
+    source_text: String,
+    source_lines: Vec<String>,
+    tests: Vec<ListedTest>,
+    closures: Vec<ClosureRange>,
+    debug_symbols: DebugSymbols,
 }
 
 #[derive(Clone, Debug)]
 struct DebugSession {
     program: Option<PathBuf>,
     cwd: Option<PathBuf>,
+    source_text: String,
     source_lines: Vec<String>,
     tests: Vec<ListedTest>,
     closures: Vec<ClosureRange>,
+    debug_symbols: DebugSymbols,
     stop_on_entry: bool,
+    enable_evaluate: bool,
     configured: bool,
     terminated: bool,
     current_test: usize,
     current_line: i64,
     breakpoints: HashMap<String, BTreeSet<i64>>,
-    locals: Vec<Variable>,
-    active_closure: Option<ClosureRange>,
-    resume_line_after_closure: Option<i64>,
+    active_closures: Vec<ActiveClosure>,
 }
 
 impl DebugSession {
@@ -48,18 +140,19 @@ impl DebugSession {
         Self {
             program: None,
             cwd: None,
+            source_text: String::new(),
             source_lines: Vec::new(),
             tests: Vec::new(),
             closures: Vec::new(),
+            debug_symbols: DebugSymbols::default(),
             stop_on_entry: false,
+            enable_evaluate: false,
             configured: false,
             terminated: false,
             current_test: 0,
             current_line: 0,
             breakpoints: HashMap::new(),
-            locals: Vec::new(),
-            active_closure: None,
-            resume_line_after_closure: None,
+            active_closures: Vec::new(),
         }
     }
 
@@ -83,15 +176,48 @@ impl DebugSession {
             .unwrap_or(false)
     }
 
-    fn set_current_locals(&mut self) {
-        self.locals = infer_locals(&self.source_lines, self.current_line);
-    }
-
     fn active_test(&self) -> Option<&ListedTest> {
         self.tests
             .iter()
             .find(|t| self.current_line >= t.line && self.current_line <= t.end_line)
             .or_else(|| self.tests.get(self.current_test))
+    }
+
+    fn active_closure_indices(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = self
+            .active_closures
+            .iter()
+            .map(|closure| closure.closure_index)
+            .collect();
+
+        let mut derived: Vec<usize> = self
+            .closures
+            .iter()
+            .enumerate()
+            .filter(|(_, closure)| self.current_line > closure.start_line && self.current_line <= closure.end_line)
+            .map(|(index, _)| index)
+            .collect();
+
+        derived.sort_by_key(|index| {
+            (
+                self.closures[*index].start_line,
+                Reverse(self.closures[*index].end_line),
+            )
+        });
+
+        for index in derived {
+            if !indices.contains(&index) {
+                indices.push(index);
+            }
+        }
+
+        indices
+    }
+
+    fn find_active_closure_state(&self, closure_index: usize) -> Option<&ActiveClosure> {
+        self.active_closures
+            .iter()
+            .find(|closure| closure.closure_index == closure_index)
     }
 
     fn advance_one_line(&mut self) -> bool {
@@ -100,16 +226,19 @@ impl DebugSession {
         }
 
         loop {
-            // If we're stepping inside a closure body, stay within its range and then resume
-            if let Some(active) = &self.active_closure {
-                if self.current_line < active.end_line {
+            // If we're stepping inside a callable closure body, stay within its range and then resume
+            if let Some(active) = self.active_closures.last() {
+                let closure = &self.closures[active.closure_index];
+                if self.current_line < closure.end_line {
                     self.current_line += 1;
-                    self.set_current_locals();
                     return true;
                 } else {
                     // Exiting closure: resume after the call site
-                    self.active_closure = None;
-                    let resume = self.resume_line_after_closure.take().unwrap_or(self.current_line + 1);
+                    let resume = self
+                        .active_closures
+                        .pop()
+                        .and_then(|closure_state| closure_state.resume_line_after_closure)
+                        .unwrap_or(self.current_line + 1);
                     self.current_line = resume - 1;
                     continue;
                 }
@@ -123,13 +252,11 @@ impl DebugSession {
 
             if self.current_line < test.line {
                 self.current_line = test.line;
-                self.set_current_locals();
                 return true;
             }
 
             if self.current_line < test.end_line {
                 self.current_line += 1;
-                self.set_current_locals();
                 return true;
             }
 
@@ -146,18 +273,6 @@ impl DebugSession {
     fn run_until_breakpoint_or_end(&mut self) -> StopOutcome {
         while self.advance_one_line() {
             if self.breakpoint_hit(self.current_line) {
-                if self.active_closure.is_none() {
-                    if let Some(cl) = self
-                        .closures
-                        .iter()
-                        .find(|c| self.current_line >= c.start_line && self.current_line <= c.end_line)
-                        .cloned()
-                    {
-                        if cl.start_line != cl.end_line || self.resume_line_after_closure.is_some() {
-                            self.active_closure = Some(cl);
-                        }
-                    }
-                }
                 return StopOutcome::Stopped("breakpoint");
             }
         }
@@ -165,13 +280,24 @@ impl DebugSession {
     }
 
     fn step_once_or_end(&mut self, action: &str) -> StopOutcome {
-        // If stepping into and we're at a call site to a known inline closure, enter it
-        if action == "stepIn" && self.active_closure.is_none() {
-            if let Some((closure, resume_line)) = find_invoked_closure(&self.source_lines, self.current_line, &self.closures) {
-                self.active_closure = Some(closure);
-                self.resume_line_after_closure = Some(resume_line);
-                self.current_line = self.active_closure.as_ref().unwrap().start_line;
-                self.set_current_locals();
+        if action == "stepOut" && self.step_out_of_closure() {
+            if self.breakpoint_hit(self.current_line) {
+                return StopOutcome::Stopped("breakpoint");
+            }
+            return StopOutcome::Stopped("step");
+        }
+
+        if action == "stepIn" {
+            if let Some((closure_index, resume_line, param_bindings, capture_bindings)) =
+                find_invoked_closure(self, self.current_line)
+            {
+                self.active_closures.push(ActiveClosure {
+                    closure_index,
+                    resume_line_after_closure: Some(resume_line),
+                    param_bindings,
+                    capture_bindings,
+                });
+                self.current_line = self.closures[closure_index].start_line;
                 return StopOutcome::Stopped("step");
             }
         }
@@ -185,6 +311,22 @@ impl DebugSession {
         } else {
             StopOutcome::Terminated
         }
+    }
+
+    fn step_out_of_closure(&mut self) -> bool {
+        if let Some(active) = self.active_closures.pop() {
+            self.current_line = active
+                .resume_line_after_closure
+                .unwrap_or(self.current_line + 1);
+            return true;
+        }
+
+        if let Some(closure_index) = self.active_closure_indices().last().copied() {
+            self.current_line = self.closures[closure_index].end_line + 1;
+            return true;
+        }
+
+        false
     }
 }
 
@@ -228,7 +370,7 @@ pub fn run_server() -> io::Result<()> {
                     Some(json!({
                         "supportsConfigurationDoneRequest": true,
                         "supportsStepInTargetsRequest": false,
-                        "supportsEvaluateForHovers": false,
+                        "supportsEvaluateForHovers": true,
                         "supportsSetVariable": false,
                     })),
                     None,
@@ -247,15 +389,22 @@ pub fn run_server() -> io::Result<()> {
                     .get("stopOnEntry")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                let enable_evaluate = arguments
+                    .get("enableEvaluate")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
 
                 match load_program_state(program.clone()) {
-                    Ok((source_lines, tests, closures)) => {
+                    Ok(program_state) => {
                         session.program = program;
                         session.cwd = cwd;
-                        session.source_lines = source_lines;
-                        session.tests = tests;
-                        session.closures = closures;
+                        session.source_text = program_state.source_text;
+                        session.source_lines = program_state.source_lines;
+                        session.tests = program_state.tests;
+                        session.closures = program_state.closures;
+                        session.debug_symbols = program_state.debug_symbols;
                         session.stop_on_entry = stop_on_entry;
+                        session.enable_evaluate = enable_evaluate;
                         session.configured = false;
                         session.terminated = false;
                         session.current_test = 0;
@@ -264,7 +413,7 @@ pub fn run_server() -> io::Result<()> {
                             .first()
                             .map(|t| t.line - 1)
                             .unwrap_or(0);
-                        session.locals.clear();
+                        session.active_closures.clear();
 
                         send_response(&mut writer, seq, command, true, Some(json!({})), None)?;
                         send_event(&mut writer, "initialized", Some(json!({})))?;
@@ -362,26 +511,26 @@ pub fn run_server() -> io::Result<()> {
                 )?;
             }
             "scopes" => {
+                let frame_id = arguments
+                    .get("frameId")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(1);
                 send_response(
                     &mut writer,
                     seq,
                     command,
                     true,
-                    Some(json!({
-                        "scopes": [{
-                            "name": "Locals",
-                            "presentationHint": "locals",
-                            "variablesReference": 1,
-                            "expensive": false
-                        }]
-                    })),
+                    Some(json!({ "scopes": build_scopes(&session, frame_id) })),
                     None,
                 )?;
             }
             "variables" => {
-                let vars: Vec<Value> = session
-                    .locals
-                    .iter()
+                let variables_reference = arguments
+                    .get("variablesReference")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let vars: Vec<Value> = variables_for_reference(&session, variables_reference)
+                    .into_iter()
                     .map(|v| {
                         json!({
                             "name": v.name,
@@ -400,6 +549,45 @@ pub fn run_server() -> io::Result<()> {
                     Some(json!({ "variables": vars })),
                     None,
                 )?;
+            }
+            "evaluate" => {
+                let expression = arguments
+                    .get("expression")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let frame_id = arguments.get("frameId").and_then(Value::as_i64);
+
+                if !session.enable_evaluate {
+                    send_response(
+                        &mut writer,
+                        seq,
+                        command,
+                        false,
+                        None,
+                        Some("Evaluate support is disabled for this launch. Set enableEvaluate to true.".to_string()),
+                    )?;
+                    continue;
+                }
+
+                match evaluate_in_frame(&session, frame_id, expression) {
+                    Ok(value) => {
+                        send_response(
+                            &mut writer,
+                            seq,
+                            command,
+                            true,
+                            Some(json!({
+                                "result": value.display(),
+                                "type": value.type_name(),
+                                "variablesReference": 0
+                            })),
+                            None,
+                        )?;
+                    }
+                    Err(err) => {
+                        send_response(&mut writer, seq, command, false, None, Some(err))?;
+                    }
+                }
             }
             "continue" => {
                 send_response(
@@ -473,17 +661,38 @@ fn send_stopped_event(writer: &mut impl Write, reason: &str) -> io::Result<()> {
 
 fn load_program_state(
     program: Option<PathBuf>,
-) -> Result<(Vec<String>, Vec<ListedTest>, Vec<ClosureRange>), String> {
+) -> Result<ProgramState, String> {
     let Some(program) = program else {
         return Err("Missing launch argument: program".to_string());
     };
 
     let source = fs::read_to_string(&program)
         .map_err(|e| format!("Failed to read source file '{}': {}", program.display(), e))?;
-    let tests = list_tests_single_file(&program)?;
-    let source_lines: Vec<String> = source.lines().map(ToString::to_string).collect();
-    let closures = parse_closures(&source_lines);
-    Ok((source_lines, tests, closures))
+    let (ast, parse_errors) = kettu_parser::parse_file(&source);
+    if !parse_errors.is_empty() {
+        let all = parse_errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("Parse error(s): {}", all));
+    }
+
+    let mut ast = ast.ok_or_else(|| "Failed to parse file".to_string())?;
+    annotate_closure_captures(&mut ast);
+
+    let mut tests = list_tests_from_ast(&ast, &source);
+    let mut closures = collect_closures_from_ast(&ast, &source);
+    let debug_symbols = build_debug_symbols(&program, &source, &ast)?;
+    apply_debug_symbols(&mut tests, &mut closures, &debug_symbols);
+
+    Ok(ProgramState {
+        source_text: source.clone(),
+        source_lines: source.lines().map(ToString::to_string).collect(),
+        tests,
+        closures,
+        debug_symbols,
+    })
 }
 
 fn build_stack_frames(session: &DebugSession) -> Vec<Value> {
@@ -491,40 +700,129 @@ fn build_stack_frames(session: &DebugSession) -> Vec<Value> {
         return vec![];
     };
 
-    let mut frames = Vec::new();
-    let mut frame_id = 1;
+    collect_stack_frames(session)
+        .into_iter()
+        .map(|frame| {
+            json!({
+                "id": frame.id,
+                "name": frame.name,
+                "line": frame.line.max(1),
+                "column": 1,
+                "source": {
+                    "name": program.file_name().and_then(|n| n.to_str()).unwrap_or("program.kettu"),
+                    "path": program.display().to_string()
+                }
+            })
+        })
+        .collect()
+}
 
-    if let Some(closure) = session.active_closure.as_ref() {
-        frames.push(json!({
-            "id": frame_id,
-            "name": closure.name,
-            "line": session.current_line.max(1),
-            "column": 1,
-            "source": {
-                "name": program.file_name().and_then(|n| n.to_str()).unwrap_or("program.kettu"),
-                "path": program.display().to_string()
-            }
-        }));
-        frame_id += 1;
+fn collect_stack_frames(session: &DebugSession) -> Vec<FrameDescriptor> {
+    let mut frames = Vec::new();
+    let mut next_id = 1;
+
+    for closure_index in session.active_closure_indices().into_iter().rev() {
+        frames.push(FrameDescriptor {
+            id: next_id,
+            name: session.closures[closure_index].name.clone(),
+            line: session.current_line.max(1),
+            target: FrameTarget::Closure(closure_index),
+        });
+        next_id += 1;
     }
 
-    let frame_name = session
-        .active_test()
-        .map(|t| format!("@test {}", t.name))
-        .unwrap_or_else(|| "@test <unknown>".to_string());
-
-    frames.push(json!({
-        "id": frame_id,
-        "name": frame_name,
-        "line": session.current_line.max(1),
-        "column": 1,
-        "source": {
-            "name": program.file_name().and_then(|n| n.to_str()).unwrap_or("program.kettu"),
-            "path": program.display().to_string()
-        }
-    }));
+    frames.push(FrameDescriptor {
+        id: next_id,
+        name: session
+            .active_test()
+            .map(|t| format!("@test {}", t.name))
+            .unwrap_or_else(|| "@test <unknown>".to_string()),
+        line: session.current_line.max(1),
+        target: FrameTarget::Test,
+    });
 
     frames
+}
+
+fn resolve_frame_target(session: &DebugSession, frame_id: i64) -> Option<FrameTarget> {
+    collect_stack_frames(session)
+        .into_iter()
+        .find(|frame| frame.id == frame_id)
+        .map(|frame| frame.target)
+}
+
+fn build_scopes(session: &DebugSession, frame_id: i64) -> Vec<Value> {
+    let Some(target) = resolve_frame_target(session, frame_id) else {
+        return Vec::new();
+    };
+
+    let mut scopes = vec![json!({
+        "name": "Locals",
+        "presentationHint": "locals",
+        "variablesReference": locals_reference(frame_id),
+        "expensive": false
+    })];
+
+    if matches!(target, FrameTarget::Closure(_)) {
+        let captures = frame_capture_variables(session, frame_id);
+        if !captures.is_empty() {
+            scopes.push(json!({
+                "name": "Captures",
+                "presentationHint": "registers",
+                "variablesReference": captures_reference(frame_id),
+                "expensive": false
+            }));
+        }
+    }
+
+    scopes
+}
+
+fn locals_reference(frame_id: i64) -> i64 {
+    frame_id * 10 + 1
+}
+
+fn captures_reference(frame_id: i64) -> i64 {
+    frame_id * 10 + 2
+}
+
+enum ScopeReferenceKind {
+    Locals,
+    Captures,
+}
+
+fn decode_scope_reference(reference: i64) -> Option<(i64, ScopeReferenceKind)> {
+    if reference <= 0 {
+        return None;
+    }
+
+    let frame_id = reference / 10;
+    match reference % 10 {
+        1 => Some((frame_id, ScopeReferenceKind::Locals)),
+        2 => Some((frame_id, ScopeReferenceKind::Captures)),
+        _ => None,
+    }
+}
+
+fn variables_for_reference(session: &DebugSession, reference: i64) -> Vec<Variable> {
+    let Some((frame_id, scope_kind)) = decode_scope_reference(reference) else {
+        return Vec::new();
+    };
+
+    match scope_kind {
+        ScopeReferenceKind::Locals => frame_local_variables(session, frame_id),
+        ScopeReferenceKind::Captures => frame_capture_variables(session, frame_id),
+    }
+}
+
+fn evaluate_in_frame(
+    session: &DebugSession,
+    frame_id: Option<i64>,
+    expression: &str,
+) -> Result<SimpleValue, String> {
+    let frame_id = frame_id.unwrap_or(1);
+    let env = frame_environment(session, frame_id);
+    evaluate_expression(expression, &env)
 }
 
 fn normalize_path_key(path: &str) -> String {
@@ -543,143 +841,511 @@ fn offset_to_line(source: &str, offset: usize) -> usize {
         + 1
 }
 
-fn list_tests_single_file(file: &PathBuf) -> Result<Vec<ListedTest>, String> {
-    use kettu_parser::{Gate, InterfaceItem, TopLevelItem};
-
-    let content = fs::read_to_string(file)
-        .map_err(|e| format!("Error reading file '{}': {}", file.display(), e))?;
-
-    let (ast, parse_errors) = kettu_parser::parse_file(&content);
-    if !parse_errors.is_empty() {
-        let all = parse_errors
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(format!("Parse error(s): {}", all));
-    }
-
-    let ast = ast.ok_or_else(|| "Failed to parse file".to_string())?;
-
+fn list_tests_from_ast(ast: &kettu_parser::WitFile, source: &str) -> Vec<ListedTest> {
     let mut listed = Vec::new();
+
     for item in &ast.items {
-        if let TopLevelItem::Interface(iface) = item {
+        if let kettu_parser::TopLevelItem::Interface(iface) = item {
             for iface_item in &iface.items {
-                if let InterfaceItem::Func(func) = iface_item {
-                    let is_test = func.gates.iter().any(|g| matches!(g, Gate::Test));
+                if let kettu_parser::InterfaceItem::Func(func) = iface_item {
+                    let is_test = func.gates.iter().any(|g| matches!(g, kettu_parser::Gate::Test));
                     if !is_test {
                         continue;
                     }
 
                     listed.push(ListedTest {
                         name: func.name.name.clone(),
-                        line: offset_to_line(&content, func.span.start) as i64,
-                        end_line: offset_to_line(&content, func.span.end) as i64,
+                        line: offset_to_line(source, func.span.start) as i64,
+                        end_line: offset_to_line(source, func.span.end) as i64,
                     });
                 }
             }
         }
     }
 
-    listed.sort_by_key(|t| t.line);
-    Ok(listed)
+    listed.sort_by_key(|test| test.line);
+    listed
 }
 
-fn parse_closures(source_lines: &[String]) -> Vec<ClosureRange> {
-    let mut closures = Vec::new();
-    let mut active_start: Option<i64> = None;
-    let mut depth: i64 = 0;
-    let mut counter = 1;
-    let mut saw_pipe = false;
+fn annotate_closure_captures(ast: &mut kettu_parser::WitFile) {
+    for item in &mut ast.items {
+        if let kettu_parser::TopLevelItem::Interface(iface) = item {
+            for iface_item in &mut iface.items {
+                if let kettu_parser::InterfaceItem::Func(func) = iface_item {
+                    let Some(body) = &mut func.body else {
+                        continue;
+                    };
 
-    for (index, line) in source_lines.iter().enumerate() {
-        let line_no = (index + 1) as i64;
-        let trimmed = line.trim();
+                    let mut scope = HashSet::new();
+                    for param in &func.params {
+                        scope.insert(param.name.name.clone());
+                    }
 
-        // Track whether we're inside a closure body by brace depth once started.
-        if active_start.is_some() {
-            depth += trimmed.chars().filter(|c| *c == '{').count() as i64;
-            depth -= trimmed.chars().filter(|c| *c == '}').count() as i64;
-
-            if depth <= 0 {
-                let start_line = active_start.unwrap_or(line_no);
-                let name = extract_closure_name(source_lines, start_line)
-                    .unwrap_or_else(|| format!("closure#{}", counter));
-                closures.push(ClosureRange {
-                    start_line,
-                    end_line: line_no,
-                    name,
-                });
-                counter += 1;
-                active_start = None;
-                depth = 0;
-            }
-            continue;
-        }
-
-        // Detect the start of a closure header: a pipe indicates parameters.
-        if trimmed.contains('|') {
-            saw_pipe = true;
-        }
-
-        // Start counting when we see an opening brace after a header with a pipe
-        // (can be on the same line or the following line). If there is no brace,
-        // treat it as a single-line closure body on that line.
-        if saw_pipe {
-            if trimmed.contains('{') {
-                active_start = Some(line_no);
-                depth = trimmed.chars().filter(|c| *c == '{').count() as i64;
-                depth -= trimmed.chars().filter(|c| *c == '}').count() as i64;
-                saw_pipe = false;
-                if depth <= 0 {
-                    // Single-line closure like `|x| { x + 1 }`.
-                    let name = extract_closure_name(source_lines, line_no)
-                        .unwrap_or_else(|| format!("closure#{}", counter));
-                    closures.push(ClosureRange {
-                        start_line: line_no,
-                        end_line: line_no,
-                        name,
-                    });
-                    counter += 1;
-                    active_start = None;
-                    depth = 0;
+                    for statement in &mut body.statements {
+                        annotate_statement_captures(statement, &mut scope);
+                    }
                 }
-            } else {
-                // No braces: treat as inline expression closure on this line.
-                let name = extract_closure_name(source_lines, line_no)
-                    .unwrap_or_else(|| format!("closure#{}", counter));
-                closures.push(ClosureRange {
-                    start_line: line_no,
-                    end_line: line_no,
-                    name,
-                });
-                counter += 1;
-                saw_pipe = false;
-                active_start = None;
-                depth = 0;
+            }
+        }
+    }
+}
+
+fn annotate_statement_captures(statement: &mut kettu_parser::Statement, scope: &mut HashSet<String>) {
+    match statement {
+        kettu_parser::Statement::Expr(expr) => kettu_parser::capture::analyze_captures(expr, scope),
+        kettu_parser::Statement::Let { name, value } => {
+            kettu_parser::capture::analyze_captures(value, scope);
+            scope.insert(name.name.clone());
+        }
+        kettu_parser::Statement::Return(Some(expr)) => kettu_parser::capture::analyze_captures(expr, scope),
+        kettu_parser::Statement::Return(None) => {}
+        kettu_parser::Statement::Assign { value, .. }
+        | kettu_parser::Statement::CompoundAssign { value, .. } => {
+            kettu_parser::capture::analyze_captures(value, scope);
+        }
+        kettu_parser::Statement::Break { condition: Some(expr) }
+        | kettu_parser::Statement::Continue { condition: Some(expr) } => {
+            kettu_parser::capture::analyze_captures(expr, scope);
+        }
+        kettu_parser::Statement::Break { condition: None }
+        | kettu_parser::Statement::Continue { condition: None } => {}
+        kettu_parser::Statement::SharedLet { name, initial_value } => {
+            kettu_parser::capture::analyze_captures(initial_value, scope);
+            scope.insert(name.name.clone());
+        }
+    }
+}
+
+fn collect_closures_from_ast(ast: &kettu_parser::WitFile, source: &str) -> Vec<ClosureRange> {
+    let mut closures = Vec::new();
+
+    for item in &ast.items {
+        if let kettu_parser::TopLevelItem::Interface(iface) = item {
+            for iface_item in &iface.items {
+                if let kettu_parser::InterfaceItem::Func(func) = iface_item {
+                    let is_test = func.gates.iter().any(|g| matches!(g, kettu_parser::Gate::Test));
+                    if !is_test {
+                        continue;
+                    }
+
+                    if let Some(body) = &func.body {
+                        collect_closures_from_statements(&body.statements, source, &mut closures);
+                    }
+                }
             }
         }
     }
 
+    closures.sort_by_key(|closure| (closure.start_line, Reverse(closure.end_line)));
     closures
 }
 
-fn extract_closure_name(source_lines: &[String], line_no: i64) -> Option<String> {
-    if line_no <= 0 {
-        return None;
+fn collect_closures_from_statements(
+    statements: &[kettu_parser::Statement],
+    source: &str,
+    closures: &mut Vec<ClosureRange>,
+) {
+    for statement in statements {
+        match statement {
+            kettu_parser::Statement::Expr(expr) => {
+                collect_closures_from_expr(expr, source, closures, None);
+            }
+            kettu_parser::Statement::Let { name, value } => {
+                let preferred_name = matches!(value, kettu_parser::Expr::Lambda { .. })
+                    .then(|| name.name.clone());
+                collect_closures_from_expr(value, source, closures, preferred_name);
+            }
+            kettu_parser::Statement::Return(Some(expr)) => {
+                collect_closures_from_expr(expr, source, closures, None);
+            }
+            kettu_parser::Statement::Return(None) => {}
+            kettu_parser::Statement::Assign { value, .. }
+            | kettu_parser::Statement::CompoundAssign { value, .. } => {
+                collect_closures_from_expr(value, source, closures, None);
+            }
+            kettu_parser::Statement::Break { condition: Some(expr) }
+            | kettu_parser::Statement::Continue { condition: Some(expr) } => {
+                collect_closures_from_expr(expr, source, closures, None);
+            }
+            kettu_parser::Statement::Break { condition: None }
+            | kettu_parser::Statement::Continue { condition: None } => {}
+            kettu_parser::Statement::SharedLet { initial_value, .. } => {
+                collect_closures_from_expr(initial_value, source, closures, None);
+            }
+        }
     }
-    let idx = (line_no - 1) as usize;
-    let line = source_lines.get(idx)?.trim();
-    if !line.starts_with("let ") {
-        return None;
+}
+
+fn collect_closures_from_expr(
+    expr: &kettu_parser::Expr,
+    source: &str,
+    closures: &mut Vec<ClosureRange>,
+    preferred_name: Option<String>,
+) {
+    match expr {
+        kettu_parser::Expr::Lambda {
+            params,
+            body,
+            captures,
+            span,
+        } => {
+            let start_line = offset_to_line(source, span.start) as i64;
+            let end_line = offset_to_line(source, span.end) as i64;
+            let inline_invocation_line = preferred_name.is_none().then_some(start_line);
+            let fallback_name = format!("closure#{}", closures.len() + 1);
+            closures.push(ClosureRange {
+                start_line,
+                end_line,
+                name: preferred_name.unwrap_or(fallback_name),
+                params: params.iter().map(|param| param.name.clone()).collect(),
+                captures: captures.iter().map(|capture| capture.name.clone()).collect(),
+                inline_invocation_line,
+            });
+            collect_closures_from_expr(body, source, closures, None);
+        }
+        kettu_parser::Expr::Binary { lhs, rhs, .. } => {
+            collect_closures_from_expr(lhs, source, closures, None);
+            collect_closures_from_expr(rhs, source, closures, None);
+        }
+        kettu_parser::Expr::Call { func, args, .. } => {
+            collect_closures_from_expr(func, source, closures, None);
+            for arg in args {
+                collect_closures_from_expr(arg, source, closures, None);
+            }
+        }
+        kettu_parser::Expr::Field { expr, .. }
+        | kettu_parser::Expr::OptionalChain { expr, .. }
+        | kettu_parser::Expr::Try { expr, .. }
+        | kettu_parser::Expr::Await { expr, .. }
+        | kettu_parser::Expr::AtomicLoad { addr: expr, .. }
+        | kettu_parser::Expr::ThreadJoin { tid: expr, .. } => {
+            collect_closures_from_expr(expr, source, closures, None);
+        }
+        kettu_parser::Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_closures_from_expr(cond, source, closures, None);
+            collect_closures_from_statements(then_branch, source, closures);
+            if let Some(else_branch) = else_branch {
+                collect_closures_from_statements(else_branch, source, closures);
+            }
+        }
+        kettu_parser::Expr::Match { scrutinee, arms, .. } => {
+            collect_closures_from_expr(scrutinee, source, closures, None);
+            for arm in arms {
+                collect_closures_from_statements(&arm.body, source, closures);
+            }
+        }
+        kettu_parser::Expr::While { condition, body, .. } => {
+            collect_closures_from_expr(condition, source, closures, None);
+            collect_closures_from_statements(body, source, closures);
+        }
+        kettu_parser::Expr::For { range, body, .. } => {
+            collect_closures_from_expr(range, source, closures, None);
+            collect_closures_from_statements(body, source, closures);
+        }
+        kettu_parser::Expr::ForEach {
+            collection, body, ..
+        } => {
+            collect_closures_from_expr(collection, source, closures, None);
+            collect_closures_from_statements(body, source, closures);
+        }
+        kettu_parser::Expr::Range {
+            start, end, step, ..
+        } => {
+            collect_closures_from_expr(start, source, closures, None);
+            collect_closures_from_expr(end, source, closures, None);
+            if let Some(step) = step {
+                collect_closures_from_expr(step, source, closures, None);
+            }
+        }
+        kettu_parser::Expr::Index { expr, index, .. } => {
+            collect_closures_from_expr(expr, source, closures, None);
+            collect_closures_from_expr(index, source, closures, None);
+        }
+        kettu_parser::Expr::Slice {
+            expr, start, end, ..
+        } => {
+            collect_closures_from_expr(expr, source, closures, None);
+            collect_closures_from_expr(start, source, closures, None);
+            collect_closures_from_expr(end, source, closures, None);
+        }
+        kettu_parser::Expr::ListLiteral { elements, .. } => {
+            for element in elements {
+                collect_closures_from_expr(element, source, closures, None);
+            }
+        }
+        kettu_parser::Expr::RecordLiteral { fields, .. } => {
+            for (_, value) in fields {
+                collect_closures_from_expr(value, source, closures, None);
+            }
+        }
+        kettu_parser::Expr::Map { list, lambda, .. }
+        | kettu_parser::Expr::Filter { list, lambda, .. } => {
+            collect_closures_from_expr(list, source, closures, None);
+            collect_closures_from_expr(lambda, source, closures, None);
+        }
+        kettu_parser::Expr::Reduce {
+            list, init, lambda, ..
+        } => {
+            collect_closures_from_expr(list, source, closures, None);
+            collect_closures_from_expr(init, source, closures, None);
+            collect_closures_from_expr(lambda, source, closures, None);
+        }
+        kettu_parser::Expr::InterpolatedString(parts, _) => {
+            for part in parts {
+                if let kettu_parser::StringPart::Expr(expr) = part {
+                    collect_closures_from_expr(expr, source, closures, None);
+                }
+            }
+        }
+        kettu_parser::Expr::Assert(expr, _)
+        | kettu_parser::Expr::Not(expr, _)
+        | kettu_parser::Expr::Neg(expr, _)
+        | kettu_parser::Expr::StrLen(expr, _)
+        | kettu_parser::Expr::ListLen(expr, _) => {
+            collect_closures_from_expr(expr, source, closures, None);
+        }
+        kettu_parser::Expr::StrEq(lhs, rhs, _) | kettu_parser::Expr::ListPush(lhs, rhs, _) => {
+            collect_closures_from_expr(lhs, source, closures, None);
+            collect_closures_from_expr(rhs, source, closures, None);
+        }
+        kettu_parser::Expr::ListSet(list, index, value, _) => {
+            collect_closures_from_expr(list, source, closures, None);
+            collect_closures_from_expr(index, source, closures, None);
+            collect_closures_from_expr(value, source, closures, None);
+        }
+        kettu_parser::Expr::VariantLiteral { payload, .. } => {
+            if let Some(payload) = payload {
+                collect_closures_from_expr(payload, source, closures, None);
+            }
+        }
+        kettu_parser::Expr::AtomicStore { addr, value, .. }
+        | kettu_parser::Expr::AtomicAdd { addr, value, .. }
+        | kettu_parser::Expr::AtomicSub { addr, value, .. }
+        | kettu_parser::Expr::AtomicNotify { addr, count: value, .. } => {
+            collect_closures_from_expr(addr, source, closures, None);
+            collect_closures_from_expr(value, source, closures, None);
+        }
+        kettu_parser::Expr::AtomicCmpxchg {
+            addr,
+            expected,
+            replacement,
+            ..
+        } => {
+            collect_closures_from_expr(addr, source, closures, None);
+            collect_closures_from_expr(expected, source, closures, None);
+            collect_closures_from_expr(replacement, source, closures, None);
+        }
+        kettu_parser::Expr::AtomicWait {
+            addr,
+            expected,
+            timeout,
+            ..
+        } => {
+            collect_closures_from_expr(addr, source, closures, None);
+            collect_closures_from_expr(expected, source, closures, None);
+            collect_closures_from_expr(timeout, source, closures, None);
+        }
+        kettu_parser::Expr::Spawn { body, .. } | kettu_parser::Expr::AtomicBlock { body, .. } => {
+            collect_closures_from_statements(body, source, closures);
+        }
+        kettu_parser::Expr::SimdOp { args, .. } => {
+            for arg in args {
+                collect_closures_from_expr(arg, source, closures, None);
+            }
+        }
+        kettu_parser::Expr::SimdForEach {
+            collection, body, ..
+        } => {
+            collect_closures_from_expr(collection, source, closures, None);
+            collect_closures_from_statements(body, source, closures);
+        }
+        kettu_parser::Expr::Integer(_, _)
+        | kettu_parser::Expr::Bool(_, _)
+        | kettu_parser::Expr::String(_, _)
+        | kettu_parser::Expr::Ident(_) => {}
     }
-    let after_let = line.trim_start_matches("let ");
-    let mut parts = after_let.splitn(2, '=');
-    let name_part = parts.next()?.trim();
-    if name_part.is_empty() {
-        return None;
+}
+
+fn build_debug_symbols(
+    program: &PathBuf,
+    source: &str,
+    ast: &kettu_parser::WitFile,
+) -> Result<DebugSymbols, String> {
+    let imported_asts = crate::load_imported_asts(program, ast);
+    let imported_aliases: HashSet<String> = imported_asts
+        .iter()
+        .map(|(alias, _)| alias.clone())
+        .collect();
+
+    let diagnostics = kettu_checker::check(ast);
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| matches!(diagnostic.severity, kettu_checker::Severity::Error))
+        .filter(|diagnostic| {
+            if diagnostic.message.starts_with("Unknown variable: ") {
+                let variable = diagnostic.message.trim_start_matches("Unknown variable: ");
+                !imported_aliases.contains(variable)
+            } else {
+                true
+            }
+        })
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect();
+
+    if !errors.is_empty() {
+        return Err(format!(
+            "Failed to build debug source map: {}",
+            errors.join("; ")
+        ));
     }
-    Some(name_part.trim().trim_end_matches(';').to_string())
+
+    let compile_options = kettu_codegen::CompileOptions {
+        core_only: true,
+        memory_pages: 1,
+        wasip3: false,
+        threads: false,
+        emit_dwarf: true,
+        keep_names: true,
+        debug_source: Some(source.to_string()),
+    };
+
+    let wasm = if imported_asts.is_empty() {
+        kettu_codegen::build_core_module(ast, &compile_options)
+    } else {
+        let imports_refs: Vec<_> = imported_asts
+            .iter()
+            .map(|(alias, ast)| (alias.clone(), ast))
+            .collect();
+        kettu_codegen::compile_module_with_imports(ast, &imports_refs, &compile_options)
+    }
+    .map_err(|err| format!("Failed to build debug source map: {}", err))?;
+
+    parse_debug_symbols(&wasm)
+}
+
+fn parse_debug_symbols(wasm: &[u8]) -> Result<DebugSymbols, String> {
+    let mut symbols = DebugSymbols::default();
+
+    for payload in Parser::new(0).parse_all(wasm) {
+        match payload.map_err(|err| format!("Invalid debug wasm payload: {}", err))? {
+            Payload::CustomSection(section) if section.name() == ".debug_info" => {
+                let payload = std::str::from_utf8(section.data())
+                    .map_err(|err| format!("Invalid UTF-8 in .debug_info section: {}", err))?;
+                parse_debug_info_payload(payload, &mut symbols)?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(symbols)
+}
+
+fn parse_debug_info_payload(payload: &str, symbols: &mut DebugSymbols) -> Result<(), String> {
+    if let Some(rest) = payload.strip_prefix("kettu-dwarf-v2\n") {
+        for line in rest.lines().filter(|line| !line.trim().is_empty()) {
+            let parts: Vec<_> = line.splitn(5, '\t').collect();
+            if parts.len() != 5 {
+                return Err(format!("Malformed .debug_info entry: {}", line));
+            }
+
+            let name = parts[1].to_string();
+            let start_line = parts[2]
+                .parse::<i64>()
+                .map_err(|_| format!("Invalid debug line entry: {}", line))?;
+            let end_line = parts[3]
+                .parse::<i64>()
+                .map_err(|_| format!("Invalid debug end-line entry: {}", line))?;
+            let byte_offset = parts[4]
+                .parse::<usize>()
+                .map_err(|_| format!("Invalid debug byte offset entry: {}", line))?;
+
+            register_debug_symbol(symbols, name, start_line, end_line, byte_offset);
+        }
+
+        return Ok(());
+    }
+
+    if let Some(rest) = payload.strip_prefix("kettu-dwarf\n") {
+        for line in rest.lines().filter(|line| !line.trim().is_empty()) {
+            let mut tail = line.rsplitn(3, ':');
+            let byte_offset = tail
+                .next()
+                .ok_or_else(|| format!("Malformed legacy .debug_info entry: {}", line))?
+                .parse::<usize>()
+                .map_err(|_| format!("Invalid legacy debug byte offset entry: {}", line))?;
+            let start_line = tail
+                .next()
+                .ok_or_else(|| format!("Malformed legacy .debug_info entry: {}", line))?
+                .parse::<i64>()
+                .map_err(|_| format!("Invalid legacy debug line entry: {}", line))?;
+            let head = tail
+                .next()
+                .ok_or_else(|| format!("Malformed legacy .debug_info entry: {}", line))?;
+            let mut head_parts = head.splitn(2, ':');
+            let _ = head_parts
+                .next()
+                .ok_or_else(|| format!("Malformed legacy .debug_info entry: {}", line))?;
+            let name = head_parts.next().unwrap_or("<unnamed>").to_string();
+            register_debug_symbol(symbols, name, start_line, start_line, byte_offset);
+        }
+    }
+
+    Ok(())
+}
+
+fn register_debug_symbol(
+    symbols: &mut DebugSymbols,
+    name: String,
+    start_line: i64,
+    end_line: i64,
+    byte_offset: usize,
+) {
+    let symbol = DebugSymbol {
+        _name: name.clone(),
+        start_line,
+        end_line,
+        _byte_offset: byte_offset,
+    };
+
+    if name.starts_with("lambda#") {
+        symbols.lambdas.push(symbol);
+    } else {
+        symbols.functions.insert(name, symbol);
+    }
+}
+
+fn apply_debug_symbols(
+    tests: &mut [ListedTest],
+    closures: &mut [ClosureRange],
+    debug_symbols: &DebugSymbols,
+) {
+    for test in tests {
+        if let Some(symbol) = debug_symbols
+            .functions
+            .iter()
+            .find(|(name, _)| *name == &test.name || name.ends_with(&format!("#{}", test.name)))
+            .map(|(_, symbol)| symbol)
+        {
+            test.line = symbol.start_line;
+            test.end_line = test.end_line.max(symbol.end_line);
+        }
+    }
+
+    for closure in closures {
+        if let Some(symbol) = debug_symbols
+            .lambdas
+            .iter()
+            .find(|symbol| symbol.start_line == closure.start_line)
+        {
+            closure.start_line = symbol.start_line;
+            closure.end_line = symbol.end_line;
+        }
+    }
 }
 
 fn extract_call_name(line: &str) -> Option<String> {
@@ -711,76 +1377,78 @@ fn extract_call_name(line: &str) -> Option<String> {
 }
 
 fn find_invoked_closure(
-    source_lines: &[String],
+    session: &DebugSession,
     current_line: i64,
-    closures: &[ClosureRange],
-) -> Option<(ClosureRange, i64)> {
+) -> Option<(usize, i64, HashMap<String, SimpleValue>, HashMap<String, SimpleValue>)> {
     if current_line <= 0 {
         return None;
     }
-    let idx = (current_line - 1) as usize;
-    let line = source_lines.get(idx)?;
-    let call_name = extract_call_name(line)?;
-    let closure = closures.iter().find(|c| c.name == call_name)?.clone();
-    Some((closure, current_line + 1))
+
+    let line = session.source_lines.get((current_line - 1) as usize)?;
+
+    if let Some(call_name) = extract_call_name(line) {
+        if let Some(closure_index) = session
+            .closures
+            .iter()
+            .enumerate()
+            .find(|(_, closure)| closure.name == call_name)
+            .map(|(index, _)| index)
+        {
+            let closure = &session.closures[closure_index];
+            let call_env = test_environment_for_line(session, current_line);
+            let capture_bindings = capture_values_for_closure(session, closure_index, &call_env);
+            let param_bindings = build_param_bindings(closure, line, &call_env);
+            return Some((closure_index, current_line + 1, param_bindings, capture_bindings));
+        }
+    }
+
+    session
+        .closures
+        .iter()
+        .enumerate()
+        .filter(|(_, closure)| closure.inline_invocation_line == Some(current_line))
+        .max_by_key(|(_, closure)| (closure.start_line, closure.end_line))
+        .map(|(closure_index, closure)| {
+            let parent_target = session
+                .active_closures
+                .last()
+                .map(|active| FrameTarget::Closure(active.closure_index))
+                .unwrap_or(FrameTarget::Test);
+            let call_env = frame_base_environment(session, parent_target);
+            let capture_bindings = capture_values_for_closure(session, closure_index, &call_env);
+            let param_bindings = closure
+                .params
+                .iter()
+                .map(|param| (param.clone(), SimpleValue::Unknown("<param>".to_string())))
+                .collect();
+            (closure_index, current_line + 1, param_bindings, capture_bindings)
+        })
 }
 
-fn infer_locals(source_lines: &[String], current_line: i64) -> Vec<Variable> {
-    if current_line <= 0 {
+#[cfg(test)]
+fn parse_closures(source_lines: &[String]) -> Vec<ClosureRange> {
+    let source = source_lines.join("\n");
+    let (ast, errors) = kettu_parser::parse_file(&source);
+    if !errors.is_empty() {
         return Vec::new();
     }
 
-    let mut values: HashMap<String, String> = HashMap::new();
-    let max_index = (current_line as usize).min(source_lines.len());
+    let Some(mut ast) = ast else {
+        return Vec::new();
+    };
 
-    for line in source_lines.iter().take(max_index) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("//") {
-            continue;
-        }
+    annotate_closure_captures(&mut ast);
+    collect_closures_from_ast(&ast, &source)
+}
 
-        if let Some(rest) = trimmed.strip_prefix("let ") {
-            if let Some((name, expr)) = split_assignment(rest) {
-                if is_identifier(name) {
-                    values.insert(name.to_string(), infer_expr_value(expr));
-                }
-            }
-            continue;
-        }
-
-        if let Some((name, expr)) = split_assignment(trimmed) {
-            if is_identifier(name) {
-                values.insert(name.to_string(), infer_expr_value(expr));
-            }
-        }
-    }
-
-    let mut vars: Vec<Variable> = values
-        .into_iter()
-        .map(|(name, value)| {
-            let var_type = if value == "true" || value == "false" {
-                "bool"
-            } else if value.starts_with('"') && value.ends_with('"') {
-                "string"
-            } else if value.parse::<i64>().is_ok() {
-                "i64"
-            } else if value.parse::<f64>().is_ok() {
-                "f64"
-            } else {
-                "unknown"
-            }
-            .to_string();
-
-            Variable {
-                name,
-                value,
-                var_type,
-            }
-        })
-        .collect();
-
-    vars.sort_by(|a, b| a.name.cmp(&b.name));
-    vars
+#[cfg(test)]
+fn infer_locals(source_lines: &[String], current_line: i64) -> Vec<Variable> {
+    variables_from_env(&infer_values_in_range(
+        source_lines,
+        1,
+        current_line,
+        &HashMap::new(),
+    ))
 }
 
 fn split_assignment(input: &str) -> Option<(&str, &str)> {
@@ -801,26 +1469,789 @@ fn is_identifier(name: &str) -> bool {
     if !(first == '_' || first.is_ascii_alphabetic()) {
         return false;
     }
-    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+    chars.all(|c| c == '_' || c == '-' || c.is_ascii_alphanumeric())
 }
 
-fn infer_expr_value(expr: &str) -> String {
+fn frame_local_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable> {
+    let Some(target) = resolve_frame_target(session, frame_id) else {
+        return Vec::new();
+    };
+
+    match target {
+        FrameTarget::Test => variables_from_env(&test_environment_for_line(session, session.current_line)),
+        FrameTarget::Closure(closure_index) => {
+            let closure = &session.closures[closure_index];
+            let capture_names: HashSet<String> = closure.captures.iter().cloned().collect();
+            let mut locals = HashMap::new();
+
+            if let Some(active) = session.find_active_closure_state(closure_index) {
+                for (name, value) in &active.param_bindings {
+                    locals.insert(name.clone(), value.clone());
+                }
+
+                let mut seed_env = active.capture_bindings.clone();
+                seed_env.extend(active.param_bindings.clone());
+                let inferred = infer_values_in_range(
+                    &session.source_lines,
+                    closure.start_line + 1,
+                    session.current_line,
+                    &seed_env,
+                );
+                for (name, value) in inferred {
+                    if !capture_names.contains(&name) {
+                        locals.insert(name, value);
+                    }
+                }
+            } else {
+                for param in &closure.params {
+                    locals.insert(param.clone(), SimpleValue::Unknown("<param>".to_string()));
+                }
+
+                let seed_env = frame_base_environment(session, FrameTarget::Closure(closure_index));
+                let inferred = infer_values_in_range(
+                    &session.source_lines,
+                    closure.start_line + 1,
+                    session.current_line,
+                    &seed_env,
+                );
+                for (name, value) in inferred {
+                    if !capture_names.contains(&name) {
+                        locals.insert(name, value);
+                    }
+                }
+            }
+
+            variables_from_env(&locals)
+        }
+    }
+}
+
+fn frame_capture_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable> {
+    let Some(FrameTarget::Closure(closure_index)) = resolve_frame_target(session, frame_id) else {
+        return Vec::new();
+    };
+
+    let captures = if let Some(active) = session.find_active_closure_state(closure_index) {
+        active.capture_bindings.clone()
+    } else {
+        let base = frame_base_environment(session, FrameTarget::Closure(closure_index));
+        capture_values_for_closure(session, closure_index, &base)
+    };
+
+    variables_from_env(&captures)
+}
+
+fn frame_environment(session: &DebugSession, frame_id: i64) -> HashMap<String, SimpleValue> {
+    let Some(target) = resolve_frame_target(session, frame_id) else {
+        return HashMap::new();
+    };
+
+    match target {
+        FrameTarget::Test => test_environment_for_line(session, session.current_line),
+        FrameTarget::Closure(closure_index) => {
+            let mut env = if let Some(active) = session.find_active_closure_state(closure_index) {
+                active.capture_bindings.clone()
+            } else {
+                let base = frame_base_environment(session, FrameTarget::Closure(closure_index));
+                capture_values_for_closure(session, closure_index, &base)
+            };
+
+            for variable in frame_local_variables(session, frame_id) {
+                env.insert(variable.name, parse_variable_display(&variable.value, &variable.var_type));
+            }
+
+            env
+        }
+    }
+}
+
+fn frame_base_environment(
+    session: &DebugSession,
+    target: FrameTarget,
+) -> HashMap<String, SimpleValue> {
+    let mut env = test_environment_for_line(session, session.current_line);
+
+    if let FrameTarget::Closure(target_index) = target {
+        for active in &session.active_closures {
+            for (name, value) in &active.capture_bindings {
+                env.insert(name.clone(), value.clone());
+            }
+            for (name, value) in &active.param_bindings {
+                env.insert(name.clone(), value.clone());
+            }
+            if active.closure_index == target_index {
+                break;
+            }
+        }
+    }
+
+    env
+}
+
+fn test_environment_for_line(session: &DebugSession, line: i64) -> HashMap<String, SimpleValue> {
+    let Some(test) = session
+        .tests
+        .iter()
+        .find(|test| line >= test.line && line <= test.end_line)
+        .or_else(|| session.tests.get(session.current_test))
+    else {
+        return HashMap::new();
+    };
+
+    infer_values_in_range(&session.source_lines, test.line, line, &HashMap::new())
+}
+
+fn capture_values_for_closure(
+    session: &DebugSession,
+    closure_index: usize,
+    env: &HashMap<String, SimpleValue>,
+) -> HashMap<String, SimpleValue> {
+    session.closures[closure_index]
+        .captures
+        .iter()
+        .map(|capture| {
+            (
+                capture.clone(),
+                env.get(capture)
+                    .cloned()
+                    .unwrap_or_else(|| SimpleValue::Unknown("<capture>".to_string())),
+            )
+        })
+        .collect()
+}
+
+fn build_param_bindings(
+    closure: &ClosureRange,
+    line: &str,
+    env: &HashMap<String, SimpleValue>,
+) -> HashMap<String, SimpleValue> {
+    let args = extract_call_arguments(line).unwrap_or_default();
+
+    closure
+        .params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| {
+            let value = args
+                .get(index)
+                .map(|arg| infer_expr_value(arg, env))
+                .unwrap_or_else(|| SimpleValue::Unknown("<param>".to_string()));
+            (param.clone(), value)
+        })
+        .collect()
+}
+
+fn extract_call_arguments(line: &str) -> Option<Vec<String>> {
+    let start = line.find('(')?;
+    let mut depth = 0i64;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut end = None;
+
+    for (index, ch) in line.char_indices().skip(start) {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let end = end?;
+    let args = &line[start + 1..end];
+    Some(split_top_level_arguments(args))
+}
+
+fn split_top_level_arguments(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0i64;
+    let mut bracket_depth = 0i64;
+    let mut brace_depth = 0i64;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for ch in input.chars() {
+        if in_string {
+            current.push(ch);
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                current.push(ch);
+            }
+            '(' => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                paren_depth -= 1;
+                current.push(ch);
+            }
+            '[' => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' => {
+                bracket_depth -= 1;
+                current.push(ch);
+            }
+            '{' => {
+                brace_depth += 1;
+                current.push(ch);
+            }
+            '}' => {
+                brace_depth -= 1;
+                current.push(ch);
+            }
+            ',' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    args.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        args.push(trimmed.to_string());
+    }
+
+    args
+}
+
+fn infer_values_in_range(
+    source_lines: &[String],
+    start_line: i64,
+    end_line: i64,
+    seed_env: &HashMap<String, SimpleValue>,
+) -> HashMap<String, SimpleValue> {
+    let mut values = seed_env.clone();
+    if end_line < start_line || end_line <= 0 {
+        return values;
+    }
+
+    let start_index = start_line.max(1).saturating_sub(1) as usize;
+    let end_index = (end_line as usize).min(source_lines.len());
+
+    for line in source_lines.iter().skip(start_index).take(end_index.saturating_sub(start_index)) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("shared let ") {
+            if let Some((name, expr)) = split_assignment(rest) {
+                if is_identifier(name) {
+                    values.insert(name.to_string(), infer_expr_value(expr, &values));
+                }
+            }
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("let ") {
+            if let Some((name, expr)) = split_assignment(rest) {
+                if is_identifier(name) {
+                    values.insert(name.to_string(), infer_expr_value(expr, &values));
+                }
+            }
+            continue;
+        }
+
+        if let Some((name, expr)) = split_assignment(trimmed) {
+            if is_identifier(name) {
+                values.insert(name.to_string(), infer_expr_value(expr, &values));
+            }
+        }
+    }
+
+    values
+}
+
+fn variables_from_env(values: &HashMap<String, SimpleValue>) -> Vec<Variable> {
+    let mut vars: Vec<Variable> = values
+        .iter()
+        .map(|(name, value)| Variable::from_value(name.clone(), value.clone()))
+        .collect();
+    vars.sort_by(|left, right| left.name.cmp(&right.name));
+    vars
+}
+
+fn infer_expr_value(expr: &str, env: &HashMap<String, SimpleValue>) -> SimpleValue {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
-        return "<unknown>".to_string();
+        return SimpleValue::Unknown("<unknown>".to_string());
     }
-    if trimmed == "true" || trimmed == "false" {
-        return trimmed.to_string();
+
+    evaluate_expression(trimmed, env).unwrap_or_else(|_| parse_literal_or_unknown(trimmed))
+}
+
+fn parse_literal_or_unknown(expr: &str) -> SimpleValue {
+    let trimmed = expr.trim();
+    if trimmed == "true" {
+        return SimpleValue::Bool(true);
     }
-    if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || (trimmed.starts_with('"') && trimmed.contains('"'))
-    {
-        return trimmed.to_string();
+    if trimmed == "false" {
+        return SimpleValue::Bool(false);
     }
-    if trimmed.parse::<i64>().is_ok() || trimmed.parse::<f64>().is_ok() {
-        return trimmed.to_string();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        return SimpleValue::String(trimmed[1..trimmed.len() - 1].to_string());
     }
-    "<expr>".to_string()
+    if let Ok(value) = trimmed.parse::<i64>() {
+        return SimpleValue::Int(value);
+    }
+    if let Ok(value) = trimmed.parse::<f64>() {
+        return SimpleValue::Float(value);
+    }
+    SimpleValue::Unknown(trimmed.to_string())
+}
+
+fn parse_variable_display(value: &str, var_type: &str) -> SimpleValue {
+    match var_type {
+        "bool" => SimpleValue::Bool(value == "true"),
+        "i64" => value
+            .parse::<i64>()
+            .map(SimpleValue::Int)
+            .unwrap_or_else(|_| SimpleValue::Unknown(value.to_string())),
+        "f64" => value
+            .parse::<f64>()
+            .map(SimpleValue::Float)
+            .unwrap_or_else(|_| SimpleValue::Unknown(value.to_string())),
+        "string" => {
+            if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+                SimpleValue::String(value[1..value.len() - 1].to_string())
+            } else {
+                SimpleValue::String(value.to_string())
+            }
+        }
+        _ => SimpleValue::Unknown(value.to_string()),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum EvalToken {
+    LParen,
+    RParen,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    EqEq,
+    NotEq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    AndAnd,
+    OrOr,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    Ident(String),
+}
+
+struct EvalParser<'a> {
+    tokens: Vec<EvalToken>,
+    position: usize,
+    env: &'a HashMap<String, SimpleValue>,
+}
+
+impl<'a> EvalParser<'a> {
+    fn new(tokens: Vec<EvalToken>, env: &'a HashMap<String, SimpleValue>) -> Self {
+        Self {
+            tokens,
+            position: 0,
+            env,
+        }
+    }
+
+    fn parse(mut self) -> Result<SimpleValue, String> {
+        let value = self.parse_or()?;
+        if self.peek().is_some() {
+            return Err("Unexpected trailing tokens".to_string());
+        }
+        Ok(value)
+    }
+
+    fn parse_or(&mut self) -> Result<SimpleValue, String> {
+        let mut value = self.parse_and()?;
+        while matches!(self.peek(), Some(EvalToken::OrOr)) {
+            self.position += 1;
+            let rhs = self.parse_and()?;
+            value = apply_binary_op(value, rhs, "||")?;
+        }
+        Ok(value)
+    }
+
+    fn parse_and(&mut self) -> Result<SimpleValue, String> {
+        let mut value = self.parse_equality()?;
+        while matches!(self.peek(), Some(EvalToken::AndAnd)) {
+            self.position += 1;
+            let rhs = self.parse_equality()?;
+            value = apply_binary_op(value, rhs, "&&")?;
+        }
+        Ok(value)
+    }
+
+    fn parse_equality(&mut self) -> Result<SimpleValue, String> {
+        let mut value = self.parse_comparison()?;
+        loop {
+            let op = match self.peek() {
+                Some(EvalToken::EqEq) => "==",
+                Some(EvalToken::NotEq) => "!=",
+                _ => break,
+            };
+            self.position += 1;
+            let rhs = self.parse_comparison()?;
+            value = apply_binary_op(value, rhs, op)?;
+        }
+        Ok(value)
+    }
+
+    fn parse_comparison(&mut self) -> Result<SimpleValue, String> {
+        let mut value = self.parse_additive()?;
+        loop {
+            let op = match self.peek() {
+                Some(EvalToken::Lt) => "<",
+                Some(EvalToken::Le) => "<=",
+                Some(EvalToken::Gt) => ">",
+                Some(EvalToken::Ge) => ">=",
+                _ => break,
+            };
+            self.position += 1;
+            let rhs = self.parse_additive()?;
+            value = apply_binary_op(value, rhs, op)?;
+        }
+        Ok(value)
+    }
+
+    fn parse_additive(&mut self) -> Result<SimpleValue, String> {
+        let mut value = self.parse_multiplicative()?;
+        loop {
+            let op = match self.peek() {
+                Some(EvalToken::Plus) => "+",
+                Some(EvalToken::Minus) => "-",
+                _ => break,
+            };
+            self.position += 1;
+            let rhs = self.parse_multiplicative()?;
+            value = apply_binary_op(value, rhs, op)?;
+        }
+        Ok(value)
+    }
+
+    fn parse_multiplicative(&mut self) -> Result<SimpleValue, String> {
+        let mut value = self.parse_unary()?;
+        loop {
+            let op = match self.peek() {
+                Some(EvalToken::Star) => "*",
+                Some(EvalToken::Slash) => "/",
+                _ => break,
+            };
+            self.position += 1;
+            let rhs = self.parse_unary()?;
+            value = apply_binary_op(value, rhs, op)?;
+        }
+        Ok(value)
+    }
+
+    fn parse_unary(&mut self) -> Result<SimpleValue, String> {
+        if matches!(self.peek(), Some(EvalToken::Minus)) {
+            self.position += 1;
+            let value = self.parse_unary()?;
+            return match value {
+                SimpleValue::Int(inner) => Ok(SimpleValue::Int(-inner)),
+                SimpleValue::Float(inner) => Ok(SimpleValue::Float(-inner)),
+                _ => Err("Unary '-' requires a numeric operand".to_string()),
+            };
+        }
+
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<SimpleValue, String> {
+        match self.next() {
+            Some(EvalToken::Bool(value)) => Ok(SimpleValue::Bool(value)),
+            Some(EvalToken::Int(value)) => Ok(SimpleValue::Int(value)),
+            Some(EvalToken::Float(value)) => Ok(SimpleValue::Float(value)),
+            Some(EvalToken::String(value)) => Ok(SimpleValue::String(value)),
+            Some(EvalToken::Ident(name)) => self
+                .env
+                .get(&name)
+                .cloned()
+                .ok_or_else(|| format!("Unknown variable in evaluate: {}", name)),
+            Some(EvalToken::LParen) => {
+                let value = self.parse_or()?;
+                match self.next() {
+                    Some(EvalToken::RParen) => Ok(value),
+                    _ => Err("Missing ')' in expression".to_string()),
+                }
+            }
+            _ => Err("Expected an expression".to_string()),
+        }
+    }
+
+    fn peek(&self) -> Option<&EvalToken> {
+        self.tokens.get(self.position)
+    }
+
+    fn next(&mut self) -> Option<EvalToken> {
+        let token = self.tokens.get(self.position).cloned();
+        if token.is_some() {
+            self.position += 1;
+        }
+        token
+    }
+}
+
+fn evaluate_expression(
+    expression: &str,
+    env: &HashMap<String, SimpleValue>,
+) -> Result<SimpleValue, String> {
+    let tokens = tokenize_expression(expression)?;
+    EvalParser::new(tokens, env).parse()
+}
+
+fn tokenize_expression(expression: &str) -> Result<Vec<EvalToken>, String> {
+    let chars: Vec<char> = expression.chars().collect();
+    let mut index = 0;
+    let mut tokens = Vec::new();
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_whitespace() {
+            index += 1;
+            continue;
+        }
+
+        match ch {
+            '(' => {
+                tokens.push(EvalToken::LParen);
+                index += 1;
+            }
+            ')' => {
+                tokens.push(EvalToken::RParen);
+                index += 1;
+            }
+            '+' => {
+                tokens.push(EvalToken::Plus);
+                index += 1;
+            }
+            '-' => {
+                tokens.push(EvalToken::Minus);
+                index += 1;
+            }
+            '*' => {
+                tokens.push(EvalToken::Star);
+                index += 1;
+            }
+            '/' => {
+                tokens.push(EvalToken::Slash);
+                index += 1;
+            }
+            '&' if chars.get(index + 1) == Some(&'&') => {
+                tokens.push(EvalToken::AndAnd);
+                index += 2;
+            }
+            '|' if chars.get(index + 1) == Some(&'|') => {
+                tokens.push(EvalToken::OrOr);
+                index += 2;
+            }
+            '=' if chars.get(index + 1) == Some(&'=') => {
+                tokens.push(EvalToken::EqEq);
+                index += 2;
+            }
+            '!' if chars.get(index + 1) == Some(&'=') => {
+                tokens.push(EvalToken::NotEq);
+                index += 2;
+            }
+            '<' if chars.get(index + 1) == Some(&'=') => {
+                tokens.push(EvalToken::Le);
+                index += 2;
+            }
+            '>' if chars.get(index + 1) == Some(&'=') => {
+                tokens.push(EvalToken::Ge);
+                index += 2;
+            }
+            '<' => {
+                tokens.push(EvalToken::Lt);
+                index += 1;
+            }
+            '>' => {
+                tokens.push(EvalToken::Gt);
+                index += 1;
+            }
+            '"' => {
+                let start = index + 1;
+                index += 1;
+                let mut escaped = false;
+                let mut value = String::new();
+                while index < chars.len() {
+                    let current = chars[index];
+                    if escaped {
+                        value.push(current);
+                        escaped = false;
+                    } else if current == '\\' {
+                        escaped = true;
+                    } else if current == '"' {
+                        break;
+                    } else {
+                        value.push(current);
+                    }
+                    index += 1;
+                }
+                if index >= chars.len() {
+                    return Err(format!("Unterminated string starting at {}", start));
+                }
+                index += 1;
+                tokens.push(EvalToken::String(value));
+            }
+            _ if ch.is_ascii_digit() => {
+                let start = index;
+                index += 1;
+                let mut is_float = false;
+                while index < chars.len()
+                    && (chars[index].is_ascii_digit() || (!is_float && chars[index] == '.'))
+                {
+                    if chars[index] == '.' {
+                        is_float = true;
+                    }
+                    index += 1;
+                }
+                let number: String = chars[start..index].iter().collect();
+                if is_float {
+                    tokens.push(EvalToken::Float(
+                        number
+                            .parse::<f64>()
+                            .map_err(|_| format!("Invalid float literal: {}", number))?,
+                    ));
+                } else {
+                    tokens.push(EvalToken::Int(
+                        number
+                            .parse::<i64>()
+                            .map_err(|_| format!("Invalid integer literal: {}", number))?,
+                    ));
+                }
+            }
+            _ if ch == '_' || ch.is_ascii_alphabetic() => {
+                let start = index;
+                index += 1;
+                while index < chars.len()
+                    && (chars[index] == '_'
+                        || chars[index] == '-'
+                        || chars[index].is_ascii_alphanumeric())
+                {
+                    index += 1;
+                }
+                let ident: String = chars[start..index].iter().collect();
+                match ident.as_str() {
+                    "true" => tokens.push(EvalToken::Bool(true)),
+                    "false" => tokens.push(EvalToken::Bool(false)),
+                    _ => tokens.push(EvalToken::Ident(ident)),
+                }
+            }
+            _ => return Err(format!("Unsupported token in expression: {}", ch)),
+        }
+    }
+
+    Ok(tokens)
+}
+
+fn apply_binary_op(lhs: SimpleValue, rhs: SimpleValue, op: &str) -> Result<SimpleValue, String> {
+    match op {
+        "+" => match (lhs, rhs) {
+            (SimpleValue::Int(lhs), SimpleValue::Int(rhs)) => Ok(SimpleValue::Int(lhs + rhs)),
+            (SimpleValue::Float(lhs), SimpleValue::Float(rhs)) => Ok(SimpleValue::Float(lhs + rhs)),
+            (SimpleValue::Int(lhs), SimpleValue::Float(rhs)) => {
+                Ok(SimpleValue::Float(lhs as f64 + rhs))
+            }
+            (SimpleValue::Float(lhs), SimpleValue::Int(rhs)) => {
+                Ok(SimpleValue::Float(lhs + rhs as f64))
+            }
+            (SimpleValue::String(lhs), SimpleValue::String(rhs)) => {
+                Ok(SimpleValue::String(lhs + &rhs))
+            }
+            _ => Err("Operator '+' requires numeric or string operands".to_string()),
+        },
+        "-" => numeric_binary_op(lhs, rhs, |lhs, rhs| lhs - rhs),
+        "*" => numeric_binary_op(lhs, rhs, |lhs, rhs| lhs * rhs),
+        "/" => numeric_binary_op(lhs, rhs, |lhs, rhs| lhs / rhs),
+        "==" => Ok(SimpleValue::Bool(lhs == rhs)),
+        "!=" => Ok(SimpleValue::Bool(lhs != rhs)),
+        "<" => compare_binary_op(lhs, rhs, |lhs, rhs| lhs < rhs),
+        "<=" => compare_binary_op(lhs, rhs, |lhs, rhs| lhs <= rhs),
+        ">" => compare_binary_op(lhs, rhs, |lhs, rhs| lhs > rhs),
+        ">=" => compare_binary_op(lhs, rhs, |lhs, rhs| lhs >= rhs),
+        "&&" => match (lhs, rhs) {
+            (SimpleValue::Bool(lhs), SimpleValue::Bool(rhs)) => Ok(SimpleValue::Bool(lhs && rhs)),
+            _ => Err("Operator '&&' requires boolean operands".to_string()),
+        },
+        "||" => match (lhs, rhs) {
+            (SimpleValue::Bool(lhs), SimpleValue::Bool(rhs)) => Ok(SimpleValue::Bool(lhs || rhs)),
+            _ => Err("Operator '||' requires boolean operands".to_string()),
+        },
+        _ => Err(format!("Unsupported operator: {}", op)),
+    }
+}
+
+fn numeric_binary_op(
+    lhs: SimpleValue,
+    rhs: SimpleValue,
+    op: impl Fn(f64, f64) -> f64,
+) -> Result<SimpleValue, String> {
+    match (lhs, rhs) {
+        (SimpleValue::Int(lhs), SimpleValue::Int(rhs)) => Ok(SimpleValue::Int(op(lhs as f64, rhs as f64) as i64)),
+        (SimpleValue::Float(lhs), SimpleValue::Float(rhs)) => Ok(SimpleValue::Float(op(lhs, rhs))),
+        (SimpleValue::Int(lhs), SimpleValue::Float(rhs)) => Ok(SimpleValue::Float(op(lhs as f64, rhs))),
+        (SimpleValue::Float(lhs), SimpleValue::Int(rhs)) => Ok(SimpleValue::Float(op(lhs, rhs as f64))),
+        _ => Err("Numeric operator requires numeric operands".to_string()),
+    }
+}
+
+fn compare_binary_op(
+    lhs: SimpleValue,
+    rhs: SimpleValue,
+    op: impl Fn(f64, f64) -> bool,
+) -> Result<SimpleValue, String> {
+    match (lhs, rhs) {
+        (SimpleValue::Int(lhs), SimpleValue::Int(rhs)) => Ok(SimpleValue::Bool(op(lhs as f64, rhs as f64))),
+        (SimpleValue::Float(lhs), SimpleValue::Float(rhs)) => Ok(SimpleValue::Bool(op(lhs, rhs))),
+        (SimpleValue::Int(lhs), SimpleValue::Float(rhs)) => Ok(SimpleValue::Bool(op(lhs as f64, rhs))),
+        (SimpleValue::Float(lhs), SimpleValue::Int(rhs)) => Ok(SimpleValue::Bool(op(lhs, rhs as f64))),
+        _ => Err("Comparison operator requires numeric operands".to_string()),
+    }
 }
 
 fn send_response(
@@ -912,20 +2343,39 @@ mod tests {
     #[test]
     fn closure_ranges_are_detected() {
         let source = vec![
-            "interface main {".to_string(),
-            "  @test fn t() -> bool {".to_string(),
-            "    let f = |x| {".to_string(),
-            "      x + 1".to_string(),
+            "package local:test;".to_string(),
+            "interface tests {".to_string(),
+            "    @test".to_string(),
+            "    t: func() -> bool {".to_string(),
+            "        let f = |x| x + 1;".to_string(),
+            "        return true;".to_string(),
             "    }".to_string(),
-            "    true".to_string(),
-            "  }".to_string(),
             "}".to_string(),
         ];
 
         let closures = parse_closures(&source);
         assert_eq!(closures.len(), 1);
-        assert_eq!(closures[0].start_line, 3);
+        assert_eq!(closures[0].start_line, 5);
         assert_eq!(closures[0].end_line, 5);
+    }
+
+    #[test]
+    fn closure_captures_are_collected() {
+        let source = vec![
+            "package local:test;".to_string(),
+            "interface tests {".to_string(),
+            "    @test".to_string(),
+            "    t: func() -> bool {".to_string(),
+            "        let x = 10;".to_string(),
+            "        let add-x = |n| n + x;".to_string(),
+            "        return true;".to_string(),
+            "    }".to_string(),
+            "}".to_string(),
+        ];
+
+        let closures = parse_closures(&source);
+        assert_eq!(closures.len(), 1);
+        assert_eq!(closures[0].captures, vec!["x"]);
     }
 
     #[test]
@@ -971,13 +2421,15 @@ mod tests {
     #[test]
     fn stack_trace_includes_closure_frame() {
         let lines = vec![
-            "interface t {".to_string(),
-            "  @test fn t() -> bool {".to_string(),
-            "    let y = reduce([1,2], 0) |acc, n| {".to_string(),
-            "      acc + n".to_string(),
+            "package local:test;".to_string(),
+            "interface tests {".to_string(),
+            "    @test".to_string(),
+            "    t: func() -> bool {".to_string(),
+            "        let y = |n|".to_string(),
+            "            n + 1;".to_string(),
+            "        let total = y(2);".to_string(),
+            "        return total > 0;".to_string(),
             "    }".to_string(),
-            "    true".to_string(),
-            "  }".to_string(),
             "}".to_string(),
         ];
 
@@ -987,16 +2439,25 @@ mod tests {
         session.source_lines = lines;
         session.tests = vec![ListedTest {
             name: "t".into(),
-            line: 2,
-            end_line: 7,
+            line: 4,
+            end_line: 10,
         }];
-        session.current_line = 4; // inside closure
+        session.current_line = 6; // inside closure
         session.closures = closures.clone();
-        session.active_closure = Some(closures[0].clone());
 
         let frames = super::build_stack_frames(&session);
         assert!(frames.len() >= 2);
         assert_eq!(frames[0].get("name"), Some(&json!("y")));
         assert_eq!(frames[1].get("name"), Some(&json!('@'.to_string() + "test t")));
+    }
+
+    #[test]
+    fn evaluate_expression_reads_known_variables() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("base".to_string(), super::SimpleValue::Int(10));
+        env.insert("n".to_string(), super::SimpleValue::Int(5));
+
+        let value = super::evaluate_expression("base + n", &env).unwrap();
+        assert_eq!(value, super::SimpleValue::Int(15));
     }
 }

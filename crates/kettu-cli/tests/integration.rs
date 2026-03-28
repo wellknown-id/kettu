@@ -209,6 +209,64 @@ fn test_build_debug_sections() {
 }
 
 #[test]
+fn test_build_debug_sections_include_lambda_locations() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(file, "package local:test;").unwrap();
+    writeln!(file, "interface tests {{").unwrap();
+    writeln!(file, "    @test").unwrap();
+    writeln!(file, "    closure: func() -> bool {{").unwrap();
+    writeln!(file, "        let add-one = |x|").unwrap();
+    writeln!(file, "            x + 1;").unwrap();
+    writeln!(file, "        return add-one(1) == 2;").unwrap();
+    writeln!(file, "    }}").unwrap();
+    writeln!(file, "}}").unwrap();
+
+    let output_file = NamedTempFile::new().unwrap();
+
+    let output = kettu_cmd()
+        .args([
+            "build",
+            "--core",
+            "--debug",
+            file.path().to_str().unwrap(),
+            "-o",
+            output_file.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run kettu build --debug");
+
+    assert!(
+        output.status.success(),
+        "Debug build should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let wasm = std::fs::read(output_file.path()).unwrap();
+    let debug_info = Parser::new(0)
+        .parse_all(&wasm)
+        .find_map(|payload| match payload.expect("valid wasm payload") {
+            Payload::CustomSection(section) if section.name() == ".debug_info" => {
+                Some(String::from_utf8(section.data().to_vec()).expect("utf8 debug info"))
+            }
+            _ => None,
+        })
+        .expect("should emit debug info payload");
+
+    assert!(
+        debug_info.starts_with("kettu-dwarf-v2\n"),
+        "expected the v2 debug payload format"
+    );
+
+    let lambda_entry = debug_info
+        .lines()
+        .find(|line| line.contains("\tlambda#0\t"))
+        .expect("expected a lambda debug symbol");
+    let parts: Vec<_> = lambda_entry.split('\t').collect();
+    assert_eq!(parts[2], "5", "lambda start line should match source");
+    assert_eq!(parts[3], "6", "lambda end line should match source");
+}
+
+#[test]
 fn test_test_list_json() {
     let mut file = NamedTempFile::new().unwrap();
     writeln!(file, "package local:test;").unwrap();

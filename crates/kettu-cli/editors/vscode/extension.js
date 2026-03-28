@@ -190,6 +190,7 @@ function activate(context) {
                 program,
                 cwd,
                 stopOnEntry: false,
+                enableEvaluate: false,
                 kettuPath: serverPath,
             };
 
@@ -268,6 +269,7 @@ class KettuDebugConfigurationProvider {
         config.cwd = config.cwd || path.dirname(config.program);
         config.kettuPath = config.kettuPath || this.defaultKettuPath;
         config.stopOnEntry = !!config.stopOnEntry;
+        config.enableEvaluate = !!config.enableEvaluate;
         return config;
     }
 }

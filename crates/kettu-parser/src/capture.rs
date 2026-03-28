@@ -16,14 +16,14 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
             captures,
             ..
         } => {
-            // Build scope for lambda body: outer scope + params
-            let mut inner_scope: HashSet<String> = scope.clone();
+            // Captures are free variables relative to the lambda's own bindings.
+            let mut lambda_scope: HashSet<String> = HashSet::new();
             for param in params.iter() {
-                inner_scope.insert(param.name.clone());
+                lambda_scope.insert(param.name.clone());
             }
 
             // Find free variables in body
-            let free_vars = find_free_variables(body, &inner_scope);
+            let free_vars = find_free_variables(body, &lambda_scope);
 
             // Populate captures with variables that are in outer scope
             *captures = free_vars
@@ -36,6 +36,8 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
                 .collect();
 
             // Recursively analyze nested lambdas
+            let mut inner_scope: HashSet<String> = scope.clone();
+            inner_scope.extend(lambda_scope);
             analyze_captures(body, &inner_scope);
         }
         Expr::Binary { lhs, rhs, .. } => {
@@ -546,5 +548,40 @@ mod tests {
         bound_with_x.insert("x".to_string());
         let free = find_free_variables(&expr, &bound_with_x);
         assert!(!free.contains("x"));
+    }
+
+    #[test]
+    fn test_analyze_captures_tracks_outer_bindings() {
+        let mut lambda = Expr::Lambda {
+            params: vec![Id {
+                name: "n".to_string(),
+                span: 0..1,
+            }],
+            body: Box::new(Expr::Binary {
+                lhs: Box::new(Expr::Ident(Id {
+                    name: "n".to_string(),
+                    span: 0..1,
+                })),
+                op: crate::ast::BinOp::Add,
+                rhs: Box::new(Expr::Ident(Id {
+                    name: "x".to_string(),
+                    span: 4..5,
+                })),
+                span: 0..5,
+            }),
+            captures: vec![],
+            span: 0..5,
+        };
+
+        let scope = HashSet::from(["x".to_string()]);
+        analyze_captures(&mut lambda, &scope);
+
+        let Expr::Lambda { captures, .. } = lambda else {
+            panic!("expected lambda");
+        };
+        assert_eq!(
+            captures.iter().map(|capture| capture.name.as_str()).collect::<Vec<_>>(),
+            vec!["x"]
+        );
     }
 }

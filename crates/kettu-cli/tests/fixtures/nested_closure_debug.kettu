@@ -1,0 +1,12 @@
+package local:nested-debug;
+interface tests {
+    @test
+    nested-closure-flow: func() -> bool {
+        let seed = 10;
+        let outer = |x|
+            reduce([1, 2], x)
+                |acc, n| acc + n + seed;
+        let total = outer(3);
+        return total > 0;
+    }
+}

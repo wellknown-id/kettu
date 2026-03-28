@@ -122,6 +122,8 @@ struct ModuleCompiler<'a> {
     exports: Vec<(String, u32)>,
     /// Source spans for functions (func_idx -> span)
     func_spans: Vec<(u32, Range<usize>)>,
+    /// Debug symbol names for non-exported functions such as lambdas
+    func_debug_names: HashMap<u32, String>,
     /// Function bodies to compile
     func_bodies: Vec<(String, Func)>,
     /// String literal data: (offset, bytes)
@@ -180,6 +182,7 @@ impl<'a> ModuleCompiler<'a> {
             local_func_count: 0,
             exports: Vec::new(),
             func_spans: Vec::new(),
+            func_debug_names: HashMap::new(),
             func_bodies: Vec::new(),
             string_data: Vec::new(),
             string_offset: 0,
@@ -233,23 +236,28 @@ impl<'a> ModuleCompiler<'a> {
 
         let mut entries = Vec::new();
         // Custom debug payload format:
-        //   kettu-dwarf\n
-        //   <func_idx>:<export_name_or_placeholder>:<line>:<byte_offset>\n...
-        // This favors readability and keeps enough information for DAP consumers
-        // to correlate exports with spans without introducing a full DWARF encoder.
+        //   kettu-dwarf-v2\n
+        //   <func_idx>\t<symbol_name>\t<start_line>\t<end_line>\t<byte_offset>\n...
+        // This keeps the payload human-readable while making it robust for names
+        // that may already contain `:` or `/`, such as component export names.
         for (idx, span) in &self.func_spans {
-            let line = source.map(|s| offset_to_line(s, span.start)).unwrap_or(1);
-            let name = idx_to_export
+            let start_line = source.map(|s| offset_to_line(s, span.start)).unwrap_or(1);
+            let end_line = source
+                .map(|s| offset_to_line(s, span.end.saturating_sub(1)))
+                .unwrap_or(start_line);
+            let name = self
+                .func_debug_names
                 .get(idx)
-                .copied()
+                .map(String::as_str)
+                .or_else(|| idx_to_export.get(idx).copied())
                 .unwrap_or("<unnamed>");
             entries.push(format!(
-                "{}:{}:{}:{}",
-                idx, name, line, span.start
+                "{}\t{}\t{}\t{}\t{}",
+                idx, name, start_line, end_line, span.start
             ));
         }
 
-        let info_payload = format!("kettu-dwarf\n{}", entries.join("\n"));
+        let info_payload = format!("kettu-dwarf-v2\n{}", entries.join("\n"));
         let info_section = CustomSection {
             name: ".debug_info".into(),
             data: Cow::from(info_payload.into_bytes()),
@@ -1711,6 +1719,7 @@ impl<'a> ModuleCompiler<'a> {
         captures: &[kettu_parser::Id],
         params: &[kettu_parser::Id],
         body: &Expr,
+        span: &Range<usize>,
     ) -> Result<u32, CompileError> {
         // Build param types: captures first, then regular params (all i32 for now)
         let total_params = captures.len() + params.len();
@@ -1746,6 +1755,9 @@ impl<'a> ModuleCompiler<'a> {
             body.clone(),
         ));
 
+        self.func_spans.push((func_idx, span.clone()));
+        self.func_debug_names
+            .insert(func_idx, format!("lambda#{}", self.next_lambda_id));
         self.next_lambda_id += 1;
 
         Ok(table_idx)
@@ -2687,10 +2699,10 @@ impl<'a> ModuleCompiler<'a> {
                 captures,
                 params,
                 body,
-                ..
+                span,
             } => {
                 // Emit lambda as function and return table index
-                let table_idx = self.emit_lambda(captures, params, body)?;
+                let table_idx = self.emit_lambda(captures, params, body, span)?;
                 function.instruction(&Instruction::I32Const(table_idx as i32));
             }
             Expr::Map { .. } => {
@@ -2954,7 +2966,7 @@ impl<'a> ModuleCompiler<'a> {
                 captures: _,
                 params,
                 body,
-                ..
+                span,
             } => {
                 // Find captures for this lambda
                 let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2978,7 +2990,7 @@ impl<'a> ModuleCompiler<'a> {
                     .collect();
 
                 // Emit lambda as function (with captures as hidden params)
-                let table_idx = self.emit_lambda(&capture_ids, params, body)?;
+                let table_idx = self.emit_lambda(&capture_ids, params, body, span)?;
 
                 // Always allocate closure cell: [table_idx, capture_count, cap1, cap2, ...]
                 let cell_size = (2 + actual_captures.len()) * 4; // i32 each

@@ -71,6 +71,11 @@
                                 "default": false,
                                 "description": "Stop before the first test executes"
                             },
+                            "enableEvaluate": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Enable simple expression evaluation in the debugger"
+                            },
                             "kettuPath": {
                                 "type": "string",
                                 "description": "Path to kettu binary. Defaults to kettu.serverPath resolution"
@@ -85,7 +90,8 @@
                         "request": "launch",
                         "program": "${file}",
                         "cwd": "${workspaceFolder}",
-                        "stopOnEntry": false
+                        "stopOnEntry": false,
+                        "enableEvaluate": false
                     }
                 ],
                 "configurationSnippets": [
@@ -98,7 +104,8 @@
                             "request": "launch",
                             "program": "${file}",
                             "cwd": "${workspaceFolder}",
-                            "stopOnEntry": false
+                            "stopOnEntry": false,
+                            "enableEvaluate": false
                         }
                     }
                 ]

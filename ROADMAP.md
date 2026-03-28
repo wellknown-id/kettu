@@ -127,6 +127,15 @@ Foundation (C): `shared<dtype>` with method syntax. Sugar (B): `shared let` + `a
   - JSON-RPC 2.0 with MCP initialize/tools/list/tools/call lifecycle
   - VS Code extension integration: auto-register as MCP server for AI/LM chat contexts
 
+### Phase 16b: Debugger
+
+- [ ] Source mapping to wasm — emit Kettu→wasm location map (debug info) and surface it to DAP so stepping and stack lines match optimized builds
+- [ ] Integration tests for release debugging — debug a `--release` build and assert DAP stack and line mappings align with source
+- [ ] Data inspection and `evaluate` support — expose closure captures and locals in the Variables pane; add `evaluate` support for simple expressions behind a flag
+- [ ] Tests for captures and `evaluate` — assert captures appear in Variables and `evaluate` returns expected values
+- [ ] Nested closures and multi-breakpoint flows — preserve the correct top frame and line order when stepping between nested closures and multiple breakpoints
+- [ ] Tests for nested closure stepping — use a fixture with nested closures and back-to-back breakpoints, asserting frame names and monotonic line progression
+
 [^1]: Syntactic sugar for atomic operations:
 
 ```kettu
