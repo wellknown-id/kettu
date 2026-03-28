@@ -1,6 +1,8 @@
 //! Integration tests for the full Kettu compilation pipeline
 
+use gimli::{self, DwarfSections, EndianSlice, LittleEndian, constants};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::io::Write;
 use std::process::Command;
 use tempfile::NamedTempFile;
@@ -35,6 +37,162 @@ fn run_mcp_request(request: Value) -> Value {
         .find(|line| !line.trim().is_empty())
         .expect("MCP response line");
     serde_json::from_str(line).expect("valid MCP JSON response")
+}
+
+#[derive(Debug)]
+struct DwarfLineRow {
+    file_name: String,
+    line: u64,
+}
+
+#[derive(Debug)]
+struct ParsedDwarf {
+    compile_units: Vec<String>,
+    subprograms: Vec<String>,
+    line_rows: Vec<DwarfLineRow>,
+}
+
+#[derive(Debug)]
+struct DebugOutput {
+    has_name: bool,
+    dwarf: ParsedDwarf,
+}
+
+fn inspect_debug_output(wasm: &[u8]) -> Result<DebugOutput, String> {
+    let mut sections = HashMap::new();
+    let mut has_name = false;
+
+    for payload in Parser::new(0).parse_all(wasm) {
+        match payload.map_err(|err| format!("invalid wasm payload: {}", err))? {
+            Payload::CustomSection(section) => {
+                if section.name() == "name" {
+                    has_name = true;
+                } else {
+                    sections.insert(section.name().to_owned(), section.data().to_vec());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(DebugOutput {
+        has_name,
+        dwarf: parse_real_dwarf_sections(&sections)?,
+    })
+}
+
+fn parse_real_dwarf_sections(sections: &HashMap<String, Vec<u8>>) -> Result<ParsedDwarf, String> {
+    for required in [".debug_abbrev", ".debug_info", ".debug_line"] {
+        if !sections.contains_key(required) {
+            return Err(format!("missing {required} section"));
+        }
+    }
+
+    let dwarf_sections = DwarfSections::load(|id| -> Result<Vec<u8>, gimli::Error> {
+        Ok(sections.get(id.name()).cloned().unwrap_or_default())
+    })
+    .map_err(|err| format!("failed to load DWARF sections: {}", err))?;
+    let dwarf = dwarf_sections.borrow(|section| EndianSlice::new(section.as_slice(), LittleEndian));
+
+    let mut compile_units = Vec::new();
+    let mut subprograms = Vec::new();
+    let mut line_rows = Vec::new();
+    let mut unit_headers = dwarf.units();
+
+    while let Some(unit_header) = unit_headers
+        .next()
+        .map_err(|err| format!("failed to read DWARF unit header: {}", err))?
+    {
+        let unit = dwarf
+            .unit(unit_header)
+            .map_err(|err| format!("failed to read DWARF unit: {}", err))?;
+
+        let mut entries = unit.entries();
+        while let Some(entry) = entries
+            .next_dfs()
+            .map_err(|err| format!("failed to walk DWARF entries: {}", err))?
+        {
+            let Some(name_attr) = entry.attr_value(constants::DW_AT_name) else {
+                continue;
+            };
+            let name = dwarf
+                .attr_string(&unit, name_attr)
+                .map_err(|err| format!("failed to read DWARF name: {}", err))?
+                .to_string_lossy()
+                .into_owned();
+
+            match entry.tag() {
+                constants::DW_TAG_compile_unit => compile_units.push(name),
+                constants::DW_TAG_subprogram => subprograms.push(name),
+                _ => {}
+            }
+        }
+
+        if let Some(program) = unit.line_program.clone() {
+            let mut rows = program.rows();
+            while let Some((header, row)) = rows
+                .next_row()
+                .map_err(|err| format!("failed to read DWARF line row: {}", err))?
+            {
+                let Some(line) = row.line().map(|line| line.get()) else {
+                    continue;
+                };
+                let file_name = row
+                    .file(header)
+                    .map(|file| {
+                        dwarf
+                            .attr_string(&unit, file.path_name())
+                            .map_err(|err| format!("failed to read DWARF file name: {}", err))
+                    })
+                    .transpose()?
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                line_rows.push(DwarfLineRow { file_name, line });
+            }
+        }
+    }
+
+    Ok(ParsedDwarf {
+        compile_units,
+        subprograms,
+        line_rows,
+    })
+}
+
+fn assert_real_dwarf_for_function(
+    dwarf: &ParsedDwarf,
+    source_name: &str,
+    function_hint: &str,
+    expected_lines: std::ops::RangeInclusive<u64>,
+) {
+    assert!(
+        !dwarf.compile_units.is_empty(),
+        "expected at least one DWARF compile unit"
+    );
+    assert!(
+        dwarf
+            .compile_units
+            .iter()
+            .any(|name| name.contains(source_name)),
+        "expected a compile unit for source {source_name}, got {:?}",
+        dwarf.compile_units
+    );
+    assert!(
+        dwarf
+            .subprograms
+            .iter()
+            .any(|name| name.contains(function_hint)),
+        "expected a DWARF subprogram containing {function_hint:?}, got {:?}",
+        dwarf.subprograms
+    );
+    assert!(
+        dwarf.line_rows.iter().any(|row| {
+            row.file_name.contains(source_name) && expected_lines.contains(&row.line)
+        }),
+        "expected a DWARF line row for {source_name} within {:?}, got {:?}",
+        expected_lines,
+        dwarf.line_rows
+    );
 }
 
 #[test]
@@ -211,28 +369,20 @@ fn test_build_debug_sections() {
     );
 
     let wasm = std::fs::read(output_file.path()).unwrap();
-    let mut has_debug_info = false;
-    let mut has_debug_line = false;
-    let mut has_name = false;
+    let source_name = file
+        .path()
+        .file_name()
+        .expect("source file name")
+        .to_string_lossy()
+        .into_owned();
+    let debug_output = inspect_debug_output(&wasm).expect("inspect debug output");
 
-    for payload in Parser::new(0).parse_all(&wasm) {
-        match payload.expect("valid wasm payload") {
-            Payload::CustomSection(section) => {
-                if section.name() == ".debug_info" {
-                    has_debug_info = true;
-                } else if section.name() == ".debug_line" {
-                    has_debug_line = true;
-                } else if section.name() == "name" {
-                    has_name = true;
-                }
-            }
-            _ => {}
-        }
-    }
+    assert!(
+        debug_output.has_name,
+        "should emit name section for debugging"
+    );
 
-    assert!(has_debug_info, "should emit .debug_info section");
-    assert!(has_debug_line, "should emit .debug_line section");
-    assert!(has_name, "should emit name section for debugging");
+    assert_real_dwarf_for_function(&debug_output.dwarf, &source_name, "add", 3..=4);
 }
 
 #[test]
@@ -269,28 +419,15 @@ fn test_build_debug_sections_include_lambda_locations() {
     );
 
     let wasm = std::fs::read(output_file.path()).unwrap();
-    let debug_info = Parser::new(0)
-        .parse_all(&wasm)
-        .find_map(|payload| match payload.expect("valid wasm payload") {
-            Payload::CustomSection(section) if section.name() == ".debug_info" => {
-                Some(String::from_utf8(section.data().to_vec()).expect("utf8 debug info"))
-            }
-            _ => None,
-        })
-        .expect("should emit debug info payload");
+    let source_name = file
+        .path()
+        .file_name()
+        .expect("source file name")
+        .to_string_lossy()
+        .into_owned();
+    let debug_output = inspect_debug_output(&wasm).expect("inspect debug output");
 
-    assert!(
-        debug_info.starts_with("kettu-dwarf-v2\n"),
-        "expected the v2 debug payload format"
-    );
-
-    let lambda_entry = debug_info
-        .lines()
-        .find(|line| line.contains("\tlambda#0\t"))
-        .expect("expected a lambda debug symbol");
-    let parts: Vec<_> = lambda_entry.split('\t').collect();
-    assert_eq!(parts[2], "5", "lambda start line should match source");
-    assert_eq!(parts[3], "6", "lambda end line should match source");
+    assert_real_dwarf_for_function(&debug_output.dwarf, &source_name, "lambda#0", 5..=6);
 }
 
 #[test]

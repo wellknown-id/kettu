@@ -143,12 +143,22 @@ Foundation (C): `shared<dtype>` with method syntax. Sugar (B): `shared let` + `a
 
 ### Phase 16b: Debugger
 
-- [x] Source mapping to wasm — emit Kettu→wasm location map (debug info) and surface it to DAP so stepping and stack lines match optimized builds
-- [x] Integration tests for release debugging — debug a `--release` build and assert DAP stack and line mappings align with source
+- [x] Real DWARF emission for debug builds — emit parseable `.debug_abbrev`, `.debug_info`, `.debug_line`, and `.debug_str` sections for `kettu build --debug`
+- [x] Standard-DWARF DAP metadata loading — read debugger symbol ranges from emitted DWARF instead of Kettu-specific custom payloads
+- [x] Integration tests for DAP line/frame mapping — assert DAP stack and line mappings align with source for the current debugger
 - [x] Data inspection and `evaluate` support — expose closure captures and locals in the Variables pane; add `evaluate` support for simple expressions behind a flag
 - [x] Tests for captures and `evaluate` — assert captures appear in Variables and `evaluate` returns expected values
 - [x] Nested closures and multi-breakpoint flows — preserve the correct top frame and line order when stepping between nested closures and multiple breakpoints
 - [x] Tests for nested closure stepping — use a fixture with nested closures and back-to-back breakpoints, asserting frame names and monotonic line progression
+- [x] Control-flow stepping regression coverage — assert taken `if` branches are followed and unreachable breakpoints are skipped in the current DAP
+- [x] Test coverage for real DWARF output — validate with `gimli` that emitted debug builds contain real compile units, subprogram DIEs, and line rows
+- Current implementation note: `kettu build --debug` now emits DWARF-only debug metadata, and `kettu dap` reads symbol ranges from that DWARF while still using AST/trace-driven stepping rather than Wasmtime-backed execution.
+
+### Phase 16c: Real DWARF Debugging
+
+- [ ] Extend DWARF emission with lexical scopes and variable locations for functions and lambdas
+- [ ] Drive `kettu dap` from executing Wasm/Wasmtime state using real DWARF instead of AST/trace simulation
+- [ ] Add validation that `kettu build --debug` output is consumable by external DWARF-aware tooling, not just Kettu's own parser/tests
 
 [^1]: Syntactic sugar for atomic operations:
 

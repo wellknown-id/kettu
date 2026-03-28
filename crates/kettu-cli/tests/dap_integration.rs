@@ -68,6 +68,11 @@ fn nested_program_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_closure_debug.kettu")
 }
 
+fn control_program_path() -> PathBuf {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    repo_root.join("examples/control_test.kettu")
+}
+
 #[test]
 fn dap_step_in_enters_callable_closure() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_kettu"))
@@ -508,6 +513,245 @@ fn dap_exposes_captures_and_evaluate_for_callable_closure() {
     );
     assert_eq!(evaluate_resp.pointer("/body/result"), Some(&json!("15")));
     assert_eq!(evaluate_resp.pointer("/body/type"), Some(&json!("i64")));
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 99, "command": "disconnect", "arguments": {}}),
+    );
+    let _disc_resp = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("disconnect"))
+        },
+        Duration::from_secs(2),
+    );
+
+    let status = child.wait().expect("wait for dap process");
+    assert!(status.success());
+}
+
+#[test]
+fn dap_follows_taken_if_branch_and_skips_unreachable_breakpoints() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kettu"))
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn kettu dap");
+
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let stdout = child.stdout.take().expect("child stdout");
+
+    let (tx, rx) = mpsc::channel::<Value>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Some(msg) = read_dap_message(&mut reader) {
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
+    let program = control_program_path();
+    let cwd = program
+        .parent()
+        .expect("program parent")
+        .to_string_lossy()
+        .to_string();
+
+    write_dap_message(
+        &mut stdin,
+        &json!({
+            "type": "request",
+            "seq": 1,
+            "command": "initialize",
+            "arguments": {}
+        }),
+    );
+    let _init_resp = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("initialize"))
+        },
+        Duration::from_secs(2),
+    );
+
+    write_dap_message(
+        &mut stdin,
+        &json!({
+            "type": "request",
+            "seq": 2,
+            "command": "launch",
+            "arguments": {
+                "program": program.to_string_lossy(),
+                "cwd": cwd,
+                "stopOnEntry": false
+            }
+        }),
+    );
+    let _launch_resp = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("launch")),
+        Duration::from_secs(3),
+    );
+    let _initialized_event = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("initialized")),
+        Duration::from_secs(2),
+    );
+
+    write_dap_message(
+        &mut stdin,
+        &json!({
+            "type": "request",
+            "seq": 3,
+            "command": "setBreakpoints",
+            "arguments": {
+                "source": { "path": program.to_string_lossy() },
+                "breakpoints": [{ "line": 28 }, { "line": 33 }]
+            }
+        }),
+    );
+    let _bp_resp = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("setBreakpoints"))
+        },
+        Duration::from_secs(2),
+    );
+
+    write_dap_message(
+        &mut stdin,
+        &json!({
+            "type": "request",
+            "seq": 4,
+            "command": "configurationDone",
+            "arguments": {}
+        }),
+    );
+    let stop_on_entry_bp = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
+        Duration::from_secs(4),
+    );
+    assert_eq!(
+        stop_on_entry_bp.pointer("/body/reason"),
+        Some(&json!("breakpoint"))
+    );
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 5, "command": "stackTrace", "arguments": {"threadId": 1}}),
+    );
+    let stack_at_28 = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("stackTrace"))
+        },
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        stack_at_28.pointer("/body/stackFrames/0/line"),
+        Some(&json!(28))
+    );
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 6, "command": "stepIn", "arguments": {"threadId": 1}}),
+    );
+    let _stop_29 = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
+        Duration::from_secs(2),
+    );
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 7, "command": "stackTrace", "arguments": {"threadId": 1}}),
+    );
+    let stack_at_29 = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("stackTrace"))
+        },
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        stack_at_29.pointer("/body/stackFrames/0/line"),
+        Some(&json!(29))
+    );
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 8, "command": "stepIn", "arguments": {"threadId": 1}}),
+    );
+    let _stop_30 = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
+        Duration::from_secs(2),
+    );
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 9, "command": "stackTrace", "arguments": {"threadId": 1}}),
+    );
+    let stack_at_30 = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("stackTrace"))
+        },
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        stack_at_30.pointer("/body/stackFrames/0/line"),
+        Some(&json!(30))
+    );
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 10, "command": "stepIn", "arguments": {"threadId": 1}}),
+    );
+    let stop_at_taken_branch = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        stop_at_taken_branch.pointer("/body/reason"),
+        Some(&json!("step"))
+    );
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 11, "command": "stackTrace", "arguments": {"threadId": 1}}),
+    );
+    let stack_at_31 = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("stackTrace"))
+        },
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        stack_at_31.pointer("/body/stackFrames/0/line"),
+        Some(&json!(31))
+    );
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 12, "command": "continue", "arguments": {"threadId": 1}}),
+    );
+    let terminated = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("terminated")),
+        Duration::from_secs(4),
+    );
+    assert_eq!(terminated.get("event"), Some(&json!("terminated")));
 
     write_dap_message(
         &mut stdin,

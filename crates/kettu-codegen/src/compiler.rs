@@ -2,6 +2,13 @@
 //!
 //! Compiles Kettu AST (with function bodies) into a core WASM module.
 
+use gimli::write::{
+    Address, AttributeValue, DwarfUnit, EndianVec, LineProgram, LineString, Sections,
+};
+use gimli::{
+    Encoding as DwarfEncoding, Format as DwarfFormat, LineEncoding, LittleEndian, SectionId,
+    constants,
+};
 use kettu_parser::{
     BinOp, Expr, Func, FuncBody, Id, InterfaceItem, Param, Pattern, PrimitiveTy, ResourceMethod,
     SimdLane, SimdOp, Statement, StringPart, TopLevelItem, Ty, TypeDef, TypeDefKind, WitFile,
@@ -9,11 +16,12 @@ use kettu_parser::{
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::path::Path;
 use wasm_encoder::{
     CodeSection, CustomSection, DataSection, ElementSection, Elements, EntityType, ExportKind,
     ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
-    Instruction, MemorySection, MemoryType, Module, NameMap, NameSection, RefType, TableSection,
-    TableType, TypeSection, ValType,
+    Instruction, MemorySection, MemoryType, Module, NameMap, NameSection, RefType, Section,
+    TableSection, TableType, TypeSection, ValType,
 };
 
 /// Type information for a record, storing field names and their offsets
@@ -57,6 +65,8 @@ pub struct CompileOptions {
     pub keep_names: bool,
     /// Optional source text used for line mapping in debug sections
     pub debug_source: Option<String>,
+    /// Optional source path used for DWARF file metadata
+    pub debug_path: Option<String>,
 }
 
 /// Compilation error
@@ -106,6 +116,52 @@ fn offset_to_line(source: &str, offset: usize) -> usize {
         .filter(|b| *b == b'\n')
         .count()
         + 1
+}
+
+fn collect_code_section_ranges(
+    wasm: &[u8],
+    import_count: u32,
+) -> Result<HashMap<u32, Range<u64>>, CompileError> {
+    use wasmparser::{Parser, Payload};
+
+    let mut code_section_start = None;
+    let mut next_local_func = 0u32;
+    let mut ranges = HashMap::new();
+
+    for payload in Parser::new(0).parse_all(wasm) {
+        match payload.map_err(|err| CompileError {
+            message: format!("Failed to parse generated wasm for DWARF emission: {}", err),
+            span: None,
+        })? {
+            Payload::CodeSectionStart { range, .. } => {
+                code_section_start = Some(range.start);
+            }
+            Payload::CodeSectionEntry(body) => {
+                let code_section_start = code_section_start.ok_or_else(|| CompileError {
+                    message: "Missing code section while emitting DWARF".to_string(),
+                    span: None,
+                })?;
+                let operators =
+                    body.get_binary_reader_for_operators()
+                        .map_err(|err| CompileError {
+                            message: format!(
+                                "Failed to inspect generated wasm operators for DWARF emission: {}",
+                                err
+                            ),
+                            span: None,
+                        })?;
+                let low_pc = operators
+                    .original_position()
+                    .saturating_sub(code_section_start) as u64;
+                let high_pc = body.range().end.saturating_sub(code_section_start) as u64;
+                ranges.insert(import_count + next_local_func, low_pc..high_pc);
+                next_local_func += 1;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ranges)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,71 +378,159 @@ impl<'a> ModuleCompiler<'a> {
         module.section(&names);
     }
 
-    fn emit_debug_sections(&self, module: &mut Module) {
-        use std::collections::HashMap;
+    fn emit_debug_sections(&self, wasm: &mut Vec<u8>) -> Result<(), CompileError> {
+        self.emit_real_dwarf_sections(wasm)
+    }
 
-        let source = self.options.debug_source.as_deref();
+    fn emit_real_dwarf_sections(&self, wasm: &mut Vec<u8>) -> Result<(), CompileError> {
+        let source = self.options.debug_source.as_deref().unwrap_or_default();
+        let debug_path = self
+            .options
+            .debug_path
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or_else(|| Path::new("module.kettu"));
+        let file_name = debug_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("module.kettu");
+        let comp_dir = debug_path
+            .parent()
+            .and_then(|parent| parent.to_str())
+            .filter(|parent| !parent.is_empty())
+            .unwrap_or(".");
+
+        let encoding = DwarfEncoding {
+            format: DwarfFormat::Dwarf32,
+            version: 5,
+            address_size: 4,
+        };
+        let mut dwarf = DwarfUnit::new(encoding);
+        let source_file = LineString::String(file_name.as_bytes().to_vec());
+        let mut line_program = LineProgram::new(
+            encoding,
+            LineEncoding::default(),
+            LineString::String(comp_dir.as_bytes().to_vec()),
+            None,
+            source_file.clone(),
+            None,
+        );
+        let source_dir = line_program.default_directory();
+        let file_id = line_program.add_file(source_file, source_dir, None);
+        dwarf.unit.line_program = line_program;
+
+        {
+            let root_id = dwarf.unit.root();
+            let root = dwarf.unit.get_mut(root_id);
+            root.set(
+                constants::DW_AT_name,
+                AttributeValue::String(file_name.as_bytes().to_vec()),
+            );
+            root.set(
+                constants::DW_AT_comp_dir,
+                AttributeValue::String(comp_dir.as_bytes().to_vec()),
+            );
+            root.set(
+                constants::DW_AT_producer,
+                AttributeValue::String(b"kettu".to_vec()),
+            );
+        }
+
         let mut idx_to_export: HashMap<u32, &str> = HashMap::new();
         for (name, idx) in &self.exports {
             idx_to_export.insert(*idx, name);
         }
 
-        let mut entries = Vec::new();
-        // Custom debug payload format:
-        //   kettu-dwarf-v2\n
-        //   <func_idx>\t<symbol_name>\t<start_line>\t<end_line>\t<byte_offset>\n...
-        // This keeps the payload human-readable while making it robust for names
-        // that may already contain `:` or `/`, such as component export names.
-        for (idx, span) in &self.func_spans {
-            let start_line = source.map(|s| offset_to_line(s, span.start)).unwrap_or(1);
-            let end_line = source
-                .map(|s| offset_to_line(s, span.end.saturating_sub(1)))
-                .unwrap_or(start_line);
+        let code_ranges = collect_code_section_ranges(wasm, self.import_count)?;
+        let mut sorted_spans = self.func_spans.clone();
+        sorted_spans.sort_by_key(|(idx, _)| *idx);
+
+        for (idx, span) in sorted_spans {
+            let start_line = offset_to_line(source, span.start) as u64;
+            let end_line = offset_to_line(source, span.end.saturating_sub(1)) as u64;
+            let end_line = end_line.max(start_line);
             let name = self
                 .func_debug_names
-                .get(idx)
+                .get(&idx)
                 .map(String::as_str)
-                .or_else(|| idx_to_export.get(idx).copied())
+                .or_else(|| idx_to_export.get(&idx).copied())
                 .unwrap_or("<unnamed>");
-            entries.push(format!(
-                "{}\t{}\t{}\t{}\t{}",
-                idx, name, start_line, end_line, span.start
-            ));
+            let code_range = code_ranges.get(&idx).ok_or_else(|| CompileError {
+                message: format!("Missing wasm code range for debug symbol {}", name),
+                span: Some(span.clone()),
+            })?;
+            if code_range.start >= code_range.end {
+                return Err(CompileError {
+                    message: format!("Invalid wasm code range for debug symbol {}", name),
+                    span: Some(span.clone()),
+                });
+            }
+            let length = code_range.end - code_range.start;
+
+            let subprogram = dwarf
+                .unit
+                .add(dwarf.unit.root(), constants::DW_TAG_subprogram);
+            let subprogram_entry = dwarf.unit.get_mut(subprogram);
+            subprogram_entry.set(
+                constants::DW_AT_name,
+                AttributeValue::String(name.as_bytes().to_vec()),
+            );
+            subprogram_entry.set(
+                constants::DW_AT_decl_file,
+                AttributeValue::FileIndex(Some(file_id)),
+            );
+            subprogram_entry.set(
+                constants::DW_AT_decl_line,
+                AttributeValue::Udata(start_line),
+            );
+            subprogram_entry.set(
+                constants::DW_AT_low_pc,
+                AttributeValue::Address(Address::Constant(code_range.start)),
+            );
+            subprogram_entry.set(constants::DW_AT_high_pc, AttributeValue::Udata(length));
+
+            let line_program = &mut dwarf.unit.line_program;
+            line_program.begin_sequence(Some(Address::Constant(code_range.start)));
+            line_program.row().file = file_id;
+            line_program.row().line = start_line;
+            line_program.generate_row();
+
+            if end_line > start_line {
+                line_program.row().file = file_id;
+                line_program.row().line = end_line;
+                line_program.row().address_offset = length - 1;
+                line_program.generate_row();
+            }
+
+            line_program.end_sequence(length);
         }
 
-        let info_payload = format!("kettu-dwarf-v2\n{}", entries.join("\n"));
-        let info_section = CustomSection {
-            name: ".debug_info".into(),
-            data: Cow::from(info_payload.into_bytes()),
-        };
-        module.section(&info_section);
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        dwarf.write(&mut sections).map_err(|err| CompileError {
+            message: format!("Failed to emit DWARF sections: {}", err),
+            span: None,
+        })?;
 
-        let line_payload = if let Some(src) = source {
-            let mut offsets = Vec::new();
-            let mut pos = 0usize;
-            offsets.push(0);
-            for b in src.as_bytes() {
-                if *b == b'\n' {
-                    offsets.push(pos + 1);
+        sections
+            .for_each(|id, data| {
+                if data.slice().is_empty()
+                    || matches!(id, SectionId::EhFrame | SectionId::DebugFrame)
+                {
+                    return Ok(());
                 }
-                pos += 1;
-            }
-            format!(
-                "lines:{}",
-                offsets
-                    .iter()
-                    .map(|o| o.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        } else {
-            "lines:unknown".to_string()
-        };
-        let line_section = CustomSection {
-            name: ".debug_line".into(),
-            data: Cow::from(line_payload.into_bytes()),
-        };
-        module.section(&line_section);
+                CustomSection {
+                    name: id.name().into(),
+                    data: Cow::from(data.slice().to_vec()),
+                }
+                .append_to(wasm);
+                Ok::<(), CompileError>(())
+            })
+            .map_err(|err| CompileError {
+                message: format!("Failed to serialize DWARF sections: {}", err.message),
+                span: err.span,
+            })?;
+
+        Ok(())
     }
     /// Register an imported interface's functions for qualified calls
     fn register_imported_interface(
@@ -876,7 +1020,9 @@ impl<'a> ModuleCompiler<'a> {
             self.emit_name_section(&mut module);
         }
         if self.options.emit_dwarf {
-            self.emit_debug_sections(&mut module);
+            let mut wasm = module.finish();
+            self.emit_debug_sections(&mut wasm)?;
+            return Ok(wasm);
         }
 
         Ok(module.finish())

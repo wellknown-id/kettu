@@ -1,3 +1,4 @@
+use gimli::{self, DwarfSections, EndianSlice, LittleEndian, Reader, constants};
 use serde_json::{Value, json};
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -11,6 +12,8 @@ struct ListedTest {
     name: String,
     line: i64,
     end_line: i64,
+    body: Vec<kettu_parser::Statement>,
+    trace: Vec<TraceEvent>,
 }
 
 #[derive(Clone, Debug)]
@@ -21,12 +24,19 @@ struct Variable {
 }
 
 #[derive(Clone, Debug)]
+struct TraceEvent {
+    line: i64,
+    env_before: HashMap<String, SimpleValue>,
+}
+
+#[derive(Clone, Debug)]
 struct ClosureRange {
     start_line: i64,
     end_line: i64,
     name: String,
     params: Vec<String>,
     captures: Vec<String>,
+    body: kettu_parser::Expr,
     inline_invocation_line: Option<i64>,
 }
 
@@ -81,16 +91,20 @@ struct ActiveClosure {
 
 #[derive(Clone, Debug)]
 struct DebugSymbol {
-    _name: String,
     start_line: i64,
     end_line: i64,
-    _byte_offset: usize,
 }
 
 #[derive(Clone, Debug, Default)]
 struct DebugSymbols {
     functions: HashMap<String, DebugSymbol>,
     lambdas: Vec<DebugSymbol>,
+}
+
+#[derive(Clone, Debug)]
+struct DwarfLineRow {
+    address: u64,
+    line: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +144,7 @@ struct DebugSession {
     configured: bool,
     terminated: bool,
     current_test: usize,
+    current_trace_index: Option<usize>,
     current_line: i64,
     breakpoints: HashMap<String, BTreeSet<i64>>,
     active_closures: Vec<ActiveClosure>,
@@ -150,6 +165,7 @@ impl DebugSession {
             configured: false,
             terminated: false,
             current_test: 0,
+            current_trace_index: None,
             current_line: 0,
             breakpoints: HashMap::new(),
             active_closures: Vec::new(),
@@ -241,7 +257,7 @@ impl DebugSession {
                         .pop()
                         .and_then(|closure_state| closure_state.resume_line_after_closure)
                         .unwrap_or(self.current_line + 1);
-                    self.current_line = resume - 1;
+                    self.set_test_position_before_line(resume);
                     continue;
                 }
             }
@@ -251,6 +267,22 @@ impl DebugSession {
             }
 
             let test = &self.tests[self.current_test];
+            if !test.trace.is_empty() {
+                let next_index = self.current_trace_index.map_or(0, |index| index + 1);
+                if let Some(entry) = test.trace.get(next_index) {
+                    self.current_trace_index = Some(next_index);
+                    self.current_line = entry.line;
+                    return true;
+                }
+
+                self.current_test += 1;
+                self.current_trace_index = None;
+                if self.current_test >= self.tests.len() {
+                    return false;
+                }
+                self.current_line = self.tests[self.current_test].line - 1;
+                continue;
+            }
 
             if self.current_line < test.line {
                 self.current_line = test.line;
@@ -317,9 +349,14 @@ impl DebugSession {
 
     fn step_out_of_closure(&mut self) -> bool {
         if let Some(active) = self.active_closures.pop() {
-            self.current_line = active
+            let resume = active
                 .resume_line_after_closure
                 .unwrap_or(self.current_line + 1);
+            if let Some(line) = self.first_trace_line_at_or_after(resume) {
+                self.current_line = line;
+            } else {
+                self.current_line = resume;
+            }
             return true;
         }
 
@@ -330,11 +367,55 @@ impl DebugSession {
 
         false
     }
+
+    fn set_test_position_before_line(&mut self, line: i64) {
+        let Some(test) = self.tests.get(self.current_test) else {
+            self.current_line = line.saturating_sub(1);
+            self.current_trace_index = None;
+            return;
+        };
+
+        if test.trace.is_empty() {
+            self.current_line = line.saturating_sub(1);
+            self.current_trace_index = None;
+            return;
+        }
+
+        self.current_trace_index = test.trace.iter().rposition(|entry| entry.line < line);
+        self.current_line = line.saturating_sub(1);
+    }
+
+    fn first_trace_line_at_or_after(&mut self, line: i64) -> Option<i64> {
+        let Some(test) = self.tests.get(self.current_test) else {
+            self.current_trace_index = None;
+            return None;
+        };
+
+        let Some((index, entry)) = test
+            .trace
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.line >= line)
+        else {
+            self.current_trace_index = None;
+            return None;
+        };
+
+        self.current_trace_index = Some(index);
+        Some(entry.line)
+    }
 }
 
 enum StopOutcome {
     Stopped(&'static str),
     Terminated,
+}
+
+enum StatementFlow {
+    Continue,
+    Return(Option<SimpleValue>),
+    Break,
+    ContinueLoop,
 }
 
 pub fn run_server() -> io::Result<()> {
@@ -410,6 +491,7 @@ pub fn run_server() -> io::Result<()> {
                         session.configured = false;
                         session.terminated = false;
                         session.current_test = 0;
+                        session.current_trace_index = None;
                         session.current_line =
                             session.tests.first().map(|t| t.line - 1).unwrap_or(0);
                         session.active_closures.clear();
@@ -682,6 +764,7 @@ fn load_program_state(program: Option<PathBuf>) -> Result<ProgramState, String> 
     let mut closures = collect_closures_from_ast(&ast, &source);
     let debug_symbols = build_debug_symbols(&program, &source, &ast)?;
     apply_debug_symbols(&mut tests, &mut closures, &debug_symbols);
+    build_test_traces(&mut tests, &closures, &source);
 
     Ok(ProgramState {
         source_text: source.clone(),
@@ -857,6 +940,12 @@ fn list_tests_from_ast(ast: &kettu_parser::WitFile, source: &str) -> Vec<ListedT
                         name: func.name.name.clone(),
                         line: offset_to_line(source, func.span.start) as i64,
                         end_line: offset_to_line(source, func.span.end) as i64,
+                        body: func
+                            .body
+                            .as_ref()
+                            .map(|body| body.statements.clone())
+                            .unwrap_or_default(),
+                        trace: Vec::new(),
                     });
                 }
             }
@@ -1056,6 +1145,7 @@ fn collect_closures_from_expr(
                     .iter()
                     .map(|capture| capture.name.clone())
                     .collect(),
+                body: body.as_ref().clone(),
                 inline_invocation_line,
             });
             collect_closures_from_expr(body, source, closures, None);
@@ -1275,6 +1365,7 @@ fn build_debug_symbols(
         emit_dwarf: true,
         keep_names: true,
         debug_source: Some(source.to_string()),
+        debug_path: Some(program.display().to_string()),
     };
 
     let wasm = if imported_asts.is_empty() {
@@ -1292,87 +1383,157 @@ fn build_debug_symbols(
 }
 
 fn parse_debug_symbols(wasm: &[u8]) -> Result<DebugSymbols, String> {
-    let mut symbols = DebugSymbols::default();
+    let mut sections = HashMap::new();
 
     for payload in Parser::new(0).parse_all(wasm) {
         match payload.map_err(|err| format!("Invalid debug wasm payload: {}", err))? {
-            Payload::CustomSection(section) if section.name() == ".debug_info" => {
-                let payload = std::str::from_utf8(section.data())
-                    .map_err(|err| format!("Invalid UTF-8 in .debug_info section: {}", err))?;
-                parse_debug_info_payload(payload, &mut symbols)?;
+            Payload::CustomSection(section) if section.name().starts_with(".debug_") => {
+                sections.insert(section.name().to_owned(), section.data().to_vec());
             }
             _ => {}
+        }
+    }
+
+    for required in [".debug_abbrev", ".debug_info", ".debug_line"] {
+        if !sections.contains_key(required) {
+            return Err(format!("Missing required DWARF section: {}", required));
+        }
+    }
+
+    let dwarf_sections = DwarfSections::load(|id| -> Result<Vec<u8>, gimli::Error> {
+        Ok(sections.get(id.name()).cloned().unwrap_or_default())
+    })
+    .map_err(|err| format!("Failed to load DWARF sections: {}", err))?;
+    let dwarf = dwarf_sections.borrow(|section| EndianSlice::new(section.as_slice(), LittleEndian));
+
+    let mut symbols = DebugSymbols::default();
+    let mut unit_headers = dwarf.units();
+    while let Some(unit_header) = unit_headers
+        .next()
+        .map_err(|err| format!("Failed to read DWARF unit header: {}", err))?
+    {
+        let unit = dwarf
+            .unit(unit_header)
+            .map_err(|err| format!("Failed to read DWARF unit: {}", err))?;
+        let line_rows = collect_dwarf_line_rows(&unit)
+            .map_err(|err| format!("Failed to read DWARF line rows: {}", err))?;
+
+        let mut entries = unit.entries();
+        while let Some(entry) = entries
+            .next_dfs()
+            .map_err(|err| format!("Failed to walk DWARF entries: {}", err))?
+        {
+            if entry.tag() != constants::DW_TAG_subprogram {
+                continue;
+            }
+
+            let Some(name_attr) = entry.attr_value(constants::DW_AT_name) else {
+                continue;
+            };
+            let name = dwarf
+                .attr_string(&unit, name_attr)
+                .map_err(|err| format!("Failed to read DWARF symbol name: {}", err))?
+                .to_string_lossy()
+                .into_owned();
+
+            let start_line = entry
+                .attr_value(constants::DW_AT_decl_line)
+                .and_then(attribute_u64)
+                .map(|line| line as i64)
+                .unwrap_or(1);
+            let low_pc = entry
+                .attr_value(constants::DW_AT_low_pc)
+                .and_then(attribute_address);
+            let high_pc = entry
+                .attr_value(constants::DW_AT_high_pc)
+                .and_then(|value| attribute_range_end(value, low_pc));
+            let end_line = max_line_for_range(&line_rows, low_pc, high_pc).unwrap_or(start_line);
+
+            register_debug_symbol(&mut symbols, name, start_line, end_line);
         }
     }
 
     Ok(symbols)
 }
 
-fn parse_debug_info_payload(payload: &str, symbols: &mut DebugSymbols) -> Result<(), String> {
-    if let Some(rest) = payload.strip_prefix("kettu-dwarf-v2\n") {
-        for line in rest.lines().filter(|line| !line.trim().is_empty()) {
-            let parts: Vec<_> = line.splitn(5, '\t').collect();
-            if parts.len() != 5 {
-                return Err(format!("Malformed .debug_info entry: {}", line));
-            }
-
-            let name = parts[1].to_string();
-            let start_line = parts[2]
-                .parse::<i64>()
-                .map_err(|_| format!("Invalid debug line entry: {}", line))?;
-            let end_line = parts[3]
-                .parse::<i64>()
-                .map_err(|_| format!("Invalid debug end-line entry: {}", line))?;
-            let byte_offset = parts[4]
-                .parse::<usize>()
-                .map_err(|_| format!("Invalid debug byte offset entry: {}", line))?;
-
-            register_debug_symbol(symbols, name, start_line, end_line, byte_offset);
-        }
-
-        return Ok(());
-    }
-
-    if let Some(rest) = payload.strip_prefix("kettu-dwarf\n") {
-        for line in rest.lines().filter(|line| !line.trim().is_empty()) {
-            let mut tail = line.rsplitn(3, ':');
-            let byte_offset = tail
-                .next()
-                .ok_or_else(|| format!("Malformed legacy .debug_info entry: {}", line))?
-                .parse::<usize>()
-                .map_err(|_| format!("Invalid legacy debug byte offset entry: {}", line))?;
-            let start_line = tail
-                .next()
-                .ok_or_else(|| format!("Malformed legacy .debug_info entry: {}", line))?
-                .parse::<i64>()
-                .map_err(|_| format!("Invalid legacy debug line entry: {}", line))?;
-            let head = tail
-                .next()
-                .ok_or_else(|| format!("Malformed legacy .debug_info entry: {}", line))?;
-            let mut head_parts = head.splitn(2, ':');
-            let _ = head_parts
-                .next()
-                .ok_or_else(|| format!("Malformed legacy .debug_info entry: {}", line))?;
-            let name = head_parts.next().unwrap_or("<unnamed>").to_string();
-            register_debug_symbol(symbols, name, start_line, start_line, byte_offset);
+fn collect_dwarf_line_rows<R: Reader>(
+    unit: &gimli::Unit<R>,
+) -> Result<Vec<DwarfLineRow>, gimli::Error> {
+    let mut line_rows = Vec::new();
+    if let Some(program) = unit.line_program.clone() {
+        let mut rows = program.rows();
+        while let Some((_, row)) = rows.next_row()? {
+            let Some(line) = row.line().map(|line| line.get() as i64) else {
+                continue;
+            };
+            line_rows.push(DwarfLineRow {
+                address: row.address(),
+                line,
+            });
         }
     }
-
-    Ok(())
+    Ok(line_rows)
 }
 
-fn register_debug_symbol(
-    symbols: &mut DebugSymbols,
-    name: String,
-    start_line: i64,
-    end_line: i64,
-    byte_offset: usize,
-) {
+fn attribute_u64<R: Reader>(value: gimli::AttributeValue<R>) -> Option<u64> {
+    match value {
+        gimli::AttributeValue::Udata(value) => Some(value),
+        gimli::AttributeValue::Data1(value) => Some(value.into()),
+        gimli::AttributeValue::Data2(value) => Some(value.into()),
+        gimli::AttributeValue::Data4(value) => Some(value.into()),
+        gimli::AttributeValue::Data8(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn attribute_address<R: Reader>(value: gimli::AttributeValue<R>) -> Option<u64> {
+    match value {
+        gimli::AttributeValue::Addr(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn attribute_range_end<R: Reader>(
+    value: gimli::AttributeValue<R>,
+    low_pc: Option<u64>,
+) -> Option<u64> {
+    match value {
+        gimli::AttributeValue::Addr(value) => Some(value),
+        gimli::AttributeValue::Udata(length) => low_pc.map(|low| low + length),
+        gimli::AttributeValue::Data1(length) => low_pc.map(|low| low + u64::from(length)),
+        gimli::AttributeValue::Data2(length) => low_pc.map(|low| low + u64::from(length)),
+        gimli::AttributeValue::Data4(length) => low_pc.map(|low| low + u64::from(length)),
+        gimli::AttributeValue::Data8(length) => low_pc.map(|low| low + length),
+        _ => None,
+    }
+}
+
+fn max_line_for_range(
+    line_rows: &[DwarfLineRow],
+    low_pc: Option<u64>,
+    high_pc: Option<u64>,
+) -> Option<i64> {
+    line_rows
+        .iter()
+        .filter(|row| {
+            let after_start = match low_pc {
+                Some(low_pc) => row.address >= low_pc,
+                None => true,
+            };
+            let before_end = match high_pc {
+                Some(high_pc) => row.address < high_pc,
+                None => true,
+            };
+            after_start && before_end
+        })
+        .map(|row| row.line)
+        .max()
+}
+
+fn register_debug_symbol(symbols: &mut DebugSymbols, name: String, start_line: i64, end_line: i64) {
     let symbol = DebugSymbol {
-        _name: name.clone(),
         start_line,
         end_line,
-        _byte_offset: byte_offset,
     };
 
     if name.starts_with("lambda#") {
@@ -1408,6 +1569,501 @@ fn apply_debug_symbols(
             closure.start_line = symbol.start_line;
             closure.end_line = symbol.end_line;
         }
+    }
+}
+
+fn build_test_traces(tests: &mut [ListedTest], closures: &[ClosureRange], source: &str) {
+    for test in tests {
+        let mut env = HashMap::new();
+        let mut trace = Vec::new();
+        let _ = simulate_statements(&test.body, closures, source, &mut env, &mut trace, true);
+        if let Some(first) = trace.first() {
+            test.line = first.line;
+        }
+        if let Some(last) = trace.last() {
+            test.end_line = test.end_line.max(last.line);
+        }
+        test.trace = trace;
+    }
+}
+
+fn simulate_statements(
+    statements: &[kettu_parser::Statement],
+    closures: &[ClosureRange],
+    source: &str,
+    env: &mut HashMap<String, SimpleValue>,
+    trace: &mut Vec<TraceEvent>,
+    tail_returns: bool,
+) -> StatementFlow {
+    for (index, statement) in statements.iter().enumerate() {
+        let is_tail = tail_returns && index + 1 == statements.len();
+        match simulate_statement(statement, closures, source, env, trace, is_tail) {
+            StatementFlow::Continue => {}
+            flow => return flow,
+        }
+    }
+
+    StatementFlow::Continue
+}
+
+fn simulate_statement(
+    statement: &kettu_parser::Statement,
+    closures: &[ClosureRange],
+    source: &str,
+    env: &mut HashMap<String, SimpleValue>,
+    trace: &mut Vec<TraceEvent>,
+    is_tail: bool,
+) -> StatementFlow {
+    match statement {
+        kettu_parser::Statement::Expr(expr) => {
+            simulate_expr_statement(expr, closures, source, env, trace, is_tail)
+        }
+        kettu_parser::Statement::Let { name, value } => {
+            record_trace_event(trace, offset_to_line(source, name.span.start) as i64, env);
+            env.insert(
+                name.name.clone(),
+                evaluate_ast_expr(value, closures, source, env),
+            );
+            StatementFlow::Continue
+        }
+        kettu_parser::Statement::Return(Some(expr)) => {
+            record_trace_event(trace, expr_start_line(expr, source), env);
+            StatementFlow::Return(Some(evaluate_ast_expr(expr, closures, source, env)))
+        }
+        kettu_parser::Statement::Return(None) => {
+            record_trace_event(trace, 0, env);
+            StatementFlow::Return(None)
+        }
+        kettu_parser::Statement::Assign { name, value } => {
+            record_trace_event(trace, offset_to_line(source, name.span.start) as i64, env);
+            env.insert(
+                name.name.clone(),
+                evaluate_ast_expr(value, closures, source, env),
+            );
+            StatementFlow::Continue
+        }
+        kettu_parser::Statement::CompoundAssign { name, op, value } => {
+            record_trace_event(trace, offset_to_line(source, name.span.start) as i64, env);
+            let current = env
+                .get(&name.name)
+                .cloned()
+                .unwrap_or_else(|| SimpleValue::Unknown(name.name.clone()));
+            let rhs = evaluate_ast_expr(value, closures, source, env);
+            env.insert(
+                name.name.clone(),
+                apply_binary_op(current, rhs, bin_op_symbol(*op))
+                    .unwrap_or_else(|_| SimpleValue::Unknown(name.name.clone())),
+            );
+            StatementFlow::Continue
+        }
+        kettu_parser::Statement::Break { condition } => {
+            let line = condition
+                .as_deref()
+                .map(|expr| expr_start_line(expr, source))
+                .unwrap_or(0);
+            record_trace_event(trace, line, env);
+            match condition.as_deref() {
+                Some(expr) => match evaluate_ast_expr(expr, closures, source, env) {
+                    SimpleValue::Bool(true) => StatementFlow::Break,
+                    _ => StatementFlow::Continue,
+                },
+                None => StatementFlow::Break,
+            }
+        }
+        kettu_parser::Statement::Continue { condition } => {
+            let line = condition
+                .as_deref()
+                .map(|expr| expr_start_line(expr, source))
+                .unwrap_or(0);
+            record_trace_event(trace, line, env);
+            match condition.as_deref() {
+                Some(expr) => match evaluate_ast_expr(expr, closures, source, env) {
+                    SimpleValue::Bool(true) => StatementFlow::ContinueLoop,
+                    _ => StatementFlow::Continue,
+                },
+                None => StatementFlow::ContinueLoop,
+            }
+        }
+        kettu_parser::Statement::SharedLet {
+            name,
+            initial_value,
+        } => {
+            record_trace_event(trace, offset_to_line(source, name.span.start) as i64, env);
+            env.insert(
+                name.name.clone(),
+                evaluate_ast_expr(initial_value, closures, source, env),
+            );
+            StatementFlow::Continue
+        }
+        kettu_parser::Statement::Guard {
+            condition,
+            else_body,
+        } => {
+            record_trace_event(trace, expr_start_line(condition, source), env);
+            match evaluate_ast_expr(condition, closures, source, env) {
+                SimpleValue::Bool(true) => StatementFlow::Continue,
+                _ => simulate_statements(else_body, closures, source, env, trace, is_tail),
+            }
+        }
+        kettu_parser::Statement::GuardLet {
+            name,
+            value,
+            else_body,
+        } => {
+            record_trace_event(trace, offset_to_line(source, name.span.start) as i64, env);
+            let evaluated = evaluate_ast_expr(value, closures, source, env);
+            if matches!(evaluated, SimpleValue::Unknown(_)) {
+                simulate_statements(else_body, closures, source, env, trace, is_tail)
+            } else {
+                env.insert(name.name.clone(), evaluated);
+                StatementFlow::Continue
+            }
+        }
+    }
+}
+
+fn simulate_expr_statement(
+    expr: &kettu_parser::Expr,
+    closures: &[ClosureRange],
+    source: &str,
+    env: &mut HashMap<String, SimpleValue>,
+    trace: &mut Vec<TraceEvent>,
+    is_tail: bool,
+) -> StatementFlow {
+    match expr {
+        kettu_parser::Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            record_trace_event(trace, expr_start_line(expr, source), env);
+            match evaluate_ast_expr(cond, closures, source, env) {
+                SimpleValue::Bool(true) => {
+                    simulate_statements(then_branch, closures, source, env, trace, is_tail)
+                }
+                SimpleValue::Bool(false) => simulate_statements(
+                    else_branch.as_deref().unwrap_or(&[]),
+                    closures,
+                    source,
+                    env,
+                    trace,
+                    is_tail,
+                ),
+                _ => simulate_statements(then_branch, closures, source, env, trace, is_tail),
+            }
+        }
+        kettu_parser::Expr::While {
+            condition, body, ..
+        } => loop {
+            record_trace_event(trace, expr_start_line(expr, source), env);
+            match evaluate_ast_expr(condition, closures, source, env) {
+                SimpleValue::Bool(true) => {
+                    match simulate_statements(body, closures, source, env, trace, false) {
+                        StatementFlow::Continue => continue,
+                        StatementFlow::Break => return StatementFlow::Continue,
+                        StatementFlow::ContinueLoop => continue,
+                        flow => return flow,
+                    }
+                }
+                SimpleValue::Bool(false) => return StatementFlow::Continue,
+                _ => return StatementFlow::Continue,
+            }
+        },
+        kettu_parser::Expr::For {
+            variable,
+            range,
+            body,
+            ..
+        } => {
+            record_trace_event(trace, expr_start_line(expr, source), env);
+            if let Some(values) = evaluate_range_values(range, closures, source, env) {
+                for value in values {
+                    env.insert(variable.name.clone(), SimpleValue::Int(value));
+                    match simulate_statements(body, closures, source, env, trace, false) {
+                        StatementFlow::Continue => {}
+                        StatementFlow::Break => break,
+                        StatementFlow::ContinueLoop => continue,
+                        flow => return flow,
+                    }
+                }
+            }
+            StatementFlow::Continue
+        }
+        kettu_parser::Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            record_trace_event(trace, expr_start_line(expr, source), env);
+            let scrutinee = evaluate_ast_expr(scrutinee, closures, source, env);
+            if let Some(arm) = select_match_arm(arms, &scrutinee, closures, source, env) {
+                simulate_statements(&arm.body, closures, source, env, trace, is_tail)
+            } else {
+                StatementFlow::Continue
+            }
+        }
+        _ => {
+            record_trace_event(trace, expr_start_line(expr, source), env);
+            let value = evaluate_ast_expr(expr, closures, source, env);
+            if is_tail {
+                StatementFlow::Return(Some(value))
+            } else {
+                StatementFlow::Continue
+            }
+        }
+    }
+}
+
+fn evaluate_ast_expr(
+    expr: &kettu_parser::Expr,
+    closures: &[ClosureRange],
+    source: &str,
+    env: &HashMap<String, SimpleValue>,
+) -> SimpleValue {
+    match expr {
+        kettu_parser::Expr::Ident(id) => env
+            .get(&id.name)
+            .cloned()
+            .unwrap_or_else(|| SimpleValue::Unknown(id.name.clone())),
+        kettu_parser::Expr::Integer(value, _) => SimpleValue::Int(*value),
+        kettu_parser::Expr::String(value, _) => SimpleValue::String(value.clone()),
+        kettu_parser::Expr::Bool(value, _) => SimpleValue::Bool(*value),
+        kettu_parser::Expr::InterpolatedString(parts, _) => {
+            let mut result = String::new();
+            for part in parts {
+                match part {
+                    kettu_parser::StringPart::Literal(value) => result.push_str(value),
+                    kettu_parser::StringPart::Expr(expr) => {
+                        result.push_str(&evaluate_ast_expr(expr, closures, source, env).display())
+                    }
+                }
+            }
+            SimpleValue::String(result)
+        }
+        kettu_parser::Expr::Binary { lhs, op, rhs, .. } => apply_binary_op(
+            evaluate_ast_expr(lhs, closures, source, env),
+            evaluate_ast_expr(rhs, closures, source, env),
+            bin_op_symbol(*op),
+        )
+        .unwrap_or_else(|_| SimpleValue::Unknown("<binary>".to_string())),
+        kettu_parser::Expr::Not(inner, _) => {
+            match evaluate_ast_expr(inner, closures, source, env) {
+                SimpleValue::Bool(value) => SimpleValue::Bool(!value),
+                _ => SimpleValue::Unknown("<not>".to_string()),
+            }
+        }
+        kettu_parser::Expr::Neg(inner, _) => {
+            match evaluate_ast_expr(inner, closures, source, env) {
+                SimpleValue::Int(value) => SimpleValue::Int(-value),
+                SimpleValue::Float(value) => SimpleValue::Float(-value),
+                _ => SimpleValue::Unknown("<neg>".to_string()),
+            }
+        }
+        kettu_parser::Expr::Assert(inner, _) => evaluate_ast_expr(inner, closures, source, env),
+        kettu_parser::Expr::StrLen(inner, _) => {
+            match evaluate_ast_expr(inner, closures, source, env) {
+                SimpleValue::String(value) => SimpleValue::Int(value.len() as i64),
+                _ => SimpleValue::Unknown("<str-len>".to_string()),
+            }
+        }
+        kettu_parser::Expr::StrEq(lhs, rhs, _) => {
+            let lhs = evaluate_ast_expr(lhs, closures, source, env);
+            let rhs = evaluate_ast_expr(rhs, closures, source, env);
+            SimpleValue::Bool(lhs == rhs)
+        }
+        kettu_parser::Expr::Call { func, args, .. } => {
+            if let kettu_parser::Expr::Ident(id) = func.as_ref() {
+                if let Some(closure) = closures
+                    .iter()
+                    .rev()
+                    .find(|closure| closure.name == id.name)
+                {
+                    let mut closure_env = env.clone();
+                    for (param, arg) in closure.params.iter().zip(args.iter()) {
+                        closure_env
+                            .insert(param.clone(), evaluate_ast_expr(arg, closures, source, env));
+                    }
+                    return evaluate_ast_expr(&closure.body, closures, source, &closure_env);
+                }
+            }
+            SimpleValue::Unknown("<call>".to_string())
+        }
+        kettu_parser::Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => match evaluate_ast_expr(cond, closures, source, env) {
+            SimpleValue::Bool(true) => {
+                evaluate_tail_block_value(then_branch, closures, source, env)
+            }
+            SimpleValue::Bool(false) => evaluate_tail_block_value(
+                else_branch.as_deref().unwrap_or(&[]),
+                closures,
+                source,
+                env,
+            ),
+            _ => SimpleValue::Unknown("<if>".to_string()),
+        },
+        _ => SimpleValue::Unknown("<expr>".to_string()),
+    }
+}
+
+fn evaluate_tail_block_value(
+    statements: &[kettu_parser::Statement],
+    closures: &[ClosureRange],
+    source: &str,
+    env: &HashMap<String, SimpleValue>,
+) -> SimpleValue {
+    let mut env = env.clone();
+    let mut trace = Vec::new();
+    match simulate_statements(statements, closures, source, &mut env, &mut trace, true) {
+        StatementFlow::Return(Some(value)) => value,
+        _ => SimpleValue::Unknown("<block>".to_string()),
+    }
+}
+
+fn evaluate_range_values(
+    range: &kettu_parser::Expr,
+    closures: &[ClosureRange],
+    source: &str,
+    env: &HashMap<String, SimpleValue>,
+) -> Option<Vec<i64>> {
+    let kettu_parser::Expr::Range {
+        start,
+        end,
+        step,
+        descending,
+        ..
+    } = range
+    else {
+        return None;
+    };
+
+    let start = match evaluate_ast_expr(start, closures, source, env) {
+        SimpleValue::Int(value) => value,
+        _ => return None,
+    };
+    let end = match evaluate_ast_expr(end, closures, source, env) {
+        SimpleValue::Int(value) => value,
+        _ => return None,
+    };
+    let step = match step {
+        Some(step) => match evaluate_ast_expr(step, closures, source, env) {
+            SimpleValue::Int(value) if value > 0 => value,
+            _ => return None,
+        },
+        None => 1,
+    };
+
+    let mut values = Vec::new();
+    if *descending {
+        let mut current = start;
+        while current >= end {
+            values.push(current);
+            current -= step;
+        }
+    } else {
+        let mut current = start;
+        while current <= end {
+            values.push(current);
+            current += step;
+        }
+    }
+
+    Some(values)
+}
+
+fn select_match_arm<'a>(
+    arms: &'a [kettu_parser::MatchArm],
+    scrutinee: &SimpleValue,
+    closures: &[ClosureRange],
+    source: &str,
+    env: &HashMap<String, SimpleValue>,
+) -> Option<&'a kettu_parser::MatchArm> {
+    arms.iter().find(|arm| match &arm.pattern {
+        kettu_parser::Pattern::Wildcard(_) => true,
+        kettu_parser::Pattern::Literal(expr) => {
+            evaluate_ast_expr(expr, closures, source, env) == *scrutinee
+        }
+        kettu_parser::Pattern::Variant { .. } => false,
+    })
+}
+
+fn record_trace_event(trace: &mut Vec<TraceEvent>, line: i64, env: &HashMap<String, SimpleValue>) {
+    if line <= 0 {
+        return;
+    }
+    trace.push(TraceEvent {
+        line,
+        env_before: env.clone(),
+    });
+}
+
+fn expr_start_line(expr: &kettu_parser::Expr, source: &str) -> i64 {
+    match expr {
+        kettu_parser::Expr::Ident(id) => offset_to_line(source, id.span.start) as i64,
+        kettu_parser::Expr::Integer(_, span)
+        | kettu_parser::Expr::String(_, span)
+        | kettu_parser::Expr::InterpolatedString(_, span)
+        | kettu_parser::Expr::Bool(_, span)
+        | kettu_parser::Expr::Call { span, .. }
+        | kettu_parser::Expr::Field { span, .. }
+        | kettu_parser::Expr::OptionalChain { span, .. }
+        | kettu_parser::Expr::Try { span, .. }
+        | kettu_parser::Expr::Binary { span, .. }
+        | kettu_parser::Expr::If { span, .. }
+        | kettu_parser::Expr::Assert(_, span)
+        | kettu_parser::Expr::Not(_, span)
+        | kettu_parser::Expr::Neg(_, span)
+        | kettu_parser::Expr::StrLen(_, span)
+        | kettu_parser::Expr::StrEq(_, _, span)
+        | kettu_parser::Expr::ListLen(_, span)
+        | kettu_parser::Expr::ListSet(_, _, _, span)
+        | kettu_parser::Expr::ListPush(_, _, span)
+        | kettu_parser::Expr::Lambda { span, .. }
+        | kettu_parser::Expr::Map { span, .. }
+        | kettu_parser::Expr::Filter { span, .. }
+        | kettu_parser::Expr::Reduce { span, .. }
+        | kettu_parser::Expr::RecordLiteral { span, .. }
+        | kettu_parser::Expr::VariantLiteral { span, .. }
+        | kettu_parser::Expr::Match { span, .. }
+        | kettu_parser::Expr::While { span, .. }
+        | kettu_parser::Expr::Range { span, .. }
+        | kettu_parser::Expr::For { span, .. }
+        | kettu_parser::Expr::ListLiteral { span, .. }
+        | kettu_parser::Expr::Index { span, .. }
+        | kettu_parser::Expr::Slice { span, .. }
+        | kettu_parser::Expr::ForEach { span, .. }
+        | kettu_parser::Expr::Await { span, .. }
+        | kettu_parser::Expr::AtomicLoad { span, .. }
+        | kettu_parser::Expr::AtomicStore { span, .. }
+        | kettu_parser::Expr::AtomicAdd { span, .. }
+        | kettu_parser::Expr::AtomicSub { span, .. }
+        | kettu_parser::Expr::AtomicCmpxchg { span, .. }
+        | kettu_parser::Expr::AtomicWait { span, .. }
+        | kettu_parser::Expr::AtomicNotify { span, .. }
+        | kettu_parser::Expr::Spawn { span, .. }
+        | kettu_parser::Expr::ThreadJoin { span, .. }
+        | kettu_parser::Expr::AtomicBlock { span, .. }
+        | kettu_parser::Expr::SimdOp { span, .. }
+        | kettu_parser::Expr::SimdForEach { span, .. } => offset_to_line(source, span.start) as i64,
+    }
+}
+
+fn bin_op_symbol(op: kettu_parser::BinOp) -> &'static str {
+    match op {
+        kettu_parser::BinOp::Add => "+",
+        kettu_parser::BinOp::Sub => "-",
+        kettu_parser::BinOp::Mul => "*",
+        kettu_parser::BinOp::Div => "/",
+        kettu_parser::BinOp::Eq => "==",
+        kettu_parser::BinOp::Ne => "!=",
+        kettu_parser::BinOp::Lt => "<",
+        kettu_parser::BinOp::Le => "<=",
+        kettu_parser::BinOp::Gt => ">",
+        kettu_parser::BinOp::Ge => ">=",
+        kettu_parser::BinOp::And => "&&",
+        kettu_parser::BinOp::Or => "||",
     }
 }
 
@@ -1680,6 +2336,20 @@ fn test_environment_for_line(session: &DebugSession, line: i64) -> HashMap<Strin
     else {
         return HashMap::new();
     };
+
+    if !test.trace.is_empty() {
+        if line == session.current_line {
+            if let Some(index) = session.current_trace_index {
+                if let Some(entry) = test.trace.get(index) {
+                    return entry.env_before.clone();
+                }
+            }
+        }
+
+        if let Some(entry) = test.trace.iter().find(|entry| entry.line == line) {
+            return entry.env_before.clone();
+        }
+    }
 
     infer_values_in_range(&session.source_lines, test.line, line, &HashMap::new())
 }
@@ -2483,6 +3153,8 @@ mod tests {
             name: "t".to_string(),
             line: 10,
             end_line: 12,
+            body: Vec::new(),
+            trace: Vec::new(),
         }];
         session.current_line = 9;
 
@@ -2539,6 +3211,8 @@ mod tests {
             name: "t".into(),
             line: 4,
             end_line: 10,
+            body: Vec::new(),
+            trace: Vec::new(),
         }];
         session.current_line = 6; // inside closure
         session.closures = closures.clone();

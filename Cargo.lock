@@ -851,6 +851,7 @@ name = "kettu-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "gimli",
  "kettu-checker",
  "kettu-codegen",
  "kettu-lsp",
@@ -867,6 +868,7 @@ dependencies = [
 name = "kettu-codegen"
 version = "0.1.0"
 dependencies = [
+ "gimli",
  "kettu-checker",
  "kettu-parser",
  "wasm-encoder 0.245.1",

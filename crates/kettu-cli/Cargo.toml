@@ -18,6 +18,7 @@ clap.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 wasmparser.workspace = true
+gimli = "0.33.0"
 wasmtime = { version = "43.0.0", default-features = false, features = ["cranelift", "runtime", "std", "threads"] }
 walkdir = "2"
 

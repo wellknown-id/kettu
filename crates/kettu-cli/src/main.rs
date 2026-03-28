@@ -286,6 +286,7 @@ async fn main() {
                 emit_dwarf: debug,
                 keep_names: keep_names || debug,
                 debug_source: Some(content.clone()),
+                debug_path: Some(file.display().to_string()),
             };
 
             let wasm = if core {
@@ -654,6 +655,7 @@ fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -
         emit_dwarf: false,
         keep_names: false,
         debug_source: Some(content.clone()),
+        debug_path: Some(file.display().to_string()),
     };
 
     let wasm_bytes = match kettu_codegen::build_core_module(&ast, &compile_options) {
