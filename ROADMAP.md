@@ -114,6 +114,7 @@ Foundation (C): `shared<dtype>` with method syntax. Sugar (B): `shared let` + `a
 ### Phase 15: Auto-Vectorization
 
 - [ ] Loop analysis — detect induction variables, trip counts, memory access patterns
+  - [x] Groundwork in codegen for literal range steps/trip counts and contiguous `for item in list` access facts
 - [ ] Dependence analysis — prove iterations are independent (no loop-carried deps)
 - [ ] Cost model — decide if vectorization is profitable
 - [ ] Automatic rewrite of scalar `for item in list` loops to SIMD when safe

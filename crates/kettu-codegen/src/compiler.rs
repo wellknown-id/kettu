@@ -108,6 +108,107 @@ fn offset_to_line(source: &str, offset: usize) -> usize {
         + 1
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoopTripCount {
+    Constant(u32),
+    CollectionLength,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MemoryAccessPattern {
+    ContiguousElements { element_stride_bytes: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RangeLoopAnalysis {
+    induction_variable: String,
+    descending: bool,
+    constant_step: Option<i32>,
+    trip_count: Option<LoopTripCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForEachLoopAnalysis {
+    induction_variable: String,
+    trip_count: LoopTripCount,
+    memory_access: MemoryAccessPattern,
+}
+
+fn const_i32_expr(expr: &Expr) -> Option<i32> {
+    match expr {
+        Expr::Integer(value, _) if *value >= i32::MIN as i64 && *value <= i32::MAX as i64 => {
+            Some(*value as i32)
+        }
+        _ => None,
+    }
+}
+
+fn compute_range_trip_count(start: i32, end: i32, step: i32, descending: bool) -> Option<u32> {
+    if step <= 0 {
+        return None;
+    }
+
+    let distance = if descending {
+        end.checked_sub(start)?.checked_neg()?
+    } else {
+        end.checked_sub(start)?
+    };
+
+    if distance < 0 {
+        return Some(0);
+    }
+
+    let step = i64::from(step);
+    let distance = i64::from(distance);
+    Some((distance / step + 1) as u32)
+}
+
+fn analyze_range_loop(induction_variable: &str, range: &Expr) -> Option<RangeLoopAnalysis> {
+    let Expr::Range {
+        start,
+        end,
+        step,
+        descending,
+        ..
+    } = range
+    else {
+        return None;
+    };
+
+    let constant_step = match step.as_deref() {
+        Some(step_expr) => const_i32_expr(step_expr),
+        None => Some(1),
+    };
+
+    let trip_count = match (
+        const_i32_expr(start),
+        const_i32_expr(end),
+        constant_step,
+    ) {
+        (Some(start), Some(end), Some(step)) => {
+            compute_range_trip_count(start, end, step, *descending).map(LoopTripCount::Constant)
+        }
+        _ => None,
+    };
+
+    Some(RangeLoopAnalysis {
+        induction_variable: induction_variable.to_string(),
+        descending: *descending,
+        constant_step,
+        trip_count,
+    })
+}
+
+fn analyze_for_each_loop(induction_variable: &str, _collection: &Expr) -> ForEachLoopAnalysis {
+    ForEachLoopAnalysis {
+        induction_variable: induction_variable.to_string(),
+        trip_count: LoopTripCount::CollectionLength,
+        memory_access: MemoryAccessPattern::ContiguousElements {
+            element_stride_bytes: 4,
+        },
+    }
+}
+
 struct ModuleCompiler<'a> {
     options: &'a CompileOptions,
     /// Type index -> (params, results)
@@ -4330,17 +4431,28 @@ impl<'a> ModuleCompiler<'a> {
                 //   )
                 // )
 
+                let analysis = analyze_range_loop(&variable.name, range.as_ref());
+                if matches!(
+                    analysis.as_ref().and_then(|facts| facts.trip_count.as_ref()),
+                    Some(&LoopTripCount::Constant(0))
+                ) {
+                    function.instruction(&Instruction::I32Const(0));
+                    return Ok(());
+                }
+
                 // Extract start, end, step, and descending from range
                 if let Expr::Range {
                     start,
                     end,
                     step,
-                    descending,
                     ..
                 } = range.as_ref()
                 {
+                    let analysis = analysis.expect("range loop analysis should succeed");
                     // Get loop variable index
-                    let var_idx = *locals.get(&variable.name).expect("loop variable not found");
+                    let var_idx = *locals
+                        .get(&analysis.induction_variable)
+                        .expect("loop variable not found");
 
                     // Compile and store start value to loop variable
                     self.compile_expr_with_locals(function, start, locals, locals_types)?;
@@ -4362,7 +4474,7 @@ impl<'a> ModuleCompiler<'a> {
                     // Check termination condition based on direction
                     function.instruction(&Instruction::LocalGet(var_idx));
                     self.compile_expr_with_locals(function, end, locals, locals_types)?;
-                    if *descending {
+                    if analysis.descending {
                         // For downto: break if i < end
                         function.instruction(&Instruction::I32LtS);
                     } else {
@@ -4471,12 +4583,14 @@ impl<'a> ModuleCompiler<'a> {
 
                     // Update loop variable based on step and direction
                     function.instruction(&Instruction::LocalGet(var_idx));
-                    if let Some(step_expr) = step {
+                    if let Some(step_value) = analysis.constant_step {
+                        function.instruction(&Instruction::I32Const(step_value));
+                    } else if let Some(step_expr) = step {
                         self.compile_expr_with_locals(function, step_expr, locals, locals_types)?;
                     } else {
                         function.instruction(&Instruction::I32Const(1));
                     }
-                    if *descending {
+                    if analysis.descending {
                         function.instruction(&Instruction::I32Sub);
                     } else {
                         function.instruction(&Instruction::I32Add);
@@ -4821,11 +4935,18 @@ impl<'a> ModuleCompiler<'a> {
                 //   )
                 // )
 
+                let analysis = analyze_for_each_loop(&variable.name, collection.as_ref());
+                let element_stride_bytes = match &analysis.memory_access {
+                    MemoryAccessPattern::ContiguousElements { element_stride_bytes } => {
+                        *element_stride_bytes as i32
+                    }
+                };
+
                 // Use temp locals
                 let list_ptr_local = locals.len() as u32;
                 let idx_local = list_ptr_local + 1;
                 let elem_local = *locals
-                    .get(&variable.name)
+                    .get(&analysis.induction_variable)
                     .expect("for-each variable not found");
 
                 // Compile collection and store pointer
@@ -4849,23 +4970,29 @@ impl<'a> ModuleCompiler<'a> {
 
                 // Check termination: idx >= length => break
                 function.instruction(&Instruction::LocalGet(idx_local));
-                // Load length from list_ptr[0]
-                function.instruction(&Instruction::LocalGet(list_ptr_local));
-                function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                    offset: 0,
-                    align: 2,
-                    memory_index: 0,
-                }));
+                match &analysis.trip_count {
+                    LoopTripCount::CollectionLength => {
+                        function.instruction(&Instruction::LocalGet(list_ptr_local));
+                        function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                    }
+                    LoopTripCount::Constant(length) => {
+                        function.instruction(&Instruction::I32Const(*length as i32));
+                    }
+                }
                 function.instruction(&Instruction::I32GeS);
                 function.instruction(&Instruction::BrIf(1)); // break to outer block
 
                 // Load element at idx into elem_local
-                // elem = list_ptr + 4 + idx * 4
+                // elem = list_ptr + 4 + idx * element_stride_bytes
                 function.instruction(&Instruction::LocalGet(list_ptr_local));
                 function.instruction(&Instruction::I32Const(4)); // skip length
                 function.instruction(&Instruction::I32Add);
                 function.instruction(&Instruction::LocalGet(idx_local));
-                function.instruction(&Instruction::I32Const(4)); // element size
+                function.instruction(&Instruction::I32Const(element_stride_bytes));
                 function.instruction(&Instruction::I32Mul);
                 function.instruction(&Instruction::I32Add);
                 function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
@@ -5757,6 +5884,36 @@ mod tests {
     use super::*;
     use kettu_parser::parse_file;
 
+    fn parse_first_expr_statement(source: &str) -> Expr {
+        let (ast, errors) = parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("Should parse");
+
+        let interface = ast
+            .items
+            .iter()
+            .find_map(|item| match item {
+                TopLevelItem::Interface(interface) => Some(interface),
+                _ => None,
+            })
+            .expect("expected interface");
+
+        let func = interface
+            .items
+            .iter()
+            .find_map(|item| match item {
+                InterfaceItem::Func(func) => Some(func),
+                _ => None,
+            })
+            .expect("expected function");
+
+        let body = func.body.as_ref().expect("expected function body");
+        match &body.statements[0] {
+            Statement::Expr(expr) => expr.clone(),
+            stmt => panic!("expected expression statement, got {stmt:?}"),
+        }
+    }
+
     #[test]
     fn test_compile_simple_function() {
         let source = r#"
@@ -6012,6 +6169,145 @@ mod tests {
 
         let options = CompileOptions { threads: true, ..Default::default() };
         let wasm = compile_module(&ast, &options).expect("await thread-id should compile");
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+    }
+
+    #[test]
+    fn test_analyze_range_loop_step_and_trip_count() {
+        let expr = parse_first_expr_statement(
+            r#"
+            package local:test;
+
+            interface loops {
+                inspect: func() {
+                    for i in 0 to 9 step 3 {
+                        i;
+                    };
+                }
+            }
+        "#,
+        );
+
+        let Expr::For { variable, range, .. } = expr else {
+            panic!("expected for loop");
+        };
+
+        let analysis = analyze_range_loop(&variable.name, range.as_ref()).expect("expected range facts");
+        assert_eq!(analysis.induction_variable, "i");
+        assert!(!analysis.descending);
+        assert_eq!(analysis.constant_step, Some(3));
+        assert_eq!(analysis.trip_count, Some(LoopTripCount::Constant(4)));
+    }
+
+    #[test]
+    fn test_analyze_descending_range_loop_trip_count() {
+        let expr = parse_first_expr_statement(
+            r#"
+            package local:test;
+
+            interface loops {
+                inspect: func() {
+                    for i in 10 downto 0 step 2 {
+                        i;
+                    };
+                }
+            }
+        "#,
+        );
+
+        let Expr::For { variable, range, .. } = expr else {
+            panic!("expected for loop");
+        };
+
+        let analysis = analyze_range_loop(&variable.name, range.as_ref()).expect("expected range facts");
+        assert_eq!(analysis.induction_variable, "i");
+        assert!(analysis.descending);
+        assert_eq!(analysis.constant_step, Some(2));
+        assert_eq!(analysis.trip_count, Some(LoopTripCount::Constant(6)));
+    }
+
+    #[test]
+    fn test_analyze_zero_trip_range_loop() {
+        let expr = parse_first_expr_statement(
+            r#"
+            package local:test;
+
+            interface loops {
+                inspect: func() {
+                    for i in 5 to 1 {
+                        i;
+                    };
+                }
+            }
+        "#,
+        );
+
+        let Expr::For { variable, range, .. } = expr else {
+            panic!("expected for loop");
+        };
+
+        let analysis = analyze_range_loop(&variable.name, range.as_ref()).expect("expected range facts");
+        assert_eq!(analysis.constant_step, Some(1));
+        assert_eq!(analysis.trip_count, Some(LoopTripCount::Constant(0)));
+    }
+
+    #[test]
+    fn test_analyze_for_each_loop_access_shape() {
+        let expr = parse_first_expr_statement(
+            r#"
+            package local:test;
+
+            interface loops {
+                inspect: func() {
+                    for item in [10, 20, 30] {
+                        item;
+                    };
+                }
+            }
+        "#,
+        );
+
+        let Expr::ForEach {
+            variable,
+            collection,
+            ..
+        } = expr
+        else {
+            panic!("expected for-each loop");
+        };
+
+        let analysis = analyze_for_each_loop(&variable.name, collection.as_ref());
+        assert_eq!(analysis.induction_variable, "item");
+        assert_eq!(analysis.trip_count, LoopTripCount::CollectionLength);
+        assert_eq!(
+            analysis.memory_access,
+            MemoryAccessPattern::ContiguousElements {
+                element_stride_bytes: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn test_compile_zero_trip_for_loop() {
+        let source = r#"
+            package local:test;
+
+            interface loops {
+                inspect: func() -> s32 {
+                    for i in 5 to 1 {
+                        i;
+                    };
+                    0;
+                }
+            }
+        "#;
+
+        let (ast, errors) = parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("Should parse");
+
+        let wasm = compile_module(&ast, &CompileOptions::default())
+            .expect("zero-trip for loop should compile");
         assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
     }
 }
