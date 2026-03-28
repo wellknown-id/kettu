@@ -10,7 +10,7 @@
 //! 4. Client sends `tools/call` → server dispatches to handler
 
 use crate::docs;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 
 /// MCP protocol version we implement.
@@ -266,8 +266,20 @@ fn tool_parse(args: &Value) -> Result<String, String> {
     if let Some(ast) = &ast {
         // Summarize top-level items
         if let Some(pkg) = &ast.package {
-            let ns = pkg.path.namespace.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(":");
-            let name = pkg.path.name.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join("/");
+            let ns = pkg
+                .path
+                .namespace
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>()
+                .join(":");
+            let name = pkg
+                .path
+                .name
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>()
+                .join("/");
             output.push_str(&format!("Package: {}:{}\n", ns, name));
         }
 
@@ -353,8 +365,12 @@ fn tool_docs_read(args: &Value) -> Result<String, String> {
         .as_str()
         .ok_or("Missing required argument: topic")?;
 
-    docs::get_topic_text(topic)
-        .ok_or_else(|| format!("Topic '{}' not found. Use docs-search to find valid topic numbers.", topic))
+    docs::get_topic_text(topic).ok_or_else(|| {
+        format!(
+            "Topic '{}' not found. Use docs-search to find valid topic numbers.",
+            topic
+        )
+    })
 }
 
 fn tool_emit_wit(args: &Value) -> Result<String, String> {

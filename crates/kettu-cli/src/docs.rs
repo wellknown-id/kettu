@@ -100,9 +100,7 @@ fn extract_preamble(front: &str) -> Option<String> {
                 .trim()
                 .trim_start_matches("//")
                 .strip_prefix(' ')
-                .unwrap_or(
-                    line.trim().trim_start_matches("//"),
-                );
+                .unwrap_or(line.trim().trim_start_matches("//"));
             lines.push(code.to_string());
         }
     }
@@ -157,7 +155,11 @@ fn parse_page(source: &str) -> Option<DocPage> {
     let mut keywords = Vec::new();
     for line in front.lines() {
         if let Some(v) = parse_meta(line, "keywords") {
-            keywords = v.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+            keywords = v
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
     }
 
@@ -313,12 +315,8 @@ pub fn print_index() {
         println!();
     }
 
-    println!(
-        "Run: \x1b[1mkettu docs <number>\x1b[0m  (e.g. \x1b[36mkettu docs 1.2\x1b[0m)"
-    );
-    println!(
-        "     \x1b[1mkettu docs search <query>\x1b[0m  to search topics"
-    );
+    println!("Run: \x1b[1mkettu docs <number>\x1b[0m  (e.g. \x1b[36mkettu docs 1.2\x1b[0m)");
+    println!("     \x1b[1mkettu docs search <query>\x1b[0m  to search topics");
 }
 
 /// Print a specific topic or section overview.
@@ -350,13 +348,13 @@ pub fn print_topic(selector: &str) {
     let (section_name, topics) = &groups[sec_num - 1];
 
     if parts.len() == 1 {
-        println!("\x1b[1;36m{}\x1b[0m  \x1b[1m{}\x1b[0m", sec_num, section_name);
+        println!(
+            "\x1b[1;36m{}\x1b[0m  \x1b[1m{}\x1b[0m",
+            sec_num, section_name
+        );
         println!();
         for (i, topic) in topics.iter().enumerate() {
-            println!(
-                "     \x1b[36m{}.{}\x1b[0m  {}",
-                sec_num, i + 1, topic.title
-            );
+            println!("     \x1b[36m{}.{}\x1b[0m  {}", sec_num, i + 1, topic.title);
         }
         println!();
         println!(
@@ -383,7 +381,10 @@ pub fn print_topic(selector: &str) {
             section_name,
             topics.len()
         );
-        eprintln!("Run `kettu docs {}` to see topics in this section.", sec_num);
+        eprintln!(
+            "Run `kettu docs {}` to see topics in this section.",
+            sec_num
+        );
         std::process::exit(1);
     }
 
@@ -451,28 +452,18 @@ pub fn search_docs(query: &str) {
         return;
     }
 
-    println!(
-        "\x1b[1mSearch results for \"{}\"\x1b[0m\n",
-        query
-    );
+    println!("\x1b[1mSearch results for \"{}\"\x1b[0m\n", query);
 
     for (selector, title, _score, snippet) in &results {
-        println!(
-            "  \x1b[36m{}\x1b[0m  \x1b[1m{}\x1b[0m",
-            selector, title
-        );
+        println!("  \x1b[36m{}\x1b[0m  \x1b[1m{}\x1b[0m", selector, title);
         if !snippet.is_empty() {
             println!("      {}", snippet);
         }
         println!();
     }
 
-    println!(
-        "Run: \x1b[1mkettu docs <number>\x1b[0m to read a topic."
-    );
-    println!(
-        "     \x1b[1mkettu docs search <query>\x1b[0m to search topics."
-    );
+    println!("Run: \x1b[1mkettu docs <number>\x1b[0m to read a topic.");
+    println!("     \x1b[1mkettu docs search <query>\x1b[0m to search topics.");
 }
 
 /// Extract a short snippet around the first occurrence of `query` in `content`.
@@ -550,7 +541,10 @@ pub fn search_docs_results(query: &str) -> Vec<(String, String, String)> {
     }
 
     results.sort_by(|a, b| b.2.cmp(&a.2));
-    results.into_iter().map(|(s, t, _, sn)| (s, t, sn)).collect()
+    results
+        .into_iter()
+        .map(|(s, t, _, sn)| (s, t, sn))
+        .collect()
 }
 
 /// Return the content of a specific topic as a string, or None if not found.
@@ -609,7 +603,11 @@ pub fn get_pages_for_testing(selector: Option<&str>) -> Vec<(String, String, Opt
                 _ => return vec![],
             };
             let topic = topics[topic_num - 1];
-            vec![(topic.title.clone(), topic.content.clone(), topic.preamble.clone())]
+            vec![(
+                topic.title.clone(),
+                topic.content.clone(),
+                topic.preamble.clone(),
+            )]
         }
     } else {
         pages
@@ -618,4 +616,3 @@ pub fn get_pages_for_testing(selector: Option<&str>) -> Vec<(String, String, Opt
             .collect()
     }
 }
-

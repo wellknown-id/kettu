@@ -1,8 +1,8 @@
 //! Integration tests for the full Kettu compilation pipeline
 
+use serde_json::{Value, json};
 use std::io::Write;
 use std::process::Command;
-use serde_json::{json, Value};
 use tempfile::NamedTempFile;
 use wasmparser::{Parser, Payload};
 
@@ -24,7 +24,10 @@ fn run_mcp_request(request: Value) -> Value {
     drop(child.stdin.take());
 
     let output = child.wait_with_output().expect("Failed to read MCP output");
-    assert!(output.status.success(), "kettu mcp should exit successfully");
+    assert!(
+        output.status.success(),
+        "kettu mcp should exit successfully"
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout
@@ -420,10 +423,7 @@ fn test_docs_topic_command() {
         .output()
         .expect("Failed to run kettu docs 1.1");
 
-    assert!(
-        output.status.success(),
-        "Docs topic command should succeed"
-    );
+    assert!(output.status.success(), "Docs topic command should succeed");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -550,7 +550,11 @@ fn test_mcp_tools_list_includes_parse() {
         .collect();
 
     assert_eq!(names.len(), 5, "expected all advertised MCP tools");
-    assert!(names.contains(&"parse"), "parse tool should be listed: {:?}", names);
+    assert!(
+        names.contains(&"parse"),
+        "parse tool should be listed: {:?}",
+        names
+    );
 }
 
 #[test]
@@ -572,8 +576,20 @@ fn test_mcp_tools_call_parse() {
         .and_then(Value::as_str)
         .expect("parse tool text");
 
-    assert!(text.contains("Package: local:test"), "should summarize the package: {}", text);
-    assert!(text.contains("Interface: api"), "should summarize the interface: {}", text);
-    assert!(text.contains("func: greet"), "should summarize functions: {}", text);
+    assert!(
+        text.contains("Package: local:test"),
+        "should summarize the package: {}",
+        text
+    );
+    assert!(
+        text.contains("Interface: api"),
+        "should summarize the interface: {}",
+        text
+    );
+    assert!(
+        text.contains("func: greet"),
+        "should summarize functions: {}",
+        text
+    );
     assert_eq!(response.pointer("/result/isError"), Some(&json!(false)));
 }

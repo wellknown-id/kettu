@@ -6,9 +6,9 @@ use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
 
+mod dap;
 mod docs;
 mod doctest;
-mod dap;
 mod mcp;
 
 fn load_imported_asts(
@@ -711,7 +711,10 @@ fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -
         }
 
         if !returns_bool {
-            println!("  ✗ {} (must return bool) — {}:{}", name, file_display, line);
+            println!(
+                "  ✗ {} (must return bool) — {}:{}",
+                name, file_display, line
+            );
             failed += 1;
             continue;
         }
@@ -723,7 +726,10 @@ fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -
         let instance = match Instance::new(&mut store, &module, &[]) {
             Ok(i) => i,
             Err(e) => {
-                println!("  ✗ {} (instantiation failed: {}) — {}:{}", name, e, file_display, line);
+                println!(
+                    "  ✗ {} (instantiation failed: {}) — {}:{}",
+                    name, e, file_display, line
+                );
                 failed += 1;
                 continue;
             }
@@ -752,7 +758,10 @@ fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -
                     .map(|e| e.name().to_string())
                     .filter(|n| n != "memory" && n != "cabi_realloc" && n != "cabi_arena_reset")
                     .collect();
-                println!("  ✗ {} (not found in exports) ({:.1?}) — {}:{}", name, elapsed, file_display, line);
+                println!(
+                    "  ✗ {} (not found in exports) ({:.1?}) — {}:{}",
+                    name, elapsed, file_display, line
+                );
                 if !func_exports.is_empty() {
                     println!("    available: {}", func_exports.join(", "));
                 }
@@ -765,7 +774,10 @@ fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -
             Ok(f) => f,
             Err(e) => {
                 let elapsed = start.elapsed();
-                println!("  ✗ {} (signature mismatch: {}) ({:.1?}) — {}:{}", name, e, elapsed, file_display, line);
+                println!(
+                    "  ✗ {} (signature mismatch: {}) ({:.1?}) — {}:{}",
+                    name, e, elapsed, file_display, line
+                );
                 failed += 1;
                 continue;
             }
@@ -779,13 +791,19 @@ fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -
                     println!("  ✓ {} ({:.1?})", name, elapsed);
                     passed += 1;
                 } else {
-                    println!("  ✗ {} (returned false) ({:.1?}) — {}:{}", name, elapsed, file_display, line);
+                    println!(
+                        "  ✗ {} (returned false) ({:.1?}) — {}:{}",
+                        name, elapsed, file_display, line
+                    );
                     failed += 1;
                 }
             }
             Err(e) => {
                 let elapsed = start.elapsed();
-                println!("  ✗ {} (execution error: {}) ({:.1?}) — {}:{}", name, e, elapsed, file_display, line);
+                println!(
+                    "  ✗ {} (execution error: {}) ({:.1?}) — {}:{}",
+                    name, e, elapsed, file_display, line
+                );
                 failed += 1;
             }
         }

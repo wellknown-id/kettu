@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -110,7 +110,10 @@ fn dap_step_in_enters_callable_closure() {
 
     let _init_resp = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("initialize")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("initialize"))
+        },
         Duration::from_secs(2),
     );
 
@@ -155,7 +158,10 @@ fn dap_step_in_enters_callable_closure() {
 
     let _bp_resp = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("setBreakpoints")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("setBreakpoints"))
+        },
         Duration::from_secs(2),
     );
 
@@ -174,7 +180,10 @@ fn dap_step_in_enters_callable_closure() {
         |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
         Duration::from_secs(4),
     );
-    assert_eq!(stop_on_def.pointer("/body/reason"), Some(&json!("breakpoint")));
+    assert_eq!(
+        stop_on_def.pointer("/body/reason"),
+        Some(&json!("breakpoint"))
+    );
 
     // Stack should show only the test frame at the definition line (not closure executing yet)
     write_dap_message(
@@ -188,11 +197,20 @@ fn dap_step_in_enters_callable_closure() {
     );
     let stack_def = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("stackTrace")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("stackTrace"))
+        },
         Duration::from_secs(2),
     );
-    assert_eq!(stack_def.pointer("/body/stackFrames/0/name"), Some(&json!('@'.to_string() + "test test-no-captures")));
-    assert_eq!(stack_def.pointer("/body/stackFrames/0/line"), Some(&json!(22)));
+    assert_eq!(
+        stack_def.pointer("/body/stackFrames/0/name"),
+        Some(&json!('@'.to_string() + "test test-no-captures"))
+    );
+    assert_eq!(
+        stack_def.pointer("/body/stackFrames/0/line"),
+        Some(&json!(22))
+    );
 
     // Step once (line 22 -> 23)
     write_dap_message(
@@ -222,11 +240,20 @@ fn dap_step_in_enters_callable_closure() {
     );
     let stack_closure = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("stackTrace")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("stackTrace"))
+        },
         Duration::from_secs(2),
     );
-    assert_eq!(stack_closure.pointer("/body/stackFrames/0/name"), Some(&json!("double")));
-    assert_eq!(stack_closure.pointer("/body/stackFrames/0/line"), Some(&json!(22)));
+    assert_eq!(
+        stack_closure.pointer("/body/stackFrames/0/name"),
+        Some(&json!("double"))
+    );
+    assert_eq!(
+        stack_closure.pointer("/body/stackFrames/0/line"),
+        Some(&json!(22))
+    );
 
     write_dap_message(
         &mut stdin,
@@ -234,7 +261,10 @@ fn dap_step_in_enters_callable_closure() {
     );
     let _disc_resp = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("disconnect")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("disconnect"))
+        },
         Duration::from_secs(2),
     );
 
@@ -283,7 +313,10 @@ fn dap_exposes_captures_and_evaluate_for_callable_closure() {
     );
     let init_resp = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("initialize")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("initialize"))
+        },
         Duration::from_secs(2),
     );
     assert_eq!(
@@ -330,7 +363,10 @@ fn dap_exposes_captures_and_evaluate_for_callable_closure() {
     );
     let _bp_resp = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("setBreakpoints")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("setBreakpoints"))
+        },
         Duration::from_secs(2),
     );
 
@@ -348,7 +384,10 @@ fn dap_exposes_captures_and_evaluate_for_callable_closure() {
         |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
         Duration::from_secs(4),
     );
-    assert_eq!(stop_on_call.pointer("/body/reason"), Some(&json!("breakpoint")));
+    assert_eq!(
+        stop_on_call.pointer("/body/reason"),
+        Some(&json!("breakpoint"))
+    );
 
     write_dap_message(
         &mut stdin,
@@ -366,10 +405,16 @@ fn dap_exposes_captures_and_evaluate_for_callable_closure() {
     );
     let stack_closure = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("stackTrace")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("stackTrace"))
+        },
         Duration::from_secs(2),
     );
-    assert_eq!(stack_closure.pointer("/body/stackFrames/0/name"), Some(&json!("add-x")));
+    assert_eq!(
+        stack_closure.pointer("/body/stackFrames/0/name"),
+        Some(&json!("add-x"))
+    );
     let frame_id = stack_closure
         .pointer("/body/stackFrames/0/id")
         .and_then(Value::as_i64)
@@ -402,14 +447,21 @@ fn dap_exposes_captures_and_evaluate_for_callable_closure() {
     );
     let locals_resp = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("variables")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("variables"))
+        },
         Duration::from_secs(2),
     );
     let locals = locals_resp
         .pointer("/body/variables")
         .and_then(Value::as_array)
         .expect("locals array");
-    assert!(locals.iter().any(|v| v["name"] == json!("n") && v["value"] == json!("5")));
+    assert!(
+        locals
+            .iter()
+            .any(|v| v["name"] == json!("n") && v["value"] == json!("5"))
+    );
 
     write_dap_message(
         &mut stdin,
@@ -417,14 +469,21 @@ fn dap_exposes_captures_and_evaluate_for_callable_closure() {
     );
     let captures_resp = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("variables")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("variables"))
+        },
         Duration::from_secs(2),
     );
     let captures = captures_resp
         .pointer("/body/variables")
         .and_then(Value::as_array)
         .expect("captures array");
-    assert!(captures.iter().any(|v| v["name"] == json!("x") && v["value"] == json!("10")));
+    assert!(
+        captures
+            .iter()
+            .any(|v| v["name"] == json!("x") && v["value"] == json!("10"))
+    );
 
     write_dap_message(
         &mut stdin,
@@ -441,7 +500,10 @@ fn dap_exposes_captures_and_evaluate_for_callable_closure() {
     );
     let evaluate_resp = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("evaluate")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("evaluate"))
+        },
         Duration::from_secs(2),
     );
     assert_eq!(evaluate_resp.pointer("/body/result"), Some(&json!("15")));
@@ -453,7 +515,10 @@ fn dap_exposes_captures_and_evaluate_for_callable_closure() {
     );
     let _disc_resp = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("disconnect")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("disconnect"))
+        },
         Duration::from_secs(2),
     );
 
@@ -502,7 +567,10 @@ fn dap_tracks_nested_closure_breakpoints_and_frames() {
     );
     let _init_resp = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("initialize")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("initialize"))
+        },
         Duration::from_secs(2),
     );
 
@@ -544,7 +612,10 @@ fn dap_tracks_nested_closure_breakpoints_and_frames() {
     );
     let _bp_resp = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("setBreakpoints")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("setBreakpoints"))
+        },
         Duration::from_secs(2),
     );
 
@@ -562,17 +633,26 @@ fn dap_tracks_nested_closure_breakpoints_and_frames() {
         |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
         Duration::from_secs(4),
     );
-    assert_eq!(stop_on_call.pointer("/body/reason"), Some(&json!("breakpoint")));
+    assert_eq!(
+        stop_on_call.pointer("/body/reason"),
+        Some(&json!("breakpoint"))
+    );
     write_dap_message(
         &mut stdin,
         &json!({"type": "request", "seq": 50, "command": "stackTrace", "arguments": {"threadId": 1}}),
     );
     let call_stack = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("stackTrace")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("stackTrace"))
+        },
         Duration::from_secs(2),
     );
-    assert_eq!(call_stack.pointer("/body/stackFrames/0/line"), Some(&json!(9)));
+    assert_eq!(
+        call_stack.pointer("/body/stackFrames/0/line"),
+        Some(&json!(9))
+    );
 
     write_dap_message(
         &mut stdin,
@@ -593,7 +673,10 @@ fn dap_tracks_nested_closure_breakpoints_and_frames() {
         |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
         Duration::from_secs(2),
     );
-    assert_eq!(stop_outer_setup.pointer("/body/reason"), Some(&json!("step")));
+    assert_eq!(
+        stop_outer_setup.pointer("/body/reason"),
+        Some(&json!("step"))
+    );
 
     write_dap_message(
         &mut stdin,
@@ -604,7 +687,10 @@ fn dap_tracks_nested_closure_breakpoints_and_frames() {
         |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
         Duration::from_secs(2),
     );
-    assert_eq!(stop_outer_reduce.pointer("/body/reason"), Some(&json!("step")));
+    assert_eq!(
+        stop_outer_reduce.pointer("/body/reason"),
+        Some(&json!("step"))
+    );
 
     write_dap_message(
         &mut stdin,
@@ -623,7 +709,10 @@ fn dap_tracks_nested_closure_breakpoints_and_frames() {
     );
     let nested_stack = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("stackTrace")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("stackTrace"))
+        },
         Duration::from_secs(2),
     );
     let nested_frames = nested_stack
@@ -632,7 +721,10 @@ fn dap_tracks_nested_closure_breakpoints_and_frames() {
         .expect("nested frames");
     assert_eq!(nested_frames[0]["name"], json!("closure#2"));
     assert_eq!(nested_frames[1]["name"], json!("outer"));
-    assert_eq!(nested_frames[2]["name"], json!('@'.to_string() + "test nested-closure-flow"));
+    assert_eq!(
+        nested_frames[2]["name"],
+        json!('@'.to_string() + "test nested-closure-flow")
+    );
     assert_eq!(nested_frames[0]["line"], json!(8));
 
     write_dap_message(
@@ -644,7 +736,10 @@ fn dap_tracks_nested_closure_breakpoints_and_frames() {
         |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
         Duration::from_secs(2),
     );
-    assert_eq!(stop_return.pointer("/body/reason"), Some(&json!("breakpoint")));
+    assert_eq!(
+        stop_return.pointer("/body/reason"),
+        Some(&json!("breakpoint"))
+    );
 
     write_dap_message(
         &mut stdin,
@@ -652,14 +747,20 @@ fn dap_tracks_nested_closure_breakpoints_and_frames() {
     );
     let return_stack = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("stackTrace")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("stackTrace"))
+        },
         Duration::from_secs(2),
     );
     let return_frames = return_stack
         .pointer("/body/stackFrames")
         .and_then(Value::as_array)
         .expect("return frames");
-    assert_eq!(return_frames[0]["name"], json!('@'.to_string() + "test nested-closure-flow"));
+    assert_eq!(
+        return_frames[0]["name"],
+        json!('@'.to_string() + "test nested-closure-flow")
+    );
     assert_eq!(return_frames[0]["line"], json!(10));
 
     write_dap_message(
@@ -668,7 +769,10 @@ fn dap_tracks_nested_closure_breakpoints_and_frames() {
     );
     let _disc_resp = wait_for_message(
         &rx,
-        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("disconnect")),
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("disconnect"))
+        },
         Duration::from_secs(2),
     );
 

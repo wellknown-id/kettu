@@ -134,10 +134,7 @@ fn wrap_snippet(code: &str, preamble: Option<&str>) -> String {
 
     // World declarations
     if trimmed.starts_with("world ") {
-        return format!(
-            "package local:doctest;\n\n{}\n",
-            trimmed
-        );
+        return format!("package local:doctest;\n\n{}\n", trimmed);
     }
 
     // Statements — wrap in a function body, with optional preamble
@@ -192,10 +189,8 @@ pub fn run_doctests(pages: &[(&str, &str, Option<&str>)]) -> (usize, usize, usiz
 
     for (title, content, preamble) in pages {
         let blocks = extract_blocks(content);
-        let checkable: Vec<&CodeBlock> = blocks
-            .iter()
-            .filter(|b| b.mode != Mode::NoCheck)
-            .collect();
+        let checkable: Vec<&CodeBlock> =
+            blocks.iter().filter(|b| b.mode != Mode::NoCheck).collect();
 
         if checkable.is_empty() {
             continue;
@@ -256,9 +251,7 @@ pub fn run_doctests(pages: &[(&str, &str, Option<&str>)]) -> (usize, usize, usiz
                         let diagnostics = kettu_checker::check(&ast);
                         let errors: Vec<_> = diagnostics
                             .iter()
-                            .filter(|d| {
-                                matches!(d.severity, kettu_checker::Severity::Error)
-                            })
+                            .filter(|d| matches!(d.severity, kettu_checker::Severity::Error))
                             .collect();
 
                         if errors.is_empty() {
