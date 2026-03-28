@@ -216,6 +216,7 @@ function activate(context) {
     }
 
     context.subscriptions.push(registerMcpTool('check'));
+    context.subscriptions.push(registerMcpTool('parse'));
     context.subscriptions.push(registerMcpTool('docs-search'));
     context.subscriptions.push(registerMcpTool('docs-read'));
     context.subscriptions.push(registerMcpTool('emit-wit'));

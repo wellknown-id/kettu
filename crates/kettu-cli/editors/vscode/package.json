@@ -210,6 +210,21 @@
                 }
             },
             {
+                "name": "kettu-parse",
+                "displayName": "Kettu Parse",
+                "modelDescription": "Parse Kettu/WIT source code and summarize the AST structure",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "Kettu source code to parse"
+                        }
+                    },
+                    "required": ["source"]
+                }
+            },
+            {
                 "name": "kettu-docs-read",
                 "displayName": "Kettu Docs Read",
                 "modelDescription": "Read a specific topic from the Kettu language guide",

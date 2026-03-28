@@ -2,12 +2,36 @@
 
 use std::io::Write;
 use std::process::Command;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tempfile::NamedTempFile;
 use wasmparser::{Parser, Payload};
 
 fn kettu_cmd() -> Command {
     Command::new(env!("CARGO_BIN_EXE_kettu"))
+}
+
+fn run_mcp_request(request: Value) -> Value {
+    let mut child = kettu_cmd()
+        .args(["mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("Failed to start kettu mcp");
+
+    let stdin = child.stdin.as_mut().expect("mcp stdin");
+    writeln!(stdin, "{}", request).expect("write MCP request");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("Failed to read MCP output");
+    assert!(output.status.success(), "kettu mcp should exit successfully");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .expect("MCP response line");
+    serde_json::from_str(line).expect("valid MCP JSON response")
 }
 
 #[test]
@@ -458,67 +482,98 @@ fn test_docs_search_command() {
 
 #[test]
 fn test_mcp_initialize() {
-    let mut child = kettu_cmd()
-        .args(["mcp"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("Failed to start kettu mcp");
-
-    let stdin = child.stdin.as_mut().unwrap();
-    stdin
-        .write_all(
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\"}}}\n",
-        )
-        .unwrap();
-    drop(child.stdin.take()); // close stdin to signal EOF
-
-    let output = child.wait_with_output().expect("Failed to read output");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response = run_mcp_request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "test" }
+        }
+    }));
 
     assert!(
-        stdout.contains("\"protocolVersion\""),
+        response.pointer("/result/protocolVersion") == Some(&json!("2024-11-05")),
         "Should return protocolVersion: {}",
-        stdout
+        response
     );
     assert!(
-        stdout.contains("\"tools\""),
+        response.pointer("/result/capabilities/tools").is_some(),
         "Should advertise tools capability: {}",
-        stdout
+        response
     );
 }
 
 #[test]
 fn test_mcp_tools_call_check() {
-
-    let mut child = kettu_cmd()
-        .args(["mcp"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("Failed to start kettu mcp");
-
-    let stdin = child.stdin.as_mut().unwrap();
-    stdin
-        .write_all(
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"check\",\"arguments\":{\"source\":\"interface math { add: func(a: s32, b: s32) -> s32 { a + b } }\"}}}\n",
-        )
-        .unwrap();
-    drop(child.stdin.take());
-
-    let output = child.wait_with_output().expect("Failed to read output");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response = run_mcp_request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "check",
+            "arguments": {
+                "source": "interface math { add: func(a: s32, b: s32) -> s32 { a + b } }"
+            }
+        }
+    }));
 
     assert!(
-        stdout.contains("OK"),
+        response.pointer("/result/content/0/text") == Some(&json!("OK — no errors or warnings.")),
         "Valid code should pass check: {}",
-        stdout
+        response
     );
     assert!(
-        stdout.contains("\"isError\":false"),
+        response.pointer("/result/isError") == Some(&json!(false)),
         "Should not be an error: {}",
-        stdout
+        response
     );
+}
+
+#[test]
+fn test_mcp_tools_list_includes_parse() {
+    let response = run_mcp_request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {}
+    }));
+
+    let tools = response
+        .pointer("/result/tools")
+        .and_then(Value::as_array)
+        .expect("tools array");
+    let names: Vec<_> = tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect();
+
+    assert_eq!(names.len(), 5, "expected all advertised MCP tools");
+    assert!(names.contains(&"parse"), "parse tool should be listed: {:?}", names);
+}
+
+#[test]
+fn test_mcp_tools_call_parse() {
+    let response = run_mcp_request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "parse",
+            "arguments": {
+                "source": "package local:test; interface api { greet: func(name: string) -> string; }"
+            }
+        }
+    }));
+
+    let text = response
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .expect("parse tool text");
+
+    assert!(text.contains("Package: local:test"), "should summarize the package: {}", text);
+    assert!(text.contains("Interface: api"), "should summarize the interface: {}", text);
+    assert!(text.contains("func: greet"), "should summarize functions: {}", text);
+    assert_eq!(response.pointer("/result/isError"), Some(&json!(false)));
 }
