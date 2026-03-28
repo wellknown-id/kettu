@@ -667,7 +667,10 @@ mod tests {
         };
         let body = func.body.as_ref().expect("should have body");
         match &body.statements[0] {
-            crate::ast::Statement::SharedLet { name, initial_value } => {
+            crate::ast::Statement::SharedLet {
+                name,
+                initial_value,
+            } => {
                 assert_eq!(name.name, "counter");
                 assert!(matches!(initial_value, crate::ast::Expr::Integer(0, _)));
             }
@@ -692,7 +695,10 @@ mod tests {
         let body = func.body.as_ref().expect("should have body");
         match &body.statements[0] {
             crate::ast::Statement::Expr(crate::ast::Expr::AtomicBlock { body, .. }) => {
-                assert!(!body.is_empty(), "atomic block should have at least one statement");
+                assert!(
+                    !body.is_empty(),
+                    "atomic block should have at least one statement"
+                );
             }
             other => panic!("expected AtomicBlock expression, got: {:?}", other),
         }
@@ -714,7 +720,10 @@ mod tests {
         };
         let body = func.body.as_ref().unwrap();
         match &body.statements[0] {
-            crate::ast::Statement::SharedLet { name, initial_value } => {
+            crate::ast::Statement::SharedLet {
+                name,
+                initial_value,
+            } => {
                 assert_eq!(name.name, "x");
                 assert!(matches!(initial_value, crate::ast::Expr::Binary { .. }));
             }
@@ -761,8 +770,14 @@ mod tests {
         };
         let body = func.body.as_ref().unwrap();
         assert_eq!(body.statements.len(), 2);
-        assert!(matches!(&body.statements[0], crate::ast::Statement::SharedLet { .. }));
-        assert!(matches!(&body.statements[1], crate::ast::Statement::Expr(crate::ast::Expr::AtomicBlock { .. })));
+        assert!(matches!(
+            &body.statements[0],
+            crate::ast::Statement::SharedLet { .. }
+        ));
+        assert!(matches!(
+            &body.statements[1],
+            crate::ast::Statement::Expr(crate::ast::Expr::AtomicBlock { .. })
+        ));
     }
 
     // ================================================================
@@ -885,10 +900,112 @@ mod tests {
         match &body.statements[1] {
             crate::ast::Statement::Expr(crate::ast::Expr::AtomicBlock { body, .. }) => {
                 assert_eq!(body.len(), 1);
-                assert!(matches!(&body[0], crate::ast::Statement::CompoundAssign { .. }));
+                assert!(matches!(
+                    &body[0],
+                    crate::ast::Statement::CompoundAssign { .. }
+                ));
             }
             other => panic!("expected AtomicBlock with CompoundAssign, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_guard_statement_parse() {
+        let src = "interface i {\n  f: func() -> s32 {\n    guard true else {\n      return 0;\n    };\n    42;\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected Interface"),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!("expected Func"),
+        };
+        let body = func.body.as_ref().expect("should have body");
+        match &body.statements[0] {
+            crate::ast::Statement::Guard {
+                condition,
+                else_body,
+            } => {
+                assert!(matches!(
+                    condition.as_ref(),
+                    crate::ast::Expr::Bool(true, _)
+                ));
+                assert_eq!(else_body.len(), 1);
+                assert!(matches!(
+                    &else_body[0],
+                    crate::ast::Statement::Return(Some(crate::ast::Expr::Integer(0, _)))
+                ));
+            }
+            other => panic!("expected Guard, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_guard_statement_with_multiple_else_statements() {
+        let src = "interface i {\n  f: func(flag: bool) -> s32 {\n    guard flag else {\n      let fallback = 7;\n      return fallback;\n    };\n    1;\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected Interface"),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!("expected Func"),
+        };
+        let body = func.body.as_ref().expect("should have body");
+        match &body.statements[0] {
+            crate::ast::Statement::Guard { else_body, .. } => {
+                assert_eq!(else_body.len(), 2);
+                assert!(matches!(&else_body[0], crate::ast::Statement::Let { .. }));
+                assert!(matches!(
+                    &else_body[1],
+                    crate::ast::Statement::Return(Some(_))
+                ));
+            }
+            other => panic!("expected Guard, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_guard_let_statement_parse() {
+        let src = "interface i {\n  f: func(maybe: option<s32>) -> s32 {\n    guard let value = maybe else {\n      return 0;\n    };\n    value;\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected Interface"),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!("expected Func"),
+        };
+        let body = func.body.as_ref().expect("should have body");
+        match &body.statements[0] {
+            crate::ast::Statement::GuardLet {
+                name,
+                value,
+                else_body,
+            } => {
+                assert_eq!(name.name, "value");
+                assert!(matches!(value, crate::ast::Expr::Ident(id) if id.name == "maybe"));
+                assert_eq!(else_body.len(), 1);
+                assert!(matches!(
+                    &else_body[0],
+                    crate::ast::Statement::Return(Some(crate::ast::Expr::Integer(0, _)))
+                ));
+            }
+            other => panic!("expected GuardLet, got {:?}", other),
+        }
+        assert!(matches!(
+            &body.statements[1],
+            crate::ast::Statement::Expr(crate::ast::Expr::Ident(id)) if id.name == "value"
+        ));
     }
 
     #[test]
@@ -907,7 +1024,13 @@ mod tests {
         };
         let body = func.body.as_ref().unwrap();
         match &body.statements[0] {
-            crate::ast::Statement::Expr(crate::ast::Expr::SimdOp { lane, op, args, lane_idx, .. }) => {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdOp {
+                lane,
+                op,
+                args,
+                lane_idx,
+                ..
+            }) => {
                 assert!(matches!(lane, crate::ast::SimdLane::I32x4));
                 assert!(matches!(op, crate::ast::SimdOp::Splat));
                 assert_eq!(args.len(), 1);
@@ -958,7 +1081,13 @@ mod tests {
         };
         let body = func.body.as_ref().unwrap();
         match &body.statements[0] {
-            crate::ast::Statement::Expr(crate::ast::Expr::SimdOp { lane, op, lane_idx, args, .. }) => {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdOp {
+                lane,
+                op,
+                lane_idx,
+                args,
+                ..
+            }) => {
                 assert!(matches!(lane, crate::ast::SimdLane::I32x4));
                 assert!(matches!(op, crate::ast::SimdOp::ExtractLane));
                 assert_eq!(*lane_idx, Some(2));
@@ -1034,7 +1163,9 @@ mod tests {
         };
         let body = func.body.as_ref().unwrap();
         match &body.statements[0] {
-            crate::ast::Statement::Expr(crate::ast::Expr::SimdForEach { variable, body, .. }) => {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdForEach {
+                variable, body, ..
+            }) => {
                 assert_eq!(variable.name, "v");
                 assert_eq!(body.len(), 1);
             }

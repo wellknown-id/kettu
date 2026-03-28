@@ -269,6 +269,17 @@ pub enum Statement {
     Continue { condition: Option<Box<Expr>> },
     /// `shared let name = expr;` — allocate shared memory for atomic access
     SharedLet { name: Id, initial_value: Expr },
+    /// `guard condition else { ... };` - early-exit block when the condition is false
+    Guard {
+        condition: Box<Expr>,
+        else_body: Vec<Statement>,
+    },
+    /// `guard let name = value else { ... };` - unwrap option/result payload or early-exit
+    GuardLet {
+        name: Id,
+        value: Expr,
+        else_body: Vec<Statement>,
+    },
 }
 
 /// Part of an interpolated string
@@ -457,17 +468,43 @@ pub enum Expr {
     /// Atomic load: `atomic.load(addr)` - atomically reads i32 from shared memory
     AtomicLoad { addr: Box<Expr>, span: Span },
     /// Atomic store: `atomic.store(addr, value)` - atomically writes i32 to shared memory
-    AtomicStore { addr: Box<Expr>, value: Box<Expr>, span: Span },
+    AtomicStore {
+        addr: Box<Expr>,
+        value: Box<Expr>,
+        span: Span,
+    },
     /// Atomic add: `atomic.add(addr, value)` - atomically adds and returns old value
-    AtomicAdd { addr: Box<Expr>, value: Box<Expr>, span: Span },
+    AtomicAdd {
+        addr: Box<Expr>,
+        value: Box<Expr>,
+        span: Span,
+    },
     /// Atomic sub: `atomic.sub(addr, value)` - atomically subtracts and returns old value
-    AtomicSub { addr: Box<Expr>, value: Box<Expr>, span: Span },
+    AtomicSub {
+        addr: Box<Expr>,
+        value: Box<Expr>,
+        span: Span,
+    },
     /// Atomic compare-exchange: `atomic.cmpxchg(addr, expected, new)` - returns old value
-    AtomicCmpxchg { addr: Box<Expr>, expected: Box<Expr>, replacement: Box<Expr>, span: Span },
+    AtomicCmpxchg {
+        addr: Box<Expr>,
+        expected: Box<Expr>,
+        replacement: Box<Expr>,
+        span: Span,
+    },
     /// Atomic wait: `atomic.wait(addr, expected, timeout_ns)` - blocks until notified
-    AtomicWait { addr: Box<Expr>, expected: Box<Expr>, timeout: Box<Expr>, span: Span },
+    AtomicWait {
+        addr: Box<Expr>,
+        expected: Box<Expr>,
+        timeout: Box<Expr>,
+        span: Span,
+    },
     /// Atomic notify: `atomic.notify(addr, count)` - wakes waiting threads
-    AtomicNotify { addr: Box<Expr>, count: Box<Expr>, span: Span },
+    AtomicNotify {
+        addr: Box<Expr>,
+        count: Box<Expr>,
+        span: Span,
+    },
     /// Spawn: `spawn { body }` - runs body on a new thread
     Spawn { body: Vec<Statement>, span: Span },
     /// Thread join: `thread.join(tid)` - blocks until spawned thread completes
@@ -475,9 +512,20 @@ pub enum Expr {
     /// Atomic block: `atomic { stmts }` - sugar for atomic operations on shared vars
     AtomicBlock { body: Vec<Statement>, span: Span },
     /// SIMD operation: `interpretation.op(args)` — e.g. `i32x4.add(a, b)`
-    SimdOp { lane: SimdLane, op: SimdOp, args: Vec<Expr>, lane_idx: Option<u8>, span: Span },
+    SimdOp {
+        lane: SimdLane,
+        op: SimdOp,
+        args: Vec<Expr>,
+        lane_idx: Option<u8>,
+        span: Span,
+    },
     /// SIMD for-each loop: `simd for v in list { body }` — vectorized loop processing 4 elements at a time
-    SimdForEach { variable: Id, collection: Box<Expr>, body: Vec<Statement>, span: Span },
+    SimdForEach {
+        variable: Id,
+        collection: Box<Expr>,
+        body: Vec<Statement>,
+        span: Span,
+    },
 }
 
 /// Pattern for match arms

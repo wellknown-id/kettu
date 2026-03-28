@@ -12,7 +12,7 @@
 //   let c = true;
 //   let maybe = #some(5);
 // preamble-end
-// keywords: "expression, operator, arithmetic, comparison, boolean, literal, assignment, if, else, ternary"
+// keywords: "expression, operator, arithmetic, comparison, boolean, literal, assignment, if, else, guard, ternary"
 ---
 # Expressions
 
@@ -85,6 +85,33 @@ if x > 20 {
     };
 };
 ```
+
+## Guard Statements
+
+Use `guard` for early exits without nesting the main path:
+
+```kettu nocheck
+guard x > 0 else {
+    return 0;
+};
+```
+
+The condition must be `bool`, and the `else` block must exit the current scope with
+`return`, `break`, or `continue`.
+
+Use `guard let` to unwrap `option<T>` or `result<T, E>` payloads and bind the
+success value for the rest of the scope:
+
+```kettu nocheck
+guard let value = maybe-value else {
+    return 0;
+};
+
+value
+```
+
+For `option<T>`, the binding succeeds on `some`. For `result<T, E>`, it succeeds
+on `ok`.
 
 ## Function Calls
 
@@ -207,4 +234,3 @@ let x = #some(42);
 let y = #none;
 let r = result#ok(10);
 ```
-

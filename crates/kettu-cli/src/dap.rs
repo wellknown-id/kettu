@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -194,7 +194,9 @@ impl DebugSession {
             .closures
             .iter()
             .enumerate()
-            .filter(|(_, closure)| self.current_line > closure.start_line && self.current_line <= closure.end_line)
+            .filter(|(_, closure)| {
+                self.current_line > closure.start_line && self.current_line <= closure.end_line
+            })
             .map(|(index, _)| index)
             .collect();
 
@@ -408,11 +410,8 @@ pub fn run_server() -> io::Result<()> {
                         session.configured = false;
                         session.terminated = false;
                         session.current_test = 0;
-                        session.current_line = session
-                            .tests
-                            .first()
-                            .map(|t| t.line - 1)
-                            .unwrap_or(0);
+                        session.current_line =
+                            session.tests.first().map(|t| t.line - 1).unwrap_or(0);
                         session.active_closures.clear();
 
                         send_response(&mut writer, seq, command, true, Some(json!({})), None)?;
@@ -659,9 +658,7 @@ fn send_stopped_event(writer: &mut impl Write, reason: &str) -> io::Result<()> {
     )
 }
 
-fn load_program_state(
-    program: Option<PathBuf>,
-) -> Result<ProgramState, String> {
+fn load_program_state(program: Option<PathBuf>) -> Result<ProgramState, String> {
     let Some(program) = program else {
         return Err("Missing launch argument: program".to_string());
     };
@@ -848,7 +845,10 @@ fn list_tests_from_ast(ast: &kettu_parser::WitFile, source: &str) -> Vec<ListedT
         if let kettu_parser::TopLevelItem::Interface(iface) = item {
             for iface_item in &iface.items {
                 if let kettu_parser::InterfaceItem::Func(func) = iface_item {
-                    let is_test = func.gates.iter().any(|g| matches!(g, kettu_parser::Gate::Test));
+                    let is_test = func
+                        .gates
+                        .iter()
+                        .any(|g| matches!(g, kettu_parser::Gate::Test));
                     if !is_test {
                         continue;
                     }
@@ -890,28 +890,62 @@ fn annotate_closure_captures(ast: &mut kettu_parser::WitFile) {
     }
 }
 
-fn annotate_statement_captures(statement: &mut kettu_parser::Statement, scope: &mut HashSet<String>) {
+fn annotate_statement_captures(
+    statement: &mut kettu_parser::Statement,
+    scope: &mut HashSet<String>,
+) {
     match statement {
         kettu_parser::Statement::Expr(expr) => kettu_parser::capture::analyze_captures(expr, scope),
         kettu_parser::Statement::Let { name, value } => {
             kettu_parser::capture::analyze_captures(value, scope);
             scope.insert(name.name.clone());
         }
-        kettu_parser::Statement::Return(Some(expr)) => kettu_parser::capture::analyze_captures(expr, scope),
+        kettu_parser::Statement::Return(Some(expr)) => {
+            kettu_parser::capture::analyze_captures(expr, scope)
+        }
         kettu_parser::Statement::Return(None) => {}
         kettu_parser::Statement::Assign { value, .. }
         | kettu_parser::Statement::CompoundAssign { value, .. } => {
             kettu_parser::capture::analyze_captures(value, scope);
         }
-        kettu_parser::Statement::Break { condition: Some(expr) }
-        | kettu_parser::Statement::Continue { condition: Some(expr) } => {
+        kettu_parser::Statement::Break {
+            condition: Some(expr),
+        }
+        | kettu_parser::Statement::Continue {
+            condition: Some(expr),
+        } => {
             kettu_parser::capture::analyze_captures(expr, scope);
         }
         kettu_parser::Statement::Break { condition: None }
         | kettu_parser::Statement::Continue { condition: None } => {}
-        kettu_parser::Statement::SharedLet { name, initial_value } => {
+        kettu_parser::Statement::SharedLet {
+            name,
+            initial_value,
+        } => {
             kettu_parser::capture::analyze_captures(initial_value, scope);
             scope.insert(name.name.clone());
+        }
+        kettu_parser::Statement::GuardLet {
+            name,
+            value,
+            else_body,
+        } => {
+            kettu_parser::capture::analyze_captures(value, scope);
+            let mut guard_scope = scope.clone();
+            for stmt in else_body {
+                annotate_statement_captures(stmt, &mut guard_scope);
+            }
+            scope.insert(name.name.clone());
+        }
+        kettu_parser::Statement::Guard {
+            condition,
+            else_body,
+        } => {
+            kettu_parser::capture::analyze_captures(condition, scope);
+            let mut guard_scope = scope.clone();
+            for stmt in else_body {
+                annotate_statement_captures(stmt, &mut guard_scope);
+            }
         }
     }
 }
@@ -923,7 +957,10 @@ fn collect_closures_from_ast(ast: &kettu_parser::WitFile, source: &str) -> Vec<C
         if let kettu_parser::TopLevelItem::Interface(iface) = item {
             for iface_item in &iface.items {
                 if let kettu_parser::InterfaceItem::Func(func) = iface_item {
-                    let is_test = func.gates.iter().any(|g| matches!(g, kettu_parser::Gate::Test));
+                    let is_test = func
+                        .gates
+                        .iter()
+                        .any(|g| matches!(g, kettu_parser::Gate::Test));
                     if !is_test {
                         continue;
                     }
@@ -951,8 +988,8 @@ fn collect_closures_from_statements(
                 collect_closures_from_expr(expr, source, closures, None);
             }
             kettu_parser::Statement::Let { name, value } => {
-                let preferred_name = matches!(value, kettu_parser::Expr::Lambda { .. })
-                    .then(|| name.name.clone());
+                let preferred_name =
+                    matches!(value, kettu_parser::Expr::Lambda { .. }).then(|| name.name.clone());
                 collect_closures_from_expr(value, source, closures, preferred_name);
             }
             kettu_parser::Statement::Return(Some(expr)) => {
@@ -963,14 +1000,31 @@ fn collect_closures_from_statements(
             | kettu_parser::Statement::CompoundAssign { value, .. } => {
                 collect_closures_from_expr(value, source, closures, None);
             }
-            kettu_parser::Statement::Break { condition: Some(expr) }
-            | kettu_parser::Statement::Continue { condition: Some(expr) } => {
+            kettu_parser::Statement::Break {
+                condition: Some(expr),
+            }
+            | kettu_parser::Statement::Continue {
+                condition: Some(expr),
+            } => {
                 collect_closures_from_expr(expr, source, closures, None);
             }
             kettu_parser::Statement::Break { condition: None }
             | kettu_parser::Statement::Continue { condition: None } => {}
             kettu_parser::Statement::SharedLet { initial_value, .. } => {
                 collect_closures_from_expr(initial_value, source, closures, None);
+            }
+            kettu_parser::Statement::GuardLet {
+                value, else_body, ..
+            } => {
+                collect_closures_from_expr(value, source, closures, None);
+                collect_closures_from_statements(else_body, source, closures);
+            }
+            kettu_parser::Statement::Guard {
+                condition,
+                else_body,
+            } => {
+                collect_closures_from_expr(condition, source, closures, None);
+                collect_closures_from_statements(else_body, source, closures);
             }
         }
     }
@@ -998,7 +1052,10 @@ fn collect_closures_from_expr(
                 end_line,
                 name: preferred_name.unwrap_or(fallback_name),
                 params: params.iter().map(|param| param.name.clone()).collect(),
-                captures: captures.iter().map(|capture| capture.name.clone()).collect(),
+                captures: captures
+                    .iter()
+                    .map(|capture| capture.name.clone())
+                    .collect(),
                 inline_invocation_line,
             });
             collect_closures_from_expr(body, source, closures, None);
@@ -1033,13 +1090,17 @@ fn collect_closures_from_expr(
                 collect_closures_from_statements(else_branch, source, closures);
             }
         }
-        kettu_parser::Expr::Match { scrutinee, arms, .. } => {
+        kettu_parser::Expr::Match {
+            scrutinee, arms, ..
+        } => {
             collect_closures_from_expr(scrutinee, source, closures, None);
             for arm in arms {
                 collect_closures_from_statements(&arm.body, source, closures);
             }
         }
-        kettu_parser::Expr::While { condition, body, .. } => {
+        kettu_parser::Expr::While {
+            condition, body, ..
+        } => {
             collect_closures_from_expr(condition, source, closures, None);
             collect_closures_from_statements(body, source, closures);
         }
@@ -1126,7 +1187,9 @@ fn collect_closures_from_expr(
         kettu_parser::Expr::AtomicStore { addr, value, .. }
         | kettu_parser::Expr::AtomicAdd { addr, value, .. }
         | kettu_parser::Expr::AtomicSub { addr, value, .. }
-        | kettu_parser::Expr::AtomicNotify { addr, count: value, .. } => {
+        | kettu_parser::Expr::AtomicNotify {
+            addr, count: value, ..
+        } => {
             collect_closures_from_expr(addr, source, closures, None);
             collect_closures_from_expr(value, source, closures, None);
         }
@@ -1379,7 +1442,12 @@ fn extract_call_name(line: &str) -> Option<String> {
 fn find_invoked_closure(
     session: &DebugSession,
     current_line: i64,
-) -> Option<(usize, i64, HashMap<String, SimpleValue>, HashMap<String, SimpleValue>)> {
+) -> Option<(
+    usize,
+    i64,
+    HashMap<String, SimpleValue>,
+    HashMap<String, SimpleValue>,
+)> {
     if current_line <= 0 {
         return None;
     }
@@ -1398,7 +1466,12 @@ fn find_invoked_closure(
             let call_env = test_environment_for_line(session, current_line);
             let capture_bindings = capture_values_for_closure(session, closure_index, &call_env);
             let param_bindings = build_param_bindings(closure, line, &call_env);
-            return Some((closure_index, current_line + 1, param_bindings, capture_bindings));
+            return Some((
+                closure_index,
+                current_line + 1,
+                param_bindings,
+                capture_bindings,
+            ));
         }
     }
 
@@ -1421,7 +1494,12 @@ fn find_invoked_closure(
                 .iter()
                 .map(|param| (param.clone(), SimpleValue::Unknown("<param>".to_string())))
                 .collect();
-            (closure_index, current_line + 1, param_bindings, capture_bindings)
+            (
+                closure_index,
+                current_line + 1,
+                param_bindings,
+                capture_bindings,
+            )
         })
 }
 
@@ -1478,7 +1556,9 @@ fn frame_local_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable>
     };
 
     match target {
-        FrameTarget::Test => variables_from_env(&test_environment_for_line(session, session.current_line)),
+        FrameTarget::Test => {
+            variables_from_env(&test_environment_for_line(session, session.current_line))
+        }
         FrameTarget::Closure(closure_index) => {
             let closure = &session.closures[closure_index];
             let capture_names: HashSet<String> = closure.captures.iter().cloned().collect();
@@ -1557,7 +1637,10 @@ fn frame_environment(session: &DebugSession, frame_id: i64) -> HashMap<String, S
             };
 
             for variable in frame_local_variables(session, frame_id) {
-                env.insert(variable.name, parse_variable_display(&variable.value, &variable.var_type));
+                env.insert(
+                    variable.name,
+                    parse_variable_display(&variable.value, &variable.var_type),
+                );
             }
 
             env
@@ -1765,7 +1848,11 @@ fn infer_values_in_range(
     let start_index = start_line.max(1).saturating_sub(1) as usize;
     let end_index = (end_line as usize).min(source_lines.len());
 
-    for line in source_lines.iter().skip(start_index).take(end_index.saturating_sub(start_index)) {
+    for line in source_lines
+        .iter()
+        .skip(start_index)
+        .take(end_index.saturating_sub(start_index))
+    {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with("//") {
             continue;
@@ -2232,10 +2319,16 @@ fn numeric_binary_op(
     op: impl Fn(f64, f64) -> f64,
 ) -> Result<SimpleValue, String> {
     match (lhs, rhs) {
-        (SimpleValue::Int(lhs), SimpleValue::Int(rhs)) => Ok(SimpleValue::Int(op(lhs as f64, rhs as f64) as i64)),
+        (SimpleValue::Int(lhs), SimpleValue::Int(rhs)) => {
+            Ok(SimpleValue::Int(op(lhs as f64, rhs as f64) as i64))
+        }
         (SimpleValue::Float(lhs), SimpleValue::Float(rhs)) => Ok(SimpleValue::Float(op(lhs, rhs))),
-        (SimpleValue::Int(lhs), SimpleValue::Float(rhs)) => Ok(SimpleValue::Float(op(lhs as f64, rhs))),
-        (SimpleValue::Float(lhs), SimpleValue::Int(rhs)) => Ok(SimpleValue::Float(op(lhs, rhs as f64))),
+        (SimpleValue::Int(lhs), SimpleValue::Float(rhs)) => {
+            Ok(SimpleValue::Float(op(lhs as f64, rhs)))
+        }
+        (SimpleValue::Float(lhs), SimpleValue::Int(rhs)) => {
+            Ok(SimpleValue::Float(op(lhs, rhs as f64)))
+        }
         _ => Err("Numeric operator requires numeric operands".to_string()),
     }
 }
@@ -2246,10 +2339,16 @@ fn compare_binary_op(
     op: impl Fn(f64, f64) -> bool,
 ) -> Result<SimpleValue, String> {
     match (lhs, rhs) {
-        (SimpleValue::Int(lhs), SimpleValue::Int(rhs)) => Ok(SimpleValue::Bool(op(lhs as f64, rhs as f64))),
+        (SimpleValue::Int(lhs), SimpleValue::Int(rhs)) => {
+            Ok(SimpleValue::Bool(op(lhs as f64, rhs as f64)))
+        }
         (SimpleValue::Float(lhs), SimpleValue::Float(rhs)) => Ok(SimpleValue::Bool(op(lhs, rhs))),
-        (SimpleValue::Int(lhs), SimpleValue::Float(rhs)) => Ok(SimpleValue::Bool(op(lhs as f64, rhs))),
-        (SimpleValue::Float(lhs), SimpleValue::Int(rhs)) => Ok(SimpleValue::Bool(op(lhs, rhs as f64))),
+        (SimpleValue::Int(lhs), SimpleValue::Float(rhs)) => {
+            Ok(SimpleValue::Bool(op(lhs as f64, rhs)))
+        }
+        (SimpleValue::Float(lhs), SimpleValue::Int(rhs)) => {
+            Ok(SimpleValue::Bool(op(lhs, rhs as f64)))
+        }
         _ => Err("Comparison operator requires numeric operands".to_string()),
     }
 }
@@ -2312,11 +2411,10 @@ fn read_dap_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
 
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("content-length:") {
-            let raw = line
-                .split(':')
-                .nth(1)
-                .map(str::trim)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid DAP header"))?;
+            let raw =
+                line.split(':').nth(1).map(str::trim).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Invalid DAP header")
+                })?;
             let parsed = raw.parse::<usize>().map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "Invalid Content-Length value")
             })?;
@@ -2336,7 +2434,7 @@ fn read_dap_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{infer_locals, parse_closures, DebugSession, ListedTest};
+    use super::{DebugSession, ListedTest, infer_locals, parse_closures};
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -2448,7 +2546,10 @@ mod tests {
         let frames = super::build_stack_frames(&session);
         assert!(frames.len() >= 2);
         assert_eq!(frames[0].get("name"), Some(&json!("y")));
-        assert_eq!(frames[1].get("name"), Some(&json!('@'.to_string() + "test t")));
+        assert_eq!(
+            frames[1].get("name"),
+            Some(&json!('@'.to_string() + "test t"))
+        );
     }
 
     #[test]

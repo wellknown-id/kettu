@@ -527,6 +527,15 @@ fn stmt(cst: &grammar::Stmt) -> ast::Statement {
         grammar::Stmt::ReturnVoid(_) => ast::Statement::Return(None),
         grammar::Stmt::Break(_) => ast::Statement::Break { condition: None },
         grammar::Stmt::Continue(_) => ast::Statement::Continue { condition: None },
+        grammar::Stmt::GuardLet(g) => ast::Statement::GuardLet {
+            name: spanned_id(&g.name),
+            value: sexpr_flat(&g.value),
+            else_body: g.else_body.iter().map(stmt).collect(),
+        },
+        grammar::Stmt::Guard(g) => ast::Statement::Guard {
+            condition: Box::new(sexpr(&g.condition)),
+            else_body: g.else_body.iter().map(stmt).collect(),
+        },
         grammar::Stmt::Expr(e) => ast::Statement::Expr(sexpr_flat(&e.expr)),
         grammar::Stmt::TailExpr(e) => ast::Statement::Expr(sexpr_flat(&e.expr)),
         grammar::Stmt::SharedLet(s) => ast::Statement::SharedLet {
@@ -562,9 +571,10 @@ fn expr_with_span(cst: &grammar::Expr, outer_span: Range<usize>) -> ast::Expr {
                     let after_open = &rest[open + 1..];
                     if let Some(close) = after_open.find('}') {
                         let ident = after_open[..close].trim().to_string();
-                        parts.push(ast::StringPart::Expr(Box::new(ast::Expr::Ident(
-                            ast::Id { name: ident, span: outer_span.clone() },
-                        ))));
+                        parts.push(ast::StringPart::Expr(Box::new(ast::Expr::Ident(ast::Id {
+                            name: ident,
+                            span: outer_span.clone(),
+                        }))));
                         rest = &after_open[close + 1..];
                     } else {
                         // No closing brace — treat rest as literal
@@ -943,13 +953,48 @@ fn expr_with_span(cst: &grammar::Expr, outer_span: Range<usize>) -> ast::Expr {
         },
 
         // SIMD operations
-        grammar::Expr::SimdV128(s) => convert_simd_expr(ast::SimdLane::V128, s.op.value.as_str(), &s.call_args.args, outer_span),
-        grammar::Expr::SimdI8x16(s) => convert_simd_expr(ast::SimdLane::I8x16, s.op.value.as_str(), &s.call_args.args, outer_span),
-        grammar::Expr::SimdI16x8(s) => convert_simd_expr(ast::SimdLane::I16x8, s.op.value.as_str(), &s.call_args.args, outer_span),
-        grammar::Expr::SimdI32x4(s) => convert_simd_expr(ast::SimdLane::I32x4, s.op.value.as_str(), &s.call_args.args, outer_span),
-        grammar::Expr::SimdI64x2(s) => convert_simd_expr(ast::SimdLane::I64x2, s.op.value.as_str(), &s.call_args.args, outer_span),
-        grammar::Expr::SimdF32x4(s) => convert_simd_expr(ast::SimdLane::F32x4, s.op.value.as_str(), &s.call_args.args, outer_span),
-        grammar::Expr::SimdF64x2(s) => convert_simd_expr(ast::SimdLane::F64x2, s.op.value.as_str(), &s.call_args.args, outer_span),
+        grammar::Expr::SimdV128(s) => convert_simd_expr(
+            ast::SimdLane::V128,
+            s.op.value.as_str(),
+            &s.call_args.args,
+            outer_span,
+        ),
+        grammar::Expr::SimdI8x16(s) => convert_simd_expr(
+            ast::SimdLane::I8x16,
+            s.op.value.as_str(),
+            &s.call_args.args,
+            outer_span,
+        ),
+        grammar::Expr::SimdI16x8(s) => convert_simd_expr(
+            ast::SimdLane::I16x8,
+            s.op.value.as_str(),
+            &s.call_args.args,
+            outer_span,
+        ),
+        grammar::Expr::SimdI32x4(s) => convert_simd_expr(
+            ast::SimdLane::I32x4,
+            s.op.value.as_str(),
+            &s.call_args.args,
+            outer_span,
+        ),
+        grammar::Expr::SimdI64x2(s) => convert_simd_expr(
+            ast::SimdLane::I64x2,
+            s.op.value.as_str(),
+            &s.call_args.args,
+            outer_span,
+        ),
+        grammar::Expr::SimdF32x4(s) => convert_simd_expr(
+            ast::SimdLane::F32x4,
+            s.op.value.as_str(),
+            &s.call_args.args,
+            outer_span,
+        ),
+        grammar::Expr::SimdF64x2(s) => convert_simd_expr(
+            ast::SimdLane::F64x2,
+            s.op.value.as_str(),
+            &s.call_args.args,
+            outer_span,
+        ),
     }
 }
 
@@ -977,7 +1022,13 @@ fn convert_simd_expr(
         converted_args.push(sexpr_flat(arg));
     }
 
-    ast::Expr::SimdOp { lane, op, args: converted_args, lane_idx, span }
+    ast::Expr::SimdOp {
+        lane,
+        op,
+        args: converted_args,
+        lane_idx,
+        span,
+    }
 }
 
 fn parse_simd_op(name: &str) -> ast::SimdOp {

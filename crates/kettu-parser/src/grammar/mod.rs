@@ -759,6 +759,8 @@ pub enum Stmt {
     ReturnVoid(ReturnVoidStmt),
     Break(BreakStmt),
     Continue(ContinueStmt),
+    GuardLet(GuardLetStmt),
+    Guard(GuardStmt),
     Expr(ExprStmt),
     /// Trailing expression without semicolon (last item in a block)
     TailExpr(TailExprStmt),
@@ -856,6 +858,44 @@ pub struct BreakStmt {
 pub struct ContinueStmt {
     #[leaf("continue")]
     _kw: (),
+    #[leaf(";")]
+    _semi: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct GuardLetStmt {
+    #[leaf("guard")]
+    _kw: (),
+    #[leaf("let")]
+    _let_kw: (),
+    #[leaf(KIdent)]
+    pub name: Spanned<String>,
+    #[leaf("=")]
+    _eq: (),
+    pub value: Spanned<Expr>,
+    #[leaf("else")]
+    _else_kw: (),
+    #[leaf("{")]
+    _lb: (),
+    pub else_body: Vec<Stmt>,
+    #[leaf("}")]
+    _rb: (),
+    #[leaf(";")]
+    _semi: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct GuardStmt {
+    #[leaf("guard")]
+    _kw: (),
+    pub condition: Spanned<Box<Expr>>,
+    #[leaf("else")]
+    _else_kw: (),
+    #[leaf("{")]
+    _lb: (),
+    pub else_body: Vec<Stmt>,
+    #[leaf("}")]
+    _rb: (),
     #[leaf(";")]
     _semi: (),
 }
@@ -1074,6 +1114,7 @@ pub struct ParenExpr {
 }
 
 #[derive(Debug, Clone, PartialEq, Rule)]
+#[prec_right(10)]
 pub struct IfExpr {
     #[leaf("if")]
     _kw: (),
@@ -1719,7 +1760,6 @@ pub struct SimdF64x2Expr {
     pub op: Spanned<String>,
     pub call_args: CallArgs,
 }
-
 
 // ============================================================================
 

@@ -174,7 +174,11 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
                 }
             }
         }
-        Expr::Assert(e, _) | Expr::Not(e, _) | Expr::Neg(e, _) | Expr::StrLen(e, _) | Expr::ListLen(e, _) => {
+        Expr::Assert(e, _)
+        | Expr::Not(e, _)
+        | Expr::Neg(e, _)
+        | Expr::StrLen(e, _)
+        | Expr::ListLen(e, _) => {
             analyze_captures(e, scope);
         }
         Expr::StrEq(a, b, _) => {
@@ -204,16 +208,28 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
         Expr::AtomicStore { addr, value, .. }
         | Expr::AtomicAdd { addr, value, .. }
         | Expr::AtomicSub { addr, value, .. }
-        | Expr::AtomicNotify { addr, count: value, .. } => {
+        | Expr::AtomicNotify {
+            addr, count: value, ..
+        } => {
             analyze_captures(addr, scope);
             analyze_captures(value, scope);
         }
-        Expr::AtomicCmpxchg { addr, expected, replacement, .. } => {
+        Expr::AtomicCmpxchg {
+            addr,
+            expected,
+            replacement,
+            ..
+        } => {
             analyze_captures(addr, scope);
             analyze_captures(expected, scope);
             analyze_captures(replacement, scope);
         }
-        Expr::AtomicWait { addr, expected, timeout, .. } => {
+        Expr::AtomicWait {
+            addr,
+            expected,
+            timeout,
+            ..
+        } => {
             analyze_captures(addr, scope);
             analyze_captures(expected, scope);
             analyze_captures(timeout, scope);
@@ -236,7 +252,9 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
                 analyze_captures(arg, scope);
             }
         }
-        Expr::SimdForEach { collection, body, .. } => {
+        Expr::SimdForEach {
+            collection, body, ..
+        } => {
             analyze_captures(collection, scope);
             for stmt in body {
                 analyze_statement(stmt, scope);
@@ -260,6 +278,23 @@ fn analyze_statement(stmt: &mut Statement, scope: &HashSet<String>) {
         Statement::Continue { condition: Some(e) } => analyze_captures(e, scope),
         Statement::Continue { condition: None } => {}
         Statement::SharedLet { initial_value, .. } => analyze_captures(initial_value, scope),
+        Statement::GuardLet {
+            value, else_body, ..
+        } => {
+            analyze_captures(value, scope);
+            for stmt in else_body {
+                analyze_statement(stmt, scope);
+            }
+        }
+        Statement::Guard {
+            condition,
+            else_body,
+        } => {
+            analyze_captures(condition, scope);
+            for stmt in else_body {
+                analyze_statement(stmt, scope);
+            }
+        }
     }
 }
 
@@ -418,7 +453,11 @@ fn collect_free_variables(expr: &Expr, bound: &HashSet<String>, free: &mut HashS
                 }
             }
         }
-        Expr::Assert(e, _) | Expr::Not(e, _) | Expr::Neg(e, _) | Expr::StrLen(e, _) | Expr::ListLen(e, _) => {
+        Expr::Assert(e, _)
+        | Expr::Not(e, _)
+        | Expr::Neg(e, _)
+        | Expr::StrLen(e, _)
+        | Expr::ListLen(e, _) => {
             collect_free_variables(e, bound, free);
         }
         Expr::StrEq(a, b, _) => {
@@ -448,16 +487,28 @@ fn collect_free_variables(expr: &Expr, bound: &HashSet<String>, free: &mut HashS
         Expr::AtomicStore { addr, value, .. }
         | Expr::AtomicAdd { addr, value, .. }
         | Expr::AtomicSub { addr, value, .. }
-        | Expr::AtomicNotify { addr, count: value, .. } => {
+        | Expr::AtomicNotify {
+            addr, count: value, ..
+        } => {
             collect_free_variables(addr, bound, free);
             collect_free_variables(value, bound, free);
         }
-        Expr::AtomicCmpxchg { addr, expected, replacement, .. } => {
+        Expr::AtomicCmpxchg {
+            addr,
+            expected,
+            replacement,
+            ..
+        } => {
             collect_free_variables(addr, bound, free);
             collect_free_variables(expected, bound, free);
             collect_free_variables(replacement, bound, free);
         }
-        Expr::AtomicWait { addr, expected, timeout, .. } => {
+        Expr::AtomicWait {
+            addr,
+            expected,
+            timeout,
+            ..
+        } => {
             collect_free_variables(addr, bound, free);
             collect_free_variables(expected, bound, free);
             collect_free_variables(timeout, bound, free);
@@ -480,7 +531,9 @@ fn collect_free_variables(expr: &Expr, bound: &HashSet<String>, free: &mut HashS
                 collect_free_variables(arg, bound, free);
             }
         }
-        Expr::SimdForEach { collection, body, .. } => {
+        Expr::SimdForEach {
+            collection, body, ..
+        } => {
             collect_free_variables(collection, bound, free);
             for stmt in body {
                 collect_free_in_statement(stmt, bound, free);
@@ -509,6 +562,23 @@ fn collect_free_in_statement(
         Statement::Continue { condition: None } => {}
         Statement::SharedLet { initial_value, .. } => {
             collect_free_variables(initial_value, bound, free)
+        }
+        Statement::GuardLet {
+            value, else_body, ..
+        } => {
+            collect_free_variables(value, bound, free);
+            for stmt in else_body {
+                collect_free_in_statement(stmt, bound, free);
+            }
+        }
+        Statement::Guard {
+            condition,
+            else_body,
+        } => {
+            collect_free_variables(condition, bound, free);
+            for stmt in else_body {
+                collect_free_in_statement(stmt, bound, free);
+            }
         }
     }
 }
@@ -580,7 +650,10 @@ mod tests {
             panic!("expected lambda");
         };
         assert_eq!(
-            captures.iter().map(|capture| capture.name.as_str()).collect::<Vec<_>>(),
+            captures
+                .iter()
+                .map(|capture| capture.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["x"]
         );
     }

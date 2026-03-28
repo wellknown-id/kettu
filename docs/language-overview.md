@@ -42,6 +42,15 @@ x -= 2;         // compound subtract
 // Conditionals
 if x > 0 { x; } else { 0; };
 
+// Early exits
+guard x > 0 else {
+    return 0;
+};
+
+guard let value = maybe-value else {
+    return 0;
+};
+
 // While loops
 let i = 0;
 while i < 10 {

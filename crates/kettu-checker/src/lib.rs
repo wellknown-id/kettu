@@ -179,6 +179,8 @@ struct Checker {
     imported_interface_bindings: HashSet<String>,
     /// Type parameters currently in scope (for generic type definitions)
     type_params: HashSet<String>,
+    /// Nesting depth of loop bodies currently being validated
+    loop_depth: usize,
 }
 
 /// Checked type representation for expression type checking
@@ -227,6 +229,7 @@ impl Checker {
             locals: HashMap::new(),
             imported_interface_bindings: HashSet::new(),
             type_params: HashSet::new(),
+            loop_depth: 0,
         }
     }
 
@@ -761,12 +764,70 @@ impl Checker {
                 if let Some(cond) = condition {
                     self.check_expr(cond);
                 }
+                if self.loop_depth == 0 {
+                    let keyword = if matches!(stmt, Statement::Break { .. }) {
+                        "break"
+                    } else {
+                        "continue"
+                    };
+                    let span = condition
+                        .as_deref()
+                        .map(Self::expr_span)
+                        .unwrap_or_default();
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("`{keyword}` can only appear inside a loop"),
+                        span,
+                        DiagnosticCode::InvalidUse,
+                    ));
+                }
             }
-            Statement::SharedLet { name, initial_value } => {
+            Statement::SharedLet {
+                name,
+                initial_value,
+            } => {
                 let _value_ty = self.check_expr(initial_value);
                 // Shared variables always have type Shared (opaque)
                 self.locals.insert(name.name.clone(), CheckedType::Shared);
             }
+            Statement::GuardLet {
+                name,
+                value,
+                else_body,
+            } => {
+                let value_ty = self.check_expr(value);
+                let binding_ty = self.guard_binding_type(value_ty, Self::expr_span(value));
+                self.validate_guard_else_body(
+                    else_body,
+                    name.span.clone(),
+                    "`guard let` else block must exit the current scope with `return`, `break`, or `continue`",
+                );
+                self.locals.insert(name.name.clone(), binding_ty);
+            }
+            Statement::Guard {
+                condition,
+                else_body,
+            } => {
+                let cond_ty = self.check_expr(condition);
+                if cond_ty != CheckedType::Bool && cond_ty != CheckedType::Unknown {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("Guard condition requires bool, got {:?}", cond_ty),
+                        Self::expr_span(condition),
+                        DiagnosticCode::TypeMismatch,
+                    ));
+                }
+
+                self.validate_guard_else_body(
+                    else_body,
+                    Self::expr_span(condition),
+                    "`guard` else block must exit the current scope with `return`, `break`, or `continue`",
+                );
+            }
+        }
+    }
+
+    fn validate_block(&mut self, statements: &[Statement]) {
+        for stmt in statements {
+            self.validate_statement(stmt);
         }
     }
 
@@ -793,6 +854,120 @@ impl Checker {
         }
 
         tail
+    }
+
+    fn guard_binding_type(&mut self, value_ty: CheckedType, span: Span) -> CheckedType {
+        match value_ty {
+            CheckedType::Option(inner) => *inner,
+            CheckedType::Result {
+                ok: Some(inner), ..
+            } => *inner,
+            CheckedType::Unknown => CheckedType::Unknown,
+            CheckedType::Result { ok: None, .. } => {
+                self.diagnostics.push(Diagnostic::error(
+                    "Guard let requires option<T> or result<T, E> with an `ok` payload".to_string(),
+                    span,
+                    DiagnosticCode::TypeMismatch,
+                ));
+                CheckedType::Unknown
+            }
+            other => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "Guard let requires option<T> or result<T, E>, got {:?}",
+                        other
+                    ),
+                    span,
+                    DiagnosticCode::TypeMismatch,
+                ));
+                CheckedType::Unknown
+            }
+        }
+    }
+
+    fn validate_guard_else_body(&mut self, else_body: &[Statement], span: Span, message: &str) {
+        let saved_locals = self.locals.clone();
+        self.validate_block(else_body);
+        self.locals = saved_locals;
+
+        if !self.block_exits_scope(else_body) {
+            self.diagnostics.push(Diagnostic::error(
+                message.to_string(),
+                span,
+                DiagnosticCode::InvalidUse,
+            ));
+        }
+    }
+
+    fn block_exits_scope(&self, statements: &[Statement]) -> bool {
+        match statements.last() {
+            Some(stmt) => self.statement_exits_scope(stmt),
+            None => false,
+        }
+    }
+
+    fn statement_exits_scope(&self, stmt: &Statement) -> bool {
+        match stmt {
+            Statement::Return(_) => true,
+            Statement::Break { .. } | Statement::Continue { .. } => self.loop_depth > 0,
+            Statement::Expr(Expr::If {
+                then_branch,
+                else_branch: Some(else_branch),
+                ..
+            }) => self.block_exits_scope(then_branch) && self.block_exits_scope(else_branch),
+            _ => false,
+        }
+    }
+
+    fn expr_span(expr: &Expr) -> Span {
+        match expr {
+            Expr::Ident(id) => id.span.clone(),
+            Expr::Integer(_, span)
+            | Expr::String(_, span)
+            | Expr::InterpolatedString(_, span)
+            | Expr::Bool(_, span)
+            | Expr::Assert(_, span)
+            | Expr::Not(_, span)
+            | Expr::Neg(_, span)
+            | Expr::StrLen(_, span)
+            | Expr::ListLen(_, span)
+            | Expr::StrEq(_, _, span)
+            | Expr::ListSet(_, _, _, span)
+            | Expr::ListPush(_, _, span) => span.clone(),
+            Expr::Call { span, .. }
+            | Expr::Field { span, .. }
+            | Expr::OptionalChain { span, .. }
+            | Expr::Try { span, .. }
+            | Expr::Binary { span, .. }
+            | Expr::If { span, .. }
+            | Expr::Lambda { span, .. }
+            | Expr::Map { span, .. }
+            | Expr::Filter { span, .. }
+            | Expr::Reduce { span, .. }
+            | Expr::RecordLiteral { span, .. }
+            | Expr::VariantLiteral { span, .. }
+            | Expr::Match { span, .. }
+            | Expr::While { span, .. }
+            | Expr::Range { span, .. }
+            | Expr::For { span, .. }
+            | Expr::ListLiteral { span, .. }
+            | Expr::Index { span, .. }
+            | Expr::Slice { span, .. }
+            | Expr::ForEach { span, .. }
+            | Expr::Await { span, .. }
+            | Expr::AtomicLoad { span, .. }
+            | Expr::AtomicStore { span, .. }
+            | Expr::AtomicAdd { span, .. }
+            | Expr::AtomicSub { span, .. }
+            | Expr::AtomicCmpxchg { span, .. }
+            | Expr::AtomicWait { span, .. }
+            | Expr::AtomicNotify { span, .. }
+            | Expr::Spawn { span, .. }
+            | Expr::ThreadJoin { span, .. }
+            | Expr::AtomicBlock { span, .. }
+            | Expr::SimdOp { span, .. }
+            | Expr::SimdForEach { span, .. } => span.clone(),
+        }
     }
 
     fn check_expr(&mut self, expr: &Expr) -> CheckedType {
@@ -1483,7 +1658,7 @@ impl Checker {
                 let mut inferred_arm_type: Option<CheckedType> = None;
                 // Type check each arm's body expression
                 for arm in arms {
-                    let binding_name = match &arm.pattern {
+                    match &arm.pattern {
                         Pattern::Variant {
                             type_name,
                             case_name,
@@ -1551,41 +1726,23 @@ impl Checker {
 
                             if let Some(id) = binding {
                                 self.locals.insert(id.name.clone(), CheckedType::Unknown);
-                                Some(id.name.clone())
-                            } else {
-                                None
                             }
                         }
-                        _ => None,
+                        _ => {}
                     };
 
-                    let mut arm_result: Option<CheckedType> = None;
-                    // Type check the body
-                    for stmt in &arm.body {
-                        if let Statement::Expr(e) = stmt {
-                            arm_result = Some(self.check_expr(e));
-                        } else if let Statement::Return(Some(e)) = stmt {
-                            arm_result = Some(self.check_expr(e));
-                        } else if let Statement::Return(None) = stmt {
-                            arm_result = Some(CheckedType::Unknown);
-                        }
-                    }
+                    let saved_locals = self.locals.clone();
+                    let arm_result = self.check_block_tail_type(&arm.body);
+                    self.locals = saved_locals;
 
-                    if let Some(arm_ty) = arm_result {
-                        if arm_ty != CheckedType::Unknown {
-                            match &inferred_arm_type {
-                                Some(existing) if *existing != arm_ty => {
-                                    inferred_arm_type = Some(CheckedType::Unknown);
-                                }
-                                None => inferred_arm_type = Some(arm_ty),
-                                _ => {}
+                    if arm_result != CheckedType::Unknown {
+                        match &inferred_arm_type {
+                            Some(existing) if *existing != arm_result => {
+                                inferred_arm_type = Some(CheckedType::Unknown);
                             }
+                            None => inferred_arm_type = Some(arm_result),
+                            _ => {}
                         }
-                    }
-
-                    // Remove binding from scope after arm
-                    if let Some(name) = binding_name {
-                        self.locals.remove(&name);
                     }
                 }
                 // Match expressions return the type of the arms
@@ -1603,14 +1760,11 @@ impl Checker {
                         DiagnosticCode::TypeMismatch,
                     ));
                 }
-                // Type check body statements
-                for stmt in body {
-                    if let Statement::Expr(e) = stmt {
-                        self.check_expr(e);
-                    } else if let Statement::Return(Some(e)) = stmt {
-                        self.check_expr(e);
-                    }
-                }
+                let saved_locals = self.locals.clone();
+                self.loop_depth += 1;
+                self.validate_block(body);
+                self.loop_depth -= 1;
+                self.locals = saved_locals;
                 // While loops don't produce a value (unit type)
                 CheckedType::Unknown
             }
@@ -1643,18 +1797,12 @@ impl Checker {
             } => {
                 // Type check the range
                 self.check_expr(range);
-                // Add loop variable to scope (as i32)
-                let old_var = self.locals.insert(variable.name.clone(), CheckedType::I32);
-                // Type check body statements
-                for stmt in body {
-                    self.validate_statement(stmt);
-                }
-                // Restore old variable if shadowed
-                if let Some(old) = old_var {
-                    self.locals.insert(variable.name.clone(), old);
-                } else {
-                    self.locals.remove(&variable.name);
-                }
+                let saved_locals = self.locals.clone();
+                self.locals.insert(variable.name.clone(), CheckedType::I32);
+                self.loop_depth += 1;
+                self.validate_block(body);
+                self.loop_depth -= 1;
+                self.locals = saved_locals;
                 // For loops don't produce a value (unit type)
                 CheckedType::Unknown
             }
@@ -1679,18 +1827,12 @@ impl Checker {
                         CheckedType::Unknown
                     }
                 };
-                // Add loop variable to scope (as element type)
-                let old_var = self.locals.insert(variable.name.clone(), elem_ty);
-                // Type check body statements
-                for stmt in body {
-                    self.validate_statement(stmt);
-                }
-                // Restore old variable if shadowed
-                if let Some(old) = old_var {
-                    self.locals.insert(variable.name.clone(), old);
-                } else {
-                    self.locals.remove(&variable.name);
-                }
+                let saved_locals = self.locals.clone();
+                self.locals.insert(variable.name.clone(), elem_ty);
+                self.loop_depth += 1;
+                self.validate_block(body);
+                self.loop_depth -= 1;
+                self.locals = saved_locals;
                 // For-each loops don't produce a value (unit type)
                 CheckedType::Unknown
             }
@@ -1871,19 +2013,28 @@ impl Checker {
                 self.check_expr(value);
                 CheckedType::Unknown // void
             }
-            Expr::AtomicAdd { addr, value, .. }
-            | Expr::AtomicSub { addr, value, .. } => {
+            Expr::AtomicAdd { addr, value, .. } | Expr::AtomicSub { addr, value, .. } => {
                 self.check_expr(addr);
                 self.check_expr(value);
                 CheckedType::I32 // returns old value
             }
-            Expr::AtomicCmpxchg { addr, expected, replacement, .. } => {
+            Expr::AtomicCmpxchg {
+                addr,
+                expected,
+                replacement,
+                ..
+            } => {
                 self.check_expr(addr);
                 self.check_expr(expected);
                 self.check_expr(replacement);
                 CheckedType::I32 // returns old value
             }
-            Expr::AtomicWait { addr, expected, timeout, .. } => {
+            Expr::AtomicWait {
+                addr,
+                expected,
+                timeout,
+                ..
+            } => {
                 self.check_expr(addr);
                 self.check_expr(expected);
                 self.check_expr(timeout);
@@ -1925,22 +2076,25 @@ impl Checker {
                 }
                 // extract_lane returns a scalar; everything else returns v128
                 match op {
-                    SimdOp::ExtractLane | SimdOp::AnyTrue | SimdOp::AllTrue | SimdOp::Bitmask => CheckedType::I32,
+                    SimdOp::ExtractLane | SimdOp::AnyTrue | SimdOp::AllTrue | SimdOp::Bitmask => {
+                        CheckedType::I32
+                    }
                     _ => CheckedType::V128,
                 }
             }
-            Expr::SimdForEach { variable, collection, body, .. } => {
+            Expr::SimdForEach {
+                variable,
+                collection,
+                body,
+                ..
+            } => {
                 self.check_expr(collection);
-                // Loop variable is v128 (4 packed i32s)
-                let old_var = self.locals.insert(variable.name.clone(), CheckedType::V128);
-                for stmt in body {
-                    self.validate_statement(stmt);
-                }
-                if let Some(old) = old_var {
-                    self.locals.insert(variable.name.clone(), old);
-                } else {
-                    self.locals.remove(&variable.name);
-                }
+                let saved_locals = self.locals.clone();
+                self.locals.insert(variable.name.clone(), CheckedType::V128);
+                self.loop_depth += 1;
+                self.validate_block(body);
+                self.loop_depth -= 1;
+                self.locals = saved_locals;
                 CheckedType::Unknown
             }
         }
@@ -3299,7 +3453,11 @@ mod tests {
             .iter()
             .filter(|d| d.severity == Severity::Error)
             .collect();
-        assert!(errors.is_empty(), "spawn should type-check cleanly: {:?}", errors);
+        assert!(
+            errors.is_empty(),
+            "spawn should type-check cleanly: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -3324,7 +3482,10 @@ mod tests {
             .iter()
             .filter(|d| d.severity == Severity::Error)
             .collect();
-        assert!(!errors.is_empty(), "arithmetic on ThreadId should be rejected");
+        assert!(
+            !errors.is_empty(),
+            "arithmetic on ThreadId should be rejected"
+        );
     }
 
     #[test]
@@ -3342,8 +3503,15 @@ mod tests {
         let (ast, _) = parse_file(source);
         let ast = ast.expect("Should parse");
         let diags = check(&ast);
-        let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
-        assert!(errors.is_empty(), "shared let should type-check: {:?}", errors);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "shared let should type-check: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -3362,8 +3530,15 @@ mod tests {
         let (ast, _) = parse_file(source);
         let ast = ast.expect("Should parse");
         let diags = check(&ast);
-        let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
-        assert!(errors.is_empty(), "atomic block should type-check: {:?}", errors);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "atomic block should type-check: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -3386,8 +3561,15 @@ mod tests {
         let (ast, _) = parse_file(source);
         let ast = ast.expect("Should parse");
         let diags = check(&ast);
-        let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
-        assert!(errors.is_empty(), "combined shared let + atomic should type-check: {:?}", errors);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "combined shared let + atomic should type-check: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -3404,8 +3586,15 @@ mod tests {
         let (ast, _) = parse_file(source);
         let ast = ast.expect("Should parse");
         let diags = check(&ast);
-        let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
-        assert!(errors.is_empty(), "empty atomic block should type-check: {:?}", errors);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "empty atomic block should type-check: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -3424,8 +3613,15 @@ mod tests {
         let (ast, _) = parse_file(source);
         let ast = ast.expect("Should parse");
         let diags = check(&ast);
-        let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
-        assert!(errors.is_empty(), "thread.join(tid) should type-check: {:?}", errors);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "thread.join(tid) should type-check: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -3442,8 +3638,14 @@ mod tests {
         let (ast, _) = parse_file(source);
         let ast = ast.expect("Should parse");
         let diags = check(&ast);
-        let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
-        assert!(!errors.is_empty(), "thread.join(42) should be rejected — requires ThreadId");
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            !errors.is_empty(),
+            "thread.join(42) should be rejected — requires ThreadId"
+        );
     }
 
     #[test]
@@ -3465,7 +3667,250 @@ mod tests {
         let (ast, _) = parse_file(source);
         let ast = ast.expect("Should parse");
         let diags = check(&ast);
-        let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
-        assert!(errors.is_empty(), "spawn + join + shared let should type-check: {:?}", errors);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "spawn + join + shared let should type-check: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guard_statement_type_checks() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                classify: func(flag: bool) -> s32 {
+                    guard flag else {
+                        return 0;
+                    };
+                    1;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "guard should type-check: {:?}", errors);
+    }
+
+    #[test]
+    fn test_guard_statement_requires_bool_condition() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                classify: func() -> s32 {
+                    guard 42 else {
+                        return 0;
+                    };
+                    1;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            !errors.is_empty(),
+            "guard with non-bool condition should be rejected"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|d| d.message.contains("Guard condition requires bool")),
+            "expected guard condition error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guard_statement_requires_exiting_else_block() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                classify: func(flag: bool) -> s32 {
+                    guard flag else {
+                        let fallback = 0;
+                    };
+                    1;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|d| d.message.contains("must exit the current scope")),
+            "expected guard scope-exit error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guard_statement_allows_continue_inside_loop() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                sum: func() -> s32 {
+                    let total = 0;
+                    for item in [1, 2, 3] {
+                        guard item != 2 else {
+                            continue;
+                        };
+                        total += item;
+                    };
+                    total;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "guard with continue inside a loop should type-check: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guard_let_statement_type_checks_and_binds_payload() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                unwrap: func(v: option<s32>) -> s32 {
+                    guard let value = v else {
+                        return 0;
+                    };
+                    value;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "guard let should type-check and bind payload: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guard_let_accepts_result_ok_payload() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                unwrap: func(v: result<s32, string>) -> s32 {
+                    guard let value = v else {
+                        return 0;
+                    };
+                    value;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "guard let should unwrap result ok payloads: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guard_let_requires_option_or_result_source() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                unwrap: func(v: s32) -> s32 {
+                    guard let value = v else {
+                        return 0;
+                    };
+                    value;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors.iter().any(|d| d
+                .message
+                .contains("Guard let requires option<T> or result<T, E>")),
+            "expected guard let source type error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guard_let_requires_exiting_else_block() {
+        let source = r#"
+            package local:test;
+            interface effects {
+                unwrap: func(v: option<s32>) -> s32 {
+                    guard let value = v else {
+                        let fallback = 0;
+                    };
+                    value;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors.iter().any(|d| d
+                .message
+                .contains("`guard let` else block must exit the current scope")),
+            "expected guard let scope-exit error, got: {:?}",
+            errors
+        );
     }
 }

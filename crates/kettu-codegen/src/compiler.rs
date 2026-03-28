@@ -3,11 +3,11 @@
 //! Compiles Kettu AST (with function bodies) into a core WASM module.
 
 use kettu_parser::{
-    BinOp, Expr, Func, FuncBody, InterfaceItem, Param, Pattern, PrimitiveTy, ResourceMethod,
+    BinOp, Expr, Func, FuncBody, Id, InterfaceItem, Param, Pattern, PrimitiveTy, ResourceMethod,
     SimdLane, SimdOp, Statement, StringPart, TopLevelItem, Ty, TypeDef, TypeDefKind, WitFile,
 };
-use std::collections::HashMap;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::Range;
 use wasm_encoder::{
     CodeSection, CustomSection, DataSection, ElementSection, Elements, EntityType, ExportKind,
@@ -180,11 +180,7 @@ fn analyze_range_loop(induction_variable: &str, range: &Expr) -> Option<RangeLoo
         None => Some(1),
     };
 
-    let trip_count = match (
-        const_i32_expr(start),
-        const_i32_expr(end),
-        constant_step,
-    ) {
+    let trip_count = match (const_i32_expr(start), const_i32_expr(end), constant_step) {
         (Some(start), Some(end), Some(step)) => {
             compute_range_trip_count(start, end, step, *descending).map(LoopTripCount::Constant)
         }
@@ -564,7 +560,7 @@ impl<'a> ModuleCompiler<'a> {
         let spawn_bodies_clone = std::mem::take(&mut self.spawn_bodies);
         let mut compiled_spawns: Vec<Function> = Vec::new();
         for (_, _, body_stmts) in &spawn_bodies_clone {
-            let locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();
+            let mut locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();
             let locals: HashMap<String, u32> = HashMap::new();
             let mut func = Function::new(vec![]);
             for stmt in body_stmts {
@@ -576,6 +572,23 @@ impl<'a> ModuleCompiler<'a> {
                     Statement::Let { name: _, value, .. } => {
                         self.compile_expr_with_locals(&mut func, value, &locals, &locals_types)?;
                         func.instruction(&Instruction::Drop);
+                    }
+                    Statement::GuardLet {
+                        value, else_body, ..
+                    } => {
+                        self.compile_guard_let_statement(&mut func, value, else_body)?;
+                    }
+                    Statement::Guard {
+                        condition,
+                        else_body,
+                    } => {
+                        self.compile_guard_statement_with_locals(
+                            &mut func,
+                            condition,
+                            else_body,
+                            &locals,
+                            &mut locals_types,
+                        )?;
                     }
                     _ => {}
                 }
@@ -739,7 +752,11 @@ impl<'a> ModuleCompiler<'a> {
             let wts_t = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
             funcs.function(wts_t);
         }
-        if self.local_func_count > 0 || has_lambdas || !callback_bodies_clone.is_empty() || has_spawns {
+        if self.local_func_count > 0
+            || has_lambdas
+            || !callback_bodies_clone.is_empty()
+            || has_spawns
+        {
             module.section(&funcs);
         }
 
@@ -1383,7 +1400,9 @@ impl<'a> ModuleCompiler<'a> {
         function.instruction(&Instruction::I32Const(4));
         function.instruction(&Instruction::I32Sub);
         function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-            offset: 0, align: 2, memory_index: 0,
+            offset: 0,
+            align: 2,
+            memory_index: 0,
         }));
         function.instruction(&Instruction::LocalSet(2));
 
@@ -1392,7 +1411,9 @@ impl<'a> ModuleCompiler<'a> {
         function.instruction(&Instruction::I32Const(4));
         function.instruction(&Instruction::I32Sub);
         function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-            offset: 0, align: 2, memory_index: 0,
+            offset: 0,
+            align: 2,
+            memory_index: 0,
         }));
 
         // If len1 != len2, return 0
@@ -1422,13 +1443,17 @@ impl<'a> ModuleCompiler<'a> {
         function.instruction(&Instruction::LocalGet(3));
         function.instruction(&Instruction::I32Add);
         function.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
-            offset: 0, align: 0, memory_index: 0,
+            offset: 0,
+            align: 0,
+            memory_index: 0,
         }));
         function.instruction(&Instruction::LocalGet(1));
         function.instruction(&Instruction::LocalGet(3));
         function.instruction(&Instruction::I32Add);
         function.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
-            offset: 0, align: 0, memory_index: 0,
+            offset: 0,
+            align: 0,
+            memory_index: 0,
         }));
         function.instruction(&Instruction::I32Ne);
         function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
@@ -1590,7 +1615,6 @@ impl<'a> ModuleCompiler<'a> {
         func_idx
     }
 
-
     /// Ensure thread-spawn import exists, return its function index
     fn ensure_thread_spawn_import(&mut self) -> u32 {
         if let Some(idx) = self.thread_spawn_idx {
@@ -1689,17 +1713,21 @@ impl<'a> ModuleCompiler<'a> {
                     })
                     .sum(),
                 // Leaf expressions - no sub-expressions
-                Expr::AtomicLoad { .. } | Expr::AtomicStore { .. } | Expr::AtomicAdd { .. }
-                | Expr::AtomicSub { .. } | Expr::AtomicCmpxchg { .. }
-                | Expr::AtomicWait { .. } | Expr::AtomicNotify { .. }
+                Expr::AtomicLoad { .. }
+                | Expr::AtomicStore { .. }
+                | Expr::AtomicAdd { .. }
+                | Expr::AtomicSub { .. }
+                | Expr::AtomicCmpxchg { .. }
+                | Expr::AtomicWait { .. }
+                | Expr::AtomicNotify { .. }
                 | Expr::ThreadJoin { .. } => 0,
                 Expr::Spawn { body, .. } | Expr::AtomicBlock { body, .. } => {
                     body.iter().map(count_in_stmt).sum()
                 }
                 Expr::SimdOp { args, .. } => args.iter().map(count_in_expr).sum(),
-                Expr::SimdForEach { collection, body, .. } => {
-                    count_in_expr(collection) + body.iter().map(count_in_stmt).sum::<usize>()
-                }
+                Expr::SimdForEach {
+                    collection, body, ..
+                } => count_in_expr(collection) + body.iter().map(count_in_stmt).sum::<usize>(),
                 Expr::Ident(_) | Expr::Integer(_, _) | Expr::String(_, _) | Expr::Bool(_, _) => 0,
             }
         }
@@ -1708,10 +1736,19 @@ impl<'a> ModuleCompiler<'a> {
             match stmt {
                 Statement::Expr(e) => count_in_expr(e),
                 Statement::Let { value, .. } => count_in_expr(value),
-                Statement::Assign { value, .. } | Statement::CompoundAssign { value, .. } => count_in_expr(value),
+                Statement::Assign { value, .. } | Statement::CompoundAssign { value, .. } => {
+                    count_in_expr(value)
+                }
                 Statement::Return(Some(e)) => count_in_expr(e),
                 Statement::Return(None) | Statement::Break { .. } | Statement::Continue { .. } => 0,
                 Statement::SharedLet { initial_value, .. } => count_in_expr(initial_value),
+                Statement::GuardLet {
+                    value, else_body, ..
+                } => count_in_expr(value) + else_body.iter().map(count_in_stmt).sum::<usize>(),
+                Statement::Guard {
+                    condition,
+                    else_body,
+                } => count_in_expr(condition) + else_body.iter().map(count_in_stmt).sum::<usize>(),
             }
         }
 
@@ -1883,7 +1920,8 @@ impl<'a> ModuleCompiler<'a> {
         // Parameters get indices 0..n, but string/list params take 2 WASM locals
         let mut wasm_local_idx = 0u32;
         for param in func.params.iter() {
-            let is_wide = matches!(&param.ty,
+            let is_wide = matches!(
+                &param.ty,
                 Ty::Primitive(PrimitiveTy::String, _) | Ty::List { .. }
             );
             if is_wide {
@@ -1918,7 +1956,13 @@ impl<'a> ModuleCompiler<'a> {
                         *let_count += 1;
                         // Scan body statements
                         for stmt in body {
-                            collect_locals_from_stmt(stmt, params_len, locals, let_count, v128_locals);
+                            collect_locals_from_stmt(
+                                stmt,
+                                params_len,
+                                locals,
+                                let_count,
+                                v128_locals,
+                            );
                         }
                     }
                     Expr::ForEach { variable, body, .. } => {
@@ -1929,7 +1973,13 @@ impl<'a> ModuleCompiler<'a> {
                         *let_count += 2;
                         // Scan body statements
                         for stmt in body {
-                            collect_locals_from_stmt(stmt, params_len, locals, let_count, v128_locals);
+                            collect_locals_from_stmt(
+                                stmt,
+                                params_len,
+                                locals,
+                                let_count,
+                                v128_locals,
+                            );
                         }
                     }
                     Expr::SimdForEach { variable, body, .. } => {
@@ -1942,12 +1992,24 @@ impl<'a> ModuleCompiler<'a> {
                         *let_count += 3;
                         // Scan body statements
                         for stmt in body {
-                            collect_locals_from_stmt(stmt, params_len, locals, let_count, v128_locals);
+                            collect_locals_from_stmt(
+                                stmt,
+                                params_len,
+                                locals,
+                                let_count,
+                                v128_locals,
+                            );
                         }
                     }
                     Expr::While { body, .. } => {
                         for stmt in body {
-                            collect_locals_from_stmt(stmt, params_len, locals, let_count, v128_locals);
+                            collect_locals_from_stmt(
+                                stmt,
+                                params_len,
+                                locals,
+                                let_count,
+                                v128_locals,
+                            );
                         }
                     }
                     Expr::If {
@@ -1956,11 +2018,23 @@ impl<'a> ModuleCompiler<'a> {
                         ..
                     } => {
                         for stmt in then_branch {
-                            collect_locals_from_stmt(stmt, params_len, locals, let_count, v128_locals);
+                            collect_locals_from_stmt(
+                                stmt,
+                                params_len,
+                                locals,
+                                let_count,
+                                v128_locals,
+                            );
                         }
                         if let Some(else_stmts) = else_branch {
                             for stmt in else_stmts {
-                                collect_locals_from_stmt(stmt, params_len, locals, let_count, v128_locals);
+                                collect_locals_from_stmt(
+                                    stmt,
+                                    params_len,
+                                    locals,
+                                    let_count,
+                                    v128_locals,
+                                );
                             }
                         }
                     }
@@ -1979,7 +2053,13 @@ impl<'a> ModuleCompiler<'a> {
                         collect_locals_from_expr(list, params_len, locals, let_count, v128_locals);
                         // And from the lambda body
                         if let Expr::Lambda { body, .. } = lambda.as_ref() {
-                            collect_locals_from_expr(body, params_len, locals, let_count, v128_locals);
+                            collect_locals_from_expr(
+                                body,
+                                params_len,
+                                locals,
+                                let_count,
+                                v128_locals,
+                            );
                         }
                     }
                     Expr::Filter { list, lambda, .. } => {
@@ -1987,7 +2067,13 @@ impl<'a> ModuleCompiler<'a> {
                         *let_count += 6;
                         collect_locals_from_expr(list, params_len, locals, let_count, v128_locals);
                         if let Expr::Lambda { body, .. } = lambda.as_ref() {
-                            collect_locals_from_expr(body, params_len, locals, let_count, v128_locals);
+                            collect_locals_from_expr(
+                                body,
+                                params_len,
+                                locals,
+                                let_count,
+                                v128_locals,
+                            );
                         }
                     }
                     Expr::Reduce {
@@ -1998,7 +2084,13 @@ impl<'a> ModuleCompiler<'a> {
                         collect_locals_from_expr(list, params_len, locals, let_count, v128_locals);
                         collect_locals_from_expr(init, params_len, locals, let_count, v128_locals);
                         if let Expr::Lambda { body, .. } = lambda.as_ref() {
-                            collect_locals_from_expr(body, params_len, locals, let_count, v128_locals);
+                            collect_locals_from_expr(
+                                body,
+                                params_len,
+                                locals,
+                                let_count,
+                                v128_locals,
+                            );
                         }
                     }
                     _ => {}
@@ -2028,10 +2120,59 @@ impl<'a> ModuleCompiler<'a> {
                     Statement::Assign { value, .. } | Statement::CompoundAssign { value, .. } => {
                         collect_locals_from_expr(value, params_len, locals, let_count, v128_locals);
                     }
-                    Statement::SharedLet { name, initial_value } => {
+                    Statement::SharedLet {
+                        name,
+                        initial_value,
+                    } => {
                         locals.insert(name.name.clone(), params_len as u32 + *let_count);
                         *let_count += 1;
-                        collect_locals_from_expr(initial_value, params_len, locals, let_count, v128_locals);
+                        collect_locals_from_expr(
+                            initial_value,
+                            params_len,
+                            locals,
+                            let_count,
+                            v128_locals,
+                        );
+                    }
+                    Statement::GuardLet {
+                        name,
+                        value,
+                        else_body,
+                    } => {
+                        collect_locals_from_expr(value, params_len, locals, let_count, v128_locals);
+                        for stmt in else_body {
+                            collect_locals_from_stmt(
+                                stmt,
+                                params_len,
+                                locals,
+                                let_count,
+                                v128_locals,
+                            );
+                        }
+                        let idx = params_len as u32 + *let_count;
+                        locals.insert(name.name.clone(), idx);
+                        *let_count += 1;
+                    }
+                    Statement::Guard {
+                        condition,
+                        else_body,
+                    } => {
+                        collect_locals_from_expr(
+                            condition,
+                            params_len,
+                            locals,
+                            let_count,
+                            v128_locals,
+                        );
+                        for stmt in else_body {
+                            collect_locals_from_stmt(
+                                stmt,
+                                params_len,
+                                locals,
+                                let_count,
+                                v128_locals,
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -2042,7 +2183,13 @@ impl<'a> ModuleCompiler<'a> {
                 match expr {
                     Expr::SimdOp { op, .. } => {
                         // Most SIMD ops return v128; extract_lane/tests return i32
-                        !matches!(op, SimdOp::ExtractLane | SimdOp::AnyTrue | SimdOp::AllTrue | SimdOp::Bitmask)
+                        !matches!(
+                            op,
+                            SimdOp::ExtractLane
+                                | SimdOp::AnyTrue
+                                | SimdOp::AllTrue
+                                | SimdOp::Bitmask
+                        )
                     }
                     Expr::Ident(_id) => {
                         // If it's referencing a known v128 variable, it's v128
@@ -2053,9 +2200,14 @@ impl<'a> ModuleCompiler<'a> {
                 }
             }
 
-
             for stmt in &body.statements {
-                collect_locals_from_stmt(stmt, wasm_params_len, &mut locals, &mut let_count, &mut v128_locals);
+                collect_locals_from_stmt(
+                    stmt,
+                    wasm_params_len,
+                    &mut locals,
+                    &mut let_count,
+                    &mut v128_locals,
+                );
             }
         }
 
@@ -2150,7 +2302,12 @@ impl<'a> ModuleCompiler<'a> {
                         if let Some(&idx) = locals.get(&name.name) {
                             function.instruction(&Instruction::LocalGet(idx));
                         }
-                        self.compile_expr_with_locals(&mut function, value, &locals, &locals_types)?;
+                        self.compile_expr_with_locals(
+                            &mut function,
+                            value,
+                            &locals,
+                            &locals_types,
+                        )?;
                         match op {
                             BinOp::Add => function.instruction(&Instruction::I32Add),
                             BinOp::Sub => function.instruction(&Instruction::I32Sub),
@@ -2256,6 +2413,38 @@ impl<'a> ModuleCompiler<'a> {
                             function.instruction(&Instruction::I32Const(0));
                         }
                     }
+                    Statement::GuardLet {
+                        name,
+                        value,
+                        else_body,
+                    } => {
+                        self.compile_guard_let_statement_with_locals(
+                            &mut function,
+                            name,
+                            value,
+                            else_body,
+                            &locals,
+                            &mut locals_types,
+                        )?;
+                        if (func.is_async && self.options.wasip3) || func.result.is_some() {
+                            function.instruction(&Instruction::I32Const(0));
+                        }
+                    }
+                    Statement::Guard {
+                        condition,
+                        else_body,
+                    } => {
+                        self.compile_guard_statement_with_locals(
+                            &mut function,
+                            condition,
+                            else_body,
+                            &locals,
+                            &mut locals_types,
+                        )?;
+                        if (func.is_async && self.options.wasip3) || func.result.is_some() {
+                            function.instruction(&Instruction::I32Const(0));
+                        }
+                    }
                 }
             } else if (func.is_async && self.options.wasip3) || func.result.is_some() {
                 // Empty body - push default value (0 for async status or sync result)
@@ -2277,6 +2466,197 @@ impl<'a> ModuleCompiler<'a> {
         function.instruction(&Instruction::End);
 
         Ok(function)
+    }
+
+    fn enter_nested_control_block(&mut self) {
+        if let Some(depth) = self.loop_break_depth.as_mut() {
+            *depth += 1;
+        }
+        if let Some(depth) = self.loop_continue_depth.as_mut() {
+            *depth += 1;
+        }
+    }
+
+    fn exit_nested_control_block(&mut self) {
+        if let Some(depth) = self.loop_break_depth.as_mut() {
+            *depth -= 1;
+        }
+        if let Some(depth) = self.loop_continue_depth.as_mut() {
+            *depth -= 1;
+        }
+    }
+
+    fn variant_discriminant(case_name: &str) -> i32 {
+        case_name
+            .bytes()
+            .fold(0u32, |acc, b| acc.wrapping_add(b as u32)) as i32
+    }
+
+    fn compile_guard_let_statement_with_locals(
+        &mut self,
+        function: &mut Function,
+        name: &Id,
+        value: &Expr,
+        else_body: &[Statement],
+        locals: &HashMap<String, u32>,
+        locals_types: &HashMap<String, RecordTypeInfo>,
+    ) -> Result<(), CompileError> {
+        let Some(&binding_idx) = locals.get(&name.name) else {
+            return Err(CompileError {
+                message: format!("Missing local slot for guard let binding '{}'", name.name),
+                span: Some(name.span.clone()),
+            });
+        };
+
+        let none_discriminant = Self::variant_discriminant("none");
+        let err_discriminant = Self::variant_discriminant("err");
+        let some_discriminant = Self::variant_discriminant("some");
+        let ok_discriminant = Self::variant_discriminant("ok");
+
+        self.compile_expr_with_locals(function, value, locals, locals_types)?;
+        function.instruction(&Instruction::LocalSet(binding_idx));
+
+        function.instruction(&Instruction::LocalGet(binding_idx));
+        function.instruction(&Instruction::I32Const(none_discriminant));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::LocalGet(binding_idx));
+        function.instruction(&Instruction::I32Const(err_discriminant));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::I32Or);
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+            wasm_encoder::ValType::I32,
+        )));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::Else);
+        function.instruction(&Instruction::LocalGet(binding_idx));
+        function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        function.instruction(&Instruction::I32Const(some_discriminant));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::LocalGet(binding_idx));
+        function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        function.instruction(&Instruction::I32Const(ok_discriminant));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::I32Or);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::End);
+
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        self.enter_nested_control_block();
+        let mut guard_locals_types = locals_types.clone();
+        for stmt in else_body {
+            self.compile_statement_with_locals(function, stmt, locals, &mut guard_locals_types)?;
+        }
+        self.exit_nested_control_block();
+        function.instruction(&Instruction::Else);
+        function.instruction(&Instruction::LocalGet(binding_idx));
+        function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+        function.instruction(&Instruction::LocalSet(binding_idx));
+        function.instruction(&Instruction::End);
+        Ok(())
+    }
+
+    fn compile_guard_statement_with_locals(
+        &mut self,
+        function: &mut Function,
+        condition: &Expr,
+        else_body: &[Statement],
+        locals: &HashMap<String, u32>,
+        locals_types: &HashMap<String, RecordTypeInfo>,
+    ) -> Result<(), CompileError> {
+        self.compile_expr_with_locals(function, condition, locals, locals_types)?;
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        self.enter_nested_control_block();
+        let mut guard_locals_types = locals_types.clone();
+        for stmt in else_body {
+            self.compile_statement_with_locals(function, stmt, locals, &mut guard_locals_types)?;
+        }
+        self.exit_nested_control_block();
+        function.instruction(&Instruction::End);
+        Ok(())
+    }
+
+    fn compile_guard_statement(
+        &mut self,
+        function: &mut Function,
+        condition: &Expr,
+        else_body: &[Statement],
+    ) -> Result<(), CompileError> {
+        self.compile_expr(function, condition)?;
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        self.enter_nested_control_block();
+        for stmt in else_body {
+            self.compile_statement(function, stmt)?;
+        }
+        self.exit_nested_control_block();
+        function.instruction(&Instruction::End);
+        Ok(())
+    }
+
+    fn compile_guard_let_statement(
+        &mut self,
+        function: &mut Function,
+        value: &Expr,
+        else_body: &[Statement],
+    ) -> Result<(), CompileError> {
+        let none_discriminant = Self::variant_discriminant("none");
+        let err_discriminant = Self::variant_discriminant("err");
+        let some_discriminant = Self::variant_discriminant("some");
+        let ok_discriminant = Self::variant_discriminant("ok");
+
+        self.compile_expr(function, value)?;
+        function.instruction(&Instruction::I32Const(none_discriminant));
+        function.instruction(&Instruction::I32Eq);
+        self.compile_expr(function, value)?;
+        function.instruction(&Instruction::I32Const(err_discriminant));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::I32Or);
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+            wasm_encoder::ValType::I32,
+        )));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::Else);
+        self.compile_expr(function, value)?;
+        function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        function.instruction(&Instruction::I32Const(some_discriminant));
+        function.instruction(&Instruction::I32Eq);
+        self.compile_expr(function, value)?;
+        function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        function.instruction(&Instruction::I32Const(ok_discriminant));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::I32Or);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::End);
+
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        self.enter_nested_control_block();
+        for stmt in else_body {
+            self.compile_statement(function, stmt)?;
+        }
+        self.exit_nested_control_block();
+        function.instruction(&Instruction::End);
+        Ok(())
     }
 
     fn compile_statement_with_locals(
@@ -2347,9 +2727,15 @@ impl<'a> ModuleCompiler<'a> {
                 }
                 self.compile_expr_with_locals(function, value, locals, locals_types)?;
                 match op {
-                    BinOp::Add => { function.instruction(&Instruction::I32Add); }
-                    BinOp::Sub => { function.instruction(&Instruction::I32Sub); }
-                    _ => { function.instruction(&Instruction::I32Add); }
+                    BinOp::Add => {
+                        function.instruction(&Instruction::I32Add);
+                    }
+                    BinOp::Sub => {
+                        function.instruction(&Instruction::I32Sub);
+                    }
+                    _ => {
+                        function.instruction(&Instruction::I32Add);
+                    }
                 }
                 if let Some(&idx) = locals.get(&name.name) {
                     function.instruction(&Instruction::LocalSet(idx));
@@ -2365,7 +2751,10 @@ impl<'a> ModuleCompiler<'a> {
                     function.instruction(&Instruction::Br(depth));
                 }
             }
-            Statement::SharedLet { name, initial_value } => {
+            Statement::SharedLet {
+                name,
+                initial_value,
+            } => {
                 let offset = self.string_offset;
                 self.string_offset += 4;
                 // Store offset in shared memory and initialize
@@ -2382,6 +2771,32 @@ impl<'a> ModuleCompiler<'a> {
                     function.instruction(&Instruction::LocalSet(idx));
                 }
                 self.shared_locals.insert(name.name.clone());
+            }
+            Statement::GuardLet {
+                name,
+                value,
+                else_body,
+            } => {
+                self.compile_guard_let_statement_with_locals(
+                    function,
+                    name,
+                    value,
+                    else_body,
+                    locals,
+                    locals_types,
+                )?;
+            }
+            Statement::Guard {
+                condition,
+                else_body,
+            } => {
+                self.compile_guard_statement_with_locals(
+                    function,
+                    condition,
+                    else_body,
+                    locals,
+                    locals_types,
+                )?;
             }
         }
         Ok(())
@@ -2422,6 +2837,17 @@ impl<'a> ModuleCompiler<'a> {
                 // These only make sense inside while loops; handled there
             }
             Statement::SharedLet { .. } => {}
+            Statement::GuardLet {
+                value, else_body, ..
+            } => {
+                self.compile_guard_let_statement(function, value, else_body)?;
+            }
+            Statement::Guard {
+                condition,
+                else_body,
+            } => {
+                self.compile_guard_statement(function, condition, else_body)?;
+            }
         }
         Ok(())
     }
@@ -2709,9 +3135,23 @@ impl<'a> ModuleCompiler<'a> {
                             compiler.compile_expr(function, value)?;
                             // Leave value on stack
                         }
-                        Statement::Break { .. } | Statement::Continue { .. }
+                        Statement::Break { .. }
+                        | Statement::Continue { .. }
                         | Statement::SharedLet { .. } => {
                             // These shouldn't appear in if branches; push 0 for stack balance
+                            function.instruction(&Instruction::I32Const(0));
+                        }
+                        Statement::GuardLet {
+                            value, else_body, ..
+                        } => {
+                            compiler.compile_guard_let_statement(function, value, else_body)?;
+                            function.instruction(&Instruction::I32Const(0));
+                        }
+                        Statement::Guard {
+                            condition,
+                            else_body,
+                        } => {
+                            compiler.compile_guard_statement(function, condition, else_body)?;
                             function.instruction(&Instruction::I32Const(0));
                         }
                     }
@@ -2986,10 +3426,15 @@ impl<'a> ModuleCompiler<'a> {
                 // Await requires async runtime support - placeholder for now
                 function.instruction(&Instruction::I32Const(0));
             }
-            Expr::AtomicLoad { .. } | Expr::AtomicStore { .. } | Expr::AtomicAdd { .. }
-            | Expr::AtomicSub { .. } | Expr::AtomicCmpxchg { .. }
-            | Expr::AtomicWait { .. } | Expr::AtomicNotify { .. }
-            | Expr::Spawn { .. } | Expr::AtomicBlock { .. }
+            Expr::AtomicLoad { .. }
+            | Expr::AtomicStore { .. }
+            | Expr::AtomicAdd { .. }
+            | Expr::AtomicSub { .. }
+            | Expr::AtomicCmpxchg { .. }
+            | Expr::AtomicWait { .. }
+            | Expr::AtomicNotify { .. }
+            | Expr::Spawn { .. }
+            | Expr::AtomicBlock { .. }
             | Expr::ThreadJoin { .. }
             | Expr::SimdOp { .. }
             | Expr::SimdForEach { .. } => {
@@ -3963,13 +4408,45 @@ impl<'a> ModuleCompiler<'a> {
                         Statement::SharedLet { .. } => {
                             function.instruction(&Instruction::I32Const(0));
                         }
+                        Statement::GuardLet {
+                            name,
+                            value,
+                            else_body,
+                        } => {
+                            compiler.compile_guard_let_statement_with_locals(
+                                function,
+                                name,
+                                value,
+                                else_body,
+                                locals,
+                                locals_types,
+                            )?;
+                            function.instruction(&Instruction::I32Const(0));
+                        }
+                        Statement::Guard {
+                            condition,
+                            else_body,
+                        } => {
+                            compiler.compile_guard_statement_with_locals(
+                                function,
+                                condition,
+                                else_body,
+                                locals,
+                                locals_types,
+                            )?;
+                            function.instruction(&Instruction::I32Const(0));
+                        }
                     }
                     Ok(())
                 }
 
                 // Bump loop depths for if-block nesting (+1 for the if block)
-                if let Some(d) = self.loop_break_depth.as_mut() { *d += 1; }
-                if let Some(d) = self.loop_continue_depth.as_mut() { *d += 1; }
+                if let Some(d) = self.loop_break_depth.as_mut() {
+                    *d += 1;
+                }
+                if let Some(d) = self.loop_continue_depth.as_mut() {
+                    *d += 1;
+                }
 
                 // Need mutable clone since helper needs mut ref
                 let mut types_clone = locals_types.clone();
@@ -3992,8 +4469,12 @@ impl<'a> ModuleCompiler<'a> {
                 function.instruction(&Instruction::End);
 
                 // Restore loop depths after if-block
-                if let Some(d) = self.loop_break_depth.as_mut() { *d -= 1; }
-                if let Some(d) = self.loop_continue_depth.as_mut() { *d -= 1; }
+                if let Some(d) = self.loop_break_depth.as_mut() {
+                    *d -= 1;
+                }
+                if let Some(d) = self.loop_continue_depth.as_mut() {
+                    *d -= 1;
+                }
             }
             Expr::Assert(cond, _) => {
                 // Compile condition
@@ -4335,9 +4816,15 @@ impl<'a> ModuleCompiler<'a> {
                             }
                             self.compile_expr_with_locals(function, value, locals, locals_types)?;
                             match op {
-                                BinOp::Add => { function.instruction(&Instruction::I32Add); }
-                                BinOp::Sub => { function.instruction(&Instruction::I32Sub); }
-                                _ => { function.instruction(&Instruction::I32Add); }
+                                BinOp::Add => {
+                                    function.instruction(&Instruction::I32Add);
+                                }
+                                BinOp::Sub => {
+                                    function.instruction(&Instruction::I32Sub);
+                                }
+                                _ => {
+                                    function.instruction(&Instruction::I32Add);
+                                }
                             }
                             if let Some(&idx) = locals.get(&name.name) {
                                 function.instruction(&Instruction::LocalSet(idx));
@@ -4387,6 +4874,32 @@ impl<'a> ModuleCompiler<'a> {
                             }
                         }
                         Statement::SharedLet { .. } => {}
+                        Statement::GuardLet {
+                            name,
+                            value,
+                            else_body,
+                        } => {
+                            self.compile_guard_let_statement_with_locals(
+                                function,
+                                name,
+                                value,
+                                else_body,
+                                locals,
+                                locals_types,
+                            )?;
+                        }
+                        Statement::Guard {
+                            condition,
+                            else_body,
+                        } => {
+                            self.compile_guard_statement_with_locals(
+                                function,
+                                condition,
+                                else_body,
+                                locals,
+                                locals_types,
+                            )?;
+                        }
                     }
                 }
 
@@ -4433,7 +4946,9 @@ impl<'a> ModuleCompiler<'a> {
 
                 let analysis = analyze_range_loop(&variable.name, range.as_ref());
                 if matches!(
-                    analysis.as_ref().and_then(|facts| facts.trip_count.as_ref()),
+                    analysis
+                        .as_ref()
+                        .and_then(|facts| facts.trip_count.as_ref()),
                     Some(&LoopTripCount::Constant(0))
                 ) {
                     function.instruction(&Instruction::I32Const(0));
@@ -4442,10 +4957,7 @@ impl<'a> ModuleCompiler<'a> {
 
                 // Extract start, end, step, and descending from range
                 if let Expr::Range {
-                    start,
-                    end,
-                    step,
-                    ..
+                    start, end, step, ..
                 } = range.as_ref()
                 {
                     let analysis = analysis.expect("range loop analysis should succeed");
@@ -4515,11 +5027,22 @@ impl<'a> ModuleCompiler<'a> {
                                 if let Some(&idx) = locals.get(&name.name) {
                                     function.instruction(&Instruction::LocalGet(idx));
                                 }
-                                self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                                self.compile_expr_with_locals(
+                                    function,
+                                    value,
+                                    locals,
+                                    locals_types,
+                                )?;
                                 match op {
-                                    BinOp::Add => { function.instruction(&Instruction::I32Add); }
-                                    BinOp::Sub => { function.instruction(&Instruction::I32Sub); }
-                                    _ => { function.instruction(&Instruction::I32Add); }
+                                    BinOp::Add => {
+                                        function.instruction(&Instruction::I32Add);
+                                    }
+                                    BinOp::Sub => {
+                                        function.instruction(&Instruction::I32Sub);
+                                    }
+                                    _ => {
+                                        function.instruction(&Instruction::I32Add);
+                                    }
                                 }
                                 if let Some(&idx) = locals.get(&name.name) {
                                     function.instruction(&Instruction::LocalSet(idx));
@@ -4576,6 +5099,32 @@ impl<'a> ModuleCompiler<'a> {
                                 }
                             }
                             Statement::SharedLet { .. } => {}
+                            Statement::GuardLet {
+                                name,
+                                value,
+                                else_body,
+                            } => {
+                                self.compile_guard_let_statement_with_locals(
+                                    function,
+                                    name,
+                                    value,
+                                    else_body,
+                                    locals,
+                                    locals_types,
+                                )?;
+                            }
+                            Statement::Guard {
+                                condition,
+                                else_body,
+                            } => {
+                                self.compile_guard_statement_with_locals(
+                                    function,
+                                    condition,
+                                    else_body,
+                                    locals,
+                                    locals_types,
+                                )?;
+                            }
                         }
                     }
 
@@ -4937,9 +5486,9 @@ impl<'a> ModuleCompiler<'a> {
 
                 let analysis = analyze_for_each_loop(&variable.name, collection.as_ref());
                 let element_stride_bytes = match &analysis.memory_access {
-                    MemoryAccessPattern::ContiguousElements { element_stride_bytes } => {
-                        *element_stride_bytes as i32
-                    }
+                    MemoryAccessPattern::ContiguousElements {
+                        element_stride_bytes,
+                    } => *element_stride_bytes as i32,
                 };
 
                 // Use temp locals
@@ -5021,9 +5570,15 @@ impl<'a> ModuleCompiler<'a> {
                             }
                             self.compile_expr_with_locals(function, value, locals, locals_types)?;
                             match op {
-                                BinOp::Add => { function.instruction(&Instruction::I32Add); }
-                                BinOp::Sub => { function.instruction(&Instruction::I32Sub); }
-                                _ => { function.instruction(&Instruction::I32Add); }
+                                BinOp::Add => {
+                                    function.instruction(&Instruction::I32Add);
+                                }
+                                BinOp::Sub => {
+                                    function.instruction(&Instruction::I32Sub);
+                                }
+                                _ => {
+                                    function.instruction(&Instruction::I32Add);
+                                }
                             }
                             if let Some(&idx) = locals.get(&name.name) {
                                 function.instruction(&Instruction::LocalSet(idx));
@@ -5068,6 +5623,32 @@ impl<'a> ModuleCompiler<'a> {
                             }
                         }
                         Statement::SharedLet { .. } => {}
+                        Statement::GuardLet {
+                            name,
+                            value,
+                            else_body,
+                        } => {
+                            self.compile_guard_let_statement_with_locals(
+                                function,
+                                name,
+                                value,
+                                else_body,
+                                locals,
+                                locals_types,
+                            )?;
+                        }
+                        Statement::Guard {
+                            condition,
+                            else_body,
+                        } => {
+                            self.compile_guard_statement_with_locals(
+                                function,
+                                condition,
+                                else_body,
+                                locals,
+                                locals_types,
+                            )?;
+                        }
                     }
                 }
 
@@ -5314,7 +5895,12 @@ impl<'a> ModuleCompiler<'a> {
                     memory_index: 0,
                 }));
             }
-            Expr::AtomicCmpxchg { addr, expected, replacement, .. } => {
+            Expr::AtomicCmpxchg {
+                addr,
+                expected,
+                replacement,
+                ..
+            } => {
                 self.compile_expr_with_locals(function, addr, locals, locals_types)?;
                 self.compile_expr_with_locals(function, expected, locals, locals_types)?;
                 self.compile_expr_with_locals(function, replacement, locals, locals_types)?;
@@ -5324,7 +5910,12 @@ impl<'a> ModuleCompiler<'a> {
                     memory_index: 0,
                 }));
             }
-            Expr::AtomicWait { addr, expected, timeout, .. } => {
+            Expr::AtomicWait {
+                addr,
+                expected,
+                timeout,
+                ..
+            } => {
                 self.compile_expr_with_locals(function, addr, locals, locals_types)?;
                 self.compile_expr_with_locals(function, expected, locals, locals_types)?;
                 self.compile_expr_with_locals(function, timeout, locals, locals_types)?;
@@ -5349,23 +5940,44 @@ impl<'a> ModuleCompiler<'a> {
                 } else {
                     let mut locals_types_mut = locals_types.clone();
                     for stmt in &body[..body.len() - 1] {
-                        self.compile_atomic_statement(function, stmt, locals, &mut locals_types_mut)?;
+                        self.compile_atomic_statement(
+                            function,
+                            stmt,
+                            locals,
+                            &mut locals_types_mut,
+                        )?;
                     }
                     match &body[body.len() - 1] {
                         Statement::Expr(expr) => {
                             self.compile_atomic_expr(function, expr, locals, locals_types)?;
                         }
                         _ => {
-                            self.compile_atomic_statement(function, &body[body.len() - 1], locals, &mut locals_types_mut)?;
+                            self.compile_atomic_statement(
+                                function,
+                                &body[body.len() - 1],
+                                locals,
+                                &mut locals_types_mut,
+                            )?;
                             function.instruction(&Instruction::I32Const(0));
                         }
                     }
                 }
             }
-            Expr::SimdOp { lane, op, args, lane_idx, .. } => {
+            Expr::SimdOp {
+                lane,
+                op,
+                args,
+                lane_idx,
+                ..
+            } => {
                 self.compile_simd_op(function, lane, op, args, *lane_idx, locals, locals_types)?;
             }
-            Expr::SimdForEach { variable, collection, body, .. } => {
+            Expr::SimdForEach {
+                variable,
+                collection,
+                body,
+                ..
+            } => {
                 // SIMD for-each: simd for v in list { body }
                 // Processes list elements 4-at-a-time using v128 load/store.
                 //
@@ -5470,9 +6082,15 @@ impl<'a> ModuleCompiler<'a> {
                             }
                             self.compile_expr_with_locals(function, value, locals, locals_types)?;
                             match op {
-                                BinOp::Add => { function.instruction(&Instruction::I32Add); }
-                                BinOp::Sub => { function.instruction(&Instruction::I32Sub); }
-                                _ => { function.instruction(&Instruction::I32Add); }
+                                BinOp::Add => {
+                                    function.instruction(&Instruction::I32Add);
+                                }
+                                BinOp::Sub => {
+                                    function.instruction(&Instruction::I32Sub);
+                                }
+                                _ => {
+                                    function.instruction(&Instruction::I32Add);
+                                }
                             }
                             if let Some(&idx) = locals.get(&name.name) {
                                 function.instruction(&Instruction::LocalSet(idx));
@@ -5484,8 +6102,35 @@ impl<'a> ModuleCompiler<'a> {
                             }
                             function.instruction(&Instruction::Return);
                         }
-                        Statement::Break { .. } | Statement::Continue { .. }
+                        Statement::Break { .. }
+                        | Statement::Continue { .. }
                         | Statement::SharedLet { .. } => {}
+                        Statement::GuardLet {
+                            name,
+                            value,
+                            else_body,
+                        } => {
+                            self.compile_guard_let_statement_with_locals(
+                                function,
+                                name,
+                                value,
+                                else_body,
+                                locals,
+                                locals_types,
+                            )?;
+                        }
+                        Statement::Guard {
+                            condition,
+                            else_body,
+                        } => {
+                            self.compile_guard_statement_with_locals(
+                                function,
+                                condition,
+                                else_body,
+                                locals,
+                                locals_types,
+                            )?;
+                        }
                     }
                 }
 
@@ -5550,150 +6195,388 @@ impl<'a> ModuleCompiler<'a> {
             self.compile_expr_with_locals(function, arg, locals, locals_types)?;
         }
 
-        let memarg = wasm_encoder::MemArg { offset: 0, align: 4, memory_index: 0 };
+        let memarg = wasm_encoder::MemArg {
+            offset: 0,
+            align: 4,
+            memory_index: 0,
+        };
         let lidx = lane_idx.unwrap_or(0) as u8;
 
         match (lane, op) {
             // === Splat ===
-            (I8x16, Splat) => { function.instruction(&Instruction::I8x16Splat); }
-            (I16x8, Splat) => { function.instruction(&Instruction::I16x8Splat); }
-            (I32x4, Splat) => { function.instruction(&Instruction::I32x4Splat); }
-            (I64x2, Splat) => { function.instruction(&Instruction::I64x2Splat); }
-            (F32x4, Splat) => { function.instruction(&Instruction::F32x4Splat); }
-            (F64x2, Splat) => { function.instruction(&Instruction::F64x2Splat); }
+            (I8x16, Splat) => {
+                function.instruction(&Instruction::I8x16Splat);
+            }
+            (I16x8, Splat) => {
+                function.instruction(&Instruction::I16x8Splat);
+            }
+            (I32x4, Splat) => {
+                function.instruction(&Instruction::I32x4Splat);
+            }
+            (I64x2, Splat) => {
+                function.instruction(&Instruction::I64x2Splat);
+            }
+            (F32x4, Splat) => {
+                function.instruction(&Instruction::F32x4Splat);
+            }
+            (F64x2, Splat) => {
+                function.instruction(&Instruction::F64x2Splat);
+            }
 
             // === Add ===
-            (I8x16, Add) => { function.instruction(&Instruction::I8x16Add); }
-            (I16x8, Add) => { function.instruction(&Instruction::I16x8Add); }
-            (I32x4, Add) => { function.instruction(&Instruction::I32x4Add); }
-            (I64x2, Add) => { function.instruction(&Instruction::I64x2Add); }
-            (F32x4, Add) => { function.instruction(&Instruction::F32x4Add); }
-            (F64x2, Add) => { function.instruction(&Instruction::F64x2Add); }
+            (I8x16, Add) => {
+                function.instruction(&Instruction::I8x16Add);
+            }
+            (I16x8, Add) => {
+                function.instruction(&Instruction::I16x8Add);
+            }
+            (I32x4, Add) => {
+                function.instruction(&Instruction::I32x4Add);
+            }
+            (I64x2, Add) => {
+                function.instruction(&Instruction::I64x2Add);
+            }
+            (F32x4, Add) => {
+                function.instruction(&Instruction::F32x4Add);
+            }
+            (F64x2, Add) => {
+                function.instruction(&Instruction::F64x2Add);
+            }
 
             // === Sub ===
-            (I8x16, Sub) => { function.instruction(&Instruction::I8x16Sub); }
-            (I16x8, Sub) => { function.instruction(&Instruction::I16x8Sub); }
-            (I32x4, Sub) => { function.instruction(&Instruction::I32x4Sub); }
-            (I64x2, Sub) => { function.instruction(&Instruction::I64x2Sub); }
-            (F32x4, Sub) => { function.instruction(&Instruction::F32x4Sub); }
-            (F64x2, Sub) => { function.instruction(&Instruction::F64x2Sub); }
+            (I8x16, Sub) => {
+                function.instruction(&Instruction::I8x16Sub);
+            }
+            (I16x8, Sub) => {
+                function.instruction(&Instruction::I16x8Sub);
+            }
+            (I32x4, Sub) => {
+                function.instruction(&Instruction::I32x4Sub);
+            }
+            (I64x2, Sub) => {
+                function.instruction(&Instruction::I64x2Sub);
+            }
+            (F32x4, Sub) => {
+                function.instruction(&Instruction::F32x4Sub);
+            }
+            (F64x2, Sub) => {
+                function.instruction(&Instruction::F64x2Sub);
+            }
 
             // === Mul ===
-            (I16x8, Mul) => { function.instruction(&Instruction::I16x8Mul); }
-            (I32x4, Mul) => { function.instruction(&Instruction::I32x4Mul); }
-            (I64x2, Mul) => { function.instruction(&Instruction::I64x2Mul); }
-            (F32x4, Mul) => { function.instruction(&Instruction::F32x4Mul); }
-            (F64x2, Mul) => { function.instruction(&Instruction::F64x2Mul); }
+            (I16x8, Mul) => {
+                function.instruction(&Instruction::I16x8Mul);
+            }
+            (I32x4, Mul) => {
+                function.instruction(&Instruction::I32x4Mul);
+            }
+            (I64x2, Mul) => {
+                function.instruction(&Instruction::I64x2Mul);
+            }
+            (F32x4, Mul) => {
+                function.instruction(&Instruction::F32x4Mul);
+            }
+            (F64x2, Mul) => {
+                function.instruction(&Instruction::F64x2Mul);
+            }
 
             // === Neg ===
-            (I8x16, Neg) => { function.instruction(&Instruction::I8x16Neg); }
-            (I16x8, Neg) => { function.instruction(&Instruction::I16x8Neg); }
-            (I32x4, Neg) => { function.instruction(&Instruction::I32x4Neg); }
-            (I64x2, Neg) => { function.instruction(&Instruction::I64x2Neg); }
-            (F32x4, Neg) => { function.instruction(&Instruction::F32x4Neg); }
-            (F64x2, Neg) => { function.instruction(&Instruction::F64x2Neg); }
+            (I8x16, Neg) => {
+                function.instruction(&Instruction::I8x16Neg);
+            }
+            (I16x8, Neg) => {
+                function.instruction(&Instruction::I16x8Neg);
+            }
+            (I32x4, Neg) => {
+                function.instruction(&Instruction::I32x4Neg);
+            }
+            (I64x2, Neg) => {
+                function.instruction(&Instruction::I64x2Neg);
+            }
+            (F32x4, Neg) => {
+                function.instruction(&Instruction::F32x4Neg);
+            }
+            (F64x2, Neg) => {
+                function.instruction(&Instruction::F64x2Neg);
+            }
 
             // === Abs ===
-            (I8x16, Abs) => { function.instruction(&Instruction::I8x16Abs); }
-            (I16x8, Abs) => { function.instruction(&Instruction::I16x8Abs); }
-            (I32x4, Abs) => { function.instruction(&Instruction::I32x4Abs); }
-            (I64x2, Abs) => { function.instruction(&Instruction::I64x2Abs); }
-            (F32x4, Abs) => { function.instruction(&Instruction::F32x4Abs); }
-            (F64x2, Abs) => { function.instruction(&Instruction::F64x2Abs); }
+            (I8x16, Abs) => {
+                function.instruction(&Instruction::I8x16Abs);
+            }
+            (I16x8, Abs) => {
+                function.instruction(&Instruction::I16x8Abs);
+            }
+            (I32x4, Abs) => {
+                function.instruction(&Instruction::I32x4Abs);
+            }
+            (I64x2, Abs) => {
+                function.instruction(&Instruction::I64x2Abs);
+            }
+            (F32x4, Abs) => {
+                function.instruction(&Instruction::F32x4Abs);
+            }
+            (F64x2, Abs) => {
+                function.instruction(&Instruction::F64x2Abs);
+            }
 
             // === Float-only: Div, Sqrt, Ceil, Floor, Trunc, Nearest ===
-            (F32x4, Div) => { function.instruction(&Instruction::F32x4Div); }
-            (F64x2, Div) => { function.instruction(&Instruction::F64x2Div); }
-            (F32x4, Sqrt) => { function.instruction(&Instruction::F32x4Sqrt); }
-            (F64x2, Sqrt) => { function.instruction(&Instruction::F64x2Sqrt); }
-            (F32x4, Ceil) => { function.instruction(&Instruction::F32x4Ceil); }
-            (F64x2, Ceil) => { function.instruction(&Instruction::F64x2Ceil); }
-            (F32x4, Floor) => { function.instruction(&Instruction::F32x4Floor); }
-            (F64x2, Floor) => { function.instruction(&Instruction::F64x2Floor); }
-            (F32x4, Trunc) => { function.instruction(&Instruction::F32x4Trunc); }
-            (F64x2, Trunc) => { function.instruction(&Instruction::F64x2Trunc); }
-            (F32x4, Nearest) => { function.instruction(&Instruction::F32x4Nearest); }
-            (F64x2, Nearest) => { function.instruction(&Instruction::F64x2Nearest); }
+            (F32x4, Div) => {
+                function.instruction(&Instruction::F32x4Div);
+            }
+            (F64x2, Div) => {
+                function.instruction(&Instruction::F64x2Div);
+            }
+            (F32x4, Sqrt) => {
+                function.instruction(&Instruction::F32x4Sqrt);
+            }
+            (F64x2, Sqrt) => {
+                function.instruction(&Instruction::F64x2Sqrt);
+            }
+            (F32x4, Ceil) => {
+                function.instruction(&Instruction::F32x4Ceil);
+            }
+            (F64x2, Ceil) => {
+                function.instruction(&Instruction::F64x2Ceil);
+            }
+            (F32x4, Floor) => {
+                function.instruction(&Instruction::F32x4Floor);
+            }
+            (F64x2, Floor) => {
+                function.instruction(&Instruction::F64x2Floor);
+            }
+            (F32x4, Trunc) => {
+                function.instruction(&Instruction::F32x4Trunc);
+            }
+            (F64x2, Trunc) => {
+                function.instruction(&Instruction::F64x2Trunc);
+            }
+            (F32x4, Nearest) => {
+                function.instruction(&Instruction::F32x4Nearest);
+            }
+            (F64x2, Nearest) => {
+                function.instruction(&Instruction::F64x2Nearest);
+            }
 
             // === Shifts ===
-            (I8x16, Shl) => { function.instruction(&Instruction::I8x16Shl); }
-            (I16x8, Shl) => { function.instruction(&Instruction::I16x8Shl); }
-            (I32x4, Shl) => { function.instruction(&Instruction::I32x4Shl); }
-            (I64x2, Shl) => { function.instruction(&Instruction::I64x2Shl); }
-            (I8x16, ShrS) => { function.instruction(&Instruction::I8x16ShrS); }
-            (I16x8, ShrS) => { function.instruction(&Instruction::I16x8ShrS); }
-            (I32x4, ShrS) => { function.instruction(&Instruction::I32x4ShrS); }
-            (I64x2, ShrS) => { function.instruction(&Instruction::I64x2ShrS); }
-            (I8x16, ShrU) => { function.instruction(&Instruction::I8x16ShrU); }
-            (I16x8, ShrU) => { function.instruction(&Instruction::I16x8ShrU); }
-            (I32x4, ShrU) => { function.instruction(&Instruction::I32x4ShrU); }
-            (I64x2, ShrU) => { function.instruction(&Instruction::I64x2ShrU); }
+            (I8x16, Shl) => {
+                function.instruction(&Instruction::I8x16Shl);
+            }
+            (I16x8, Shl) => {
+                function.instruction(&Instruction::I16x8Shl);
+            }
+            (I32x4, Shl) => {
+                function.instruction(&Instruction::I32x4Shl);
+            }
+            (I64x2, Shl) => {
+                function.instruction(&Instruction::I64x2Shl);
+            }
+            (I8x16, ShrS) => {
+                function.instruction(&Instruction::I8x16ShrS);
+            }
+            (I16x8, ShrS) => {
+                function.instruction(&Instruction::I16x8ShrS);
+            }
+            (I32x4, ShrS) => {
+                function.instruction(&Instruction::I32x4ShrS);
+            }
+            (I64x2, ShrS) => {
+                function.instruction(&Instruction::I64x2ShrS);
+            }
+            (I8x16, ShrU) => {
+                function.instruction(&Instruction::I8x16ShrU);
+            }
+            (I16x8, ShrU) => {
+                function.instruction(&Instruction::I16x8ShrU);
+            }
+            (I32x4, ShrU) => {
+                function.instruction(&Instruction::I32x4ShrU);
+            }
+            (I64x2, ShrU) => {
+                function.instruction(&Instruction::I64x2ShrU);
+            }
 
             // === Min / Max ===
-            (I8x16, Min) => { function.instruction(&Instruction::I8x16MinS); }
-            (I16x8, Min) => { function.instruction(&Instruction::I16x8MinS); }
-            (I32x4, Min) => { function.instruction(&Instruction::I32x4MinS); }
-            (F32x4, Min) => { function.instruction(&Instruction::F32x4Min); }
-            (F64x2, Min) => { function.instruction(&Instruction::F64x2Min); }
-            (I8x16, Max) => { function.instruction(&Instruction::I8x16MaxS); }
-            (I16x8, Max) => { function.instruction(&Instruction::I16x8MaxS); }
-            (I32x4, Max) => { function.instruction(&Instruction::I32x4MaxS); }
-            (F32x4, Max) => { function.instruction(&Instruction::F32x4Max); }
-            (F64x2, Max) => { function.instruction(&Instruction::F64x2Max); }
+            (I8x16, Min) => {
+                function.instruction(&Instruction::I8x16MinS);
+            }
+            (I16x8, Min) => {
+                function.instruction(&Instruction::I16x8MinS);
+            }
+            (I32x4, Min) => {
+                function.instruction(&Instruction::I32x4MinS);
+            }
+            (F32x4, Min) => {
+                function.instruction(&Instruction::F32x4Min);
+            }
+            (F64x2, Min) => {
+                function.instruction(&Instruction::F64x2Min);
+            }
+            (I8x16, Max) => {
+                function.instruction(&Instruction::I8x16MaxS);
+            }
+            (I16x8, Max) => {
+                function.instruction(&Instruction::I16x8MaxS);
+            }
+            (I32x4, Max) => {
+                function.instruction(&Instruction::I32x4MaxS);
+            }
+            (F32x4, Max) => {
+                function.instruction(&Instruction::F32x4Max);
+            }
+            (F64x2, Max) => {
+                function.instruction(&Instruction::F64x2Max);
+            }
 
             // === Extract / Replace Lane ===
-            (I8x16, ExtractLane) => { function.instruction(&Instruction::I8x16ExtractLaneS(lidx)); }
-            (I16x8, ExtractLane) => { function.instruction(&Instruction::I16x8ExtractLaneS(lidx)); }
-            (I32x4, ExtractLane) => { function.instruction(&Instruction::I32x4ExtractLane(lidx)); }
-            (I64x2, ExtractLane) => { function.instruction(&Instruction::I64x2ExtractLane(lidx)); }
-            (F32x4, ExtractLane) => { function.instruction(&Instruction::F32x4ExtractLane(lidx)); }
-            (F64x2, ExtractLane) => { function.instruction(&Instruction::F64x2ExtractLane(lidx)); }
-            (I8x16, ReplaceLane) => { function.instruction(&Instruction::I8x16ReplaceLane(lidx)); }
-            (I16x8, ReplaceLane) => { function.instruction(&Instruction::I16x8ReplaceLane(lidx)); }
-            (I32x4, ReplaceLane) => { function.instruction(&Instruction::I32x4ReplaceLane(lidx)); }
-            (I64x2, ReplaceLane) => { function.instruction(&Instruction::I64x2ReplaceLane(lidx)); }
-            (F32x4, ReplaceLane) => { function.instruction(&Instruction::F32x4ReplaceLane(lidx)); }
-            (F64x2, ReplaceLane) => { function.instruction(&Instruction::F64x2ReplaceLane(lidx)); }
+            (I8x16, ExtractLane) => {
+                function.instruction(&Instruction::I8x16ExtractLaneS(lidx));
+            }
+            (I16x8, ExtractLane) => {
+                function.instruction(&Instruction::I16x8ExtractLaneS(lidx));
+            }
+            (I32x4, ExtractLane) => {
+                function.instruction(&Instruction::I32x4ExtractLane(lidx));
+            }
+            (I64x2, ExtractLane) => {
+                function.instruction(&Instruction::I64x2ExtractLane(lidx));
+            }
+            (F32x4, ExtractLane) => {
+                function.instruction(&Instruction::F32x4ExtractLane(lidx));
+            }
+            (F64x2, ExtractLane) => {
+                function.instruction(&Instruction::F64x2ExtractLane(lidx));
+            }
+            (I8x16, ReplaceLane) => {
+                function.instruction(&Instruction::I8x16ReplaceLane(lidx));
+            }
+            (I16x8, ReplaceLane) => {
+                function.instruction(&Instruction::I16x8ReplaceLane(lidx));
+            }
+            (I32x4, ReplaceLane) => {
+                function.instruction(&Instruction::I32x4ReplaceLane(lidx));
+            }
+            (I64x2, ReplaceLane) => {
+                function.instruction(&Instruction::I64x2ReplaceLane(lidx));
+            }
+            (F32x4, ReplaceLane) => {
+                function.instruction(&Instruction::F32x4ReplaceLane(lidx));
+            }
+            (F64x2, ReplaceLane) => {
+                function.instruction(&Instruction::F64x2ReplaceLane(lidx));
+            }
 
             // === Comparisons (integer signed) ===
-            (I8x16, Eq) => { function.instruction(&Instruction::I8x16Eq); }
-            (I16x8, Eq) => { function.instruction(&Instruction::I16x8Eq); }
-            (I32x4, Eq) => { function.instruction(&Instruction::I32x4Eq); }
-            (I64x2, Eq) => { function.instruction(&Instruction::I64x2Eq); }
-            (I8x16, Ne) => { function.instruction(&Instruction::I8x16Ne); }
-            (I16x8, Ne) => { function.instruction(&Instruction::I16x8Ne); }
-            (I32x4, Ne) => { function.instruction(&Instruction::I32x4Ne); }
-            (I64x2, Ne) => { function.instruction(&Instruction::I64x2Ne); }
-            (I8x16, LtS) => { function.instruction(&Instruction::I8x16LtS); }
-            (I16x8, LtS) => { function.instruction(&Instruction::I16x8LtS); }
-            (I32x4, LtS) => { function.instruction(&Instruction::I32x4LtS); }
-            (I64x2, LtS) => { function.instruction(&Instruction::I64x2LtS); }
-            (I8x16, GtS) => { function.instruction(&Instruction::I8x16GtS); }
-            (I16x8, GtS) => { function.instruction(&Instruction::I16x8GtS); }
-            (I32x4, GtS) => { function.instruction(&Instruction::I32x4GtS); }
-            (I64x2, GtS) => { function.instruction(&Instruction::I64x2GtS); }
-            (I8x16, LeS) => { function.instruction(&Instruction::I8x16LeS); }
-            (I16x8, LeS) => { function.instruction(&Instruction::I16x8LeS); }
-            (I32x4, LeS) => { function.instruction(&Instruction::I32x4LeS); }
-            (I64x2, LeS) => { function.instruction(&Instruction::I64x2LeS); }
-            (I8x16, GeS) => { function.instruction(&Instruction::I8x16GeS); }
-            (I16x8, GeS) => { function.instruction(&Instruction::I16x8GeS); }
-            (I32x4, GeS) => { function.instruction(&Instruction::I32x4GeS); }
-            (I64x2, GeS) => { function.instruction(&Instruction::I64x2GeS); }
+            (I8x16, Eq) => {
+                function.instruction(&Instruction::I8x16Eq);
+            }
+            (I16x8, Eq) => {
+                function.instruction(&Instruction::I16x8Eq);
+            }
+            (I32x4, Eq) => {
+                function.instruction(&Instruction::I32x4Eq);
+            }
+            (I64x2, Eq) => {
+                function.instruction(&Instruction::I64x2Eq);
+            }
+            (I8x16, Ne) => {
+                function.instruction(&Instruction::I8x16Ne);
+            }
+            (I16x8, Ne) => {
+                function.instruction(&Instruction::I16x8Ne);
+            }
+            (I32x4, Ne) => {
+                function.instruction(&Instruction::I32x4Ne);
+            }
+            (I64x2, Ne) => {
+                function.instruction(&Instruction::I64x2Ne);
+            }
+            (I8x16, LtS) => {
+                function.instruction(&Instruction::I8x16LtS);
+            }
+            (I16x8, LtS) => {
+                function.instruction(&Instruction::I16x8LtS);
+            }
+            (I32x4, LtS) => {
+                function.instruction(&Instruction::I32x4LtS);
+            }
+            (I64x2, LtS) => {
+                function.instruction(&Instruction::I64x2LtS);
+            }
+            (I8x16, GtS) => {
+                function.instruction(&Instruction::I8x16GtS);
+            }
+            (I16x8, GtS) => {
+                function.instruction(&Instruction::I16x8GtS);
+            }
+            (I32x4, GtS) => {
+                function.instruction(&Instruction::I32x4GtS);
+            }
+            (I64x2, GtS) => {
+                function.instruction(&Instruction::I64x2GtS);
+            }
+            (I8x16, LeS) => {
+                function.instruction(&Instruction::I8x16LeS);
+            }
+            (I16x8, LeS) => {
+                function.instruction(&Instruction::I16x8LeS);
+            }
+            (I32x4, LeS) => {
+                function.instruction(&Instruction::I32x4LeS);
+            }
+            (I64x2, LeS) => {
+                function.instruction(&Instruction::I64x2LeS);
+            }
+            (I8x16, GeS) => {
+                function.instruction(&Instruction::I8x16GeS);
+            }
+            (I16x8, GeS) => {
+                function.instruction(&Instruction::I16x8GeS);
+            }
+            (I32x4, GeS) => {
+                function.instruction(&Instruction::I32x4GeS);
+            }
+            (I64x2, GeS) => {
+                function.instruction(&Instruction::I64x2GeS);
+            }
 
             // === Comparisons (unsigned) ===
-            (I8x16, LtU) => { function.instruction(&Instruction::I8x16LtU); }
-            (I16x8, LtU) => { function.instruction(&Instruction::I16x8LtU); }
-            (I32x4, LtU) => { function.instruction(&Instruction::I32x4LtU); }
-            (I8x16, GtU) => { function.instruction(&Instruction::I8x16GtU); }
-            (I16x8, GtU) => { function.instruction(&Instruction::I16x8GtU); }
-            (I32x4, GtU) => { function.instruction(&Instruction::I32x4GtU); }
-            (I8x16, LeU) => { function.instruction(&Instruction::I8x16LeU); }
-            (I16x8, LeU) => { function.instruction(&Instruction::I16x8LeU); }
-            (I32x4, LeU) => { function.instruction(&Instruction::I32x4LeU); }
-            (I8x16, GeU) => { function.instruction(&Instruction::I8x16GeU); }
-            (I16x8, GeU) => { function.instruction(&Instruction::I16x8GeU); }
-            (I32x4, GeU) => { function.instruction(&Instruction::I32x4GeU); }
+            (I8x16, LtU) => {
+                function.instruction(&Instruction::I8x16LtU);
+            }
+            (I16x8, LtU) => {
+                function.instruction(&Instruction::I16x8LtU);
+            }
+            (I32x4, LtU) => {
+                function.instruction(&Instruction::I32x4LtU);
+            }
+            (I8x16, GtU) => {
+                function.instruction(&Instruction::I8x16GtU);
+            }
+            (I16x8, GtU) => {
+                function.instruction(&Instruction::I16x8GtU);
+            }
+            (I32x4, GtU) => {
+                function.instruction(&Instruction::I32x4GtU);
+            }
+            (I8x16, LeU) => {
+                function.instruction(&Instruction::I8x16LeU);
+            }
+            (I16x8, LeU) => {
+                function.instruction(&Instruction::I16x8LeU);
+            }
+            (I32x4, LeU) => {
+                function.instruction(&Instruction::I32x4LeU);
+            }
+            (I8x16, GeU) => {
+                function.instruction(&Instruction::I8x16GeU);
+            }
+            (I16x8, GeU) => {
+                function.instruction(&Instruction::I16x8GeU);
+            }
+            (I32x4, GeU) => {
+                function.instruction(&Instruction::I32x4GeU);
+            }
 
             // === Float comparisons ===
             (F32x4, Eq) | (F32x4, Lt) | (F32x4, Gt) | (F32x4, Le) | (F32x4, Ge) | (F32x4, Ne) => {
@@ -5722,80 +6605,188 @@ impl<'a> ModuleCompiler<'a> {
             }
 
             // === Bitwise (v128 interpretation) ===
-            (_, And) => { function.instruction(&Instruction::V128And); }
-            (_, Or) => { function.instruction(&Instruction::V128Or); }
-            (_, Xor) => { function.instruction(&Instruction::V128Xor); }
-            (_, Not) => { function.instruction(&Instruction::V128Not); }
-            (_, AndNot) => { function.instruction(&Instruction::V128AndNot); }
-            (_, Bitselect) => { function.instruction(&Instruction::V128Bitselect); }
+            (_, And) => {
+                function.instruction(&Instruction::V128And);
+            }
+            (_, Or) => {
+                function.instruction(&Instruction::V128Or);
+            }
+            (_, Xor) => {
+                function.instruction(&Instruction::V128Xor);
+            }
+            (_, Not) => {
+                function.instruction(&Instruction::V128Not);
+            }
+            (_, AndNot) => {
+                function.instruction(&Instruction::V128AndNot);
+            }
+            (_, Bitselect) => {
+                function.instruction(&Instruction::V128Bitselect);
+            }
 
             // === Tests ===
-            (_, AnyTrue) => { function.instruction(&Instruction::V128AnyTrue); }
-            (I8x16, AllTrue) => { function.instruction(&Instruction::I8x16AllTrue); }
-            (I16x8, AllTrue) => { function.instruction(&Instruction::I16x8AllTrue); }
-            (I32x4, AllTrue) => { function.instruction(&Instruction::I32x4AllTrue); }
-            (I64x2, AllTrue) => { function.instruction(&Instruction::I64x2AllTrue); }
-            (I8x16, Bitmask) => { function.instruction(&Instruction::I8x16Bitmask); }
-            (I16x8, Bitmask) => { function.instruction(&Instruction::I16x8Bitmask); }
-            (I32x4, Bitmask) => { function.instruction(&Instruction::I32x4Bitmask); }
-            (I64x2, Bitmask) => { function.instruction(&Instruction::I64x2Bitmask); }
+            (_, AnyTrue) => {
+                function.instruction(&Instruction::V128AnyTrue);
+            }
+            (I8x16, AllTrue) => {
+                function.instruction(&Instruction::I8x16AllTrue);
+            }
+            (I16x8, AllTrue) => {
+                function.instruction(&Instruction::I16x8AllTrue);
+            }
+            (I32x4, AllTrue) => {
+                function.instruction(&Instruction::I32x4AllTrue);
+            }
+            (I64x2, AllTrue) => {
+                function.instruction(&Instruction::I64x2AllTrue);
+            }
+            (I8x16, Bitmask) => {
+                function.instruction(&Instruction::I8x16Bitmask);
+            }
+            (I16x8, Bitmask) => {
+                function.instruction(&Instruction::I16x8Bitmask);
+            }
+            (I32x4, Bitmask) => {
+                function.instruction(&Instruction::I32x4Bitmask);
+            }
+            (I64x2, Bitmask) => {
+                function.instruction(&Instruction::I64x2Bitmask);
+            }
 
             // === Swizzle ===
-            (I8x16, Swizzle) => { function.instruction(&Instruction::I8x16Swizzle); }
+            (I8x16, Swizzle) => {
+                function.instruction(&Instruction::I8x16Swizzle);
+            }
 
             // === Memory ===
-            (_, Load) => { function.instruction(&Instruction::V128Load(memarg)); }
-            (_, Store) => { function.instruction(&Instruction::V128Store(memarg)); }
+            (_, Load) => {
+                function.instruction(&Instruction::V128Load(memarg));
+            }
+            (_, Store) => {
+                function.instruction(&Instruction::V128Store(memarg));
+            }
 
             // === Popcnt ===
-            (I8x16, Popcnt) => { function.instruction(&Instruction::I8x16Popcnt); }
+            (I8x16, Popcnt) => {
+                function.instruction(&Instruction::I8x16Popcnt);
+            }
 
             // === AvgR ===
-            (I8x16, AvgRU) => { function.instruction(&Instruction::I8x16AvgrU); }
-            (I16x8, AvgRU) => { function.instruction(&Instruction::I16x8AvgrU); }
+            (I8x16, AvgRU) => {
+                function.instruction(&Instruction::I8x16AvgrU);
+            }
+            (I16x8, AvgRU) => {
+                function.instruction(&Instruction::I16x8AvgrU);
+            }
 
             // === Dot ===
-            (I32x4, Dot) => { function.instruction(&Instruction::I32x4DotI16x8S); }
+            (I32x4, Dot) => {
+                function.instruction(&Instruction::I32x4DotI16x8S);
+            }
 
             // === Widening multiply ===
-            (I16x8, ExtMulLowS) => { function.instruction(&Instruction::I16x8ExtMulLowI8x16S); }
-            (I16x8, ExtMulHighS) => { function.instruction(&Instruction::I16x8ExtMulHighI8x16S); }
-            (I16x8, ExtMulLowU) => { function.instruction(&Instruction::I16x8ExtMulLowI8x16U); }
-            (I16x8, ExtMulHighU) => { function.instruction(&Instruction::I16x8ExtMulHighI8x16U); }
-            (I32x4, ExtMulLowS) => { function.instruction(&Instruction::I32x4ExtMulLowI16x8S); }
-            (I32x4, ExtMulHighS) => { function.instruction(&Instruction::I32x4ExtMulHighI16x8S); }
-            (I32x4, ExtMulLowU) => { function.instruction(&Instruction::I32x4ExtMulLowI16x8U); }
-            (I32x4, ExtMulHighU) => { function.instruction(&Instruction::I32x4ExtMulHighI16x8U); }
-            (I64x2, ExtMulLowS) => { function.instruction(&Instruction::I64x2ExtMulLowI32x4S); }
-            (I64x2, ExtMulHighS) => { function.instruction(&Instruction::I64x2ExtMulHighI32x4S); }
-            (I64x2, ExtMulLowU) => { function.instruction(&Instruction::I64x2ExtMulLowI32x4U); }
-            (I64x2, ExtMulHighU) => { function.instruction(&Instruction::I64x2ExtMulHighI32x4U); }
+            (I16x8, ExtMulLowS) => {
+                function.instruction(&Instruction::I16x8ExtMulLowI8x16S);
+            }
+            (I16x8, ExtMulHighS) => {
+                function.instruction(&Instruction::I16x8ExtMulHighI8x16S);
+            }
+            (I16x8, ExtMulLowU) => {
+                function.instruction(&Instruction::I16x8ExtMulLowI8x16U);
+            }
+            (I16x8, ExtMulHighU) => {
+                function.instruction(&Instruction::I16x8ExtMulHighI8x16U);
+            }
+            (I32x4, ExtMulLowS) => {
+                function.instruction(&Instruction::I32x4ExtMulLowI16x8S);
+            }
+            (I32x4, ExtMulHighS) => {
+                function.instruction(&Instruction::I32x4ExtMulHighI16x8S);
+            }
+            (I32x4, ExtMulLowU) => {
+                function.instruction(&Instruction::I32x4ExtMulLowI16x8U);
+            }
+            (I32x4, ExtMulHighU) => {
+                function.instruction(&Instruction::I32x4ExtMulHighI16x8U);
+            }
+            (I64x2, ExtMulLowS) => {
+                function.instruction(&Instruction::I64x2ExtMulLowI32x4S);
+            }
+            (I64x2, ExtMulHighS) => {
+                function.instruction(&Instruction::I64x2ExtMulHighI32x4S);
+            }
+            (I64x2, ExtMulLowU) => {
+                function.instruction(&Instruction::I64x2ExtMulLowI32x4U);
+            }
+            (I64x2, ExtMulHighU) => {
+                function.instruction(&Instruction::I64x2ExtMulHighI32x4U);
+            }
 
             // === Pairwise add ===
-            (I16x8, ExtAddPairwiseS) => { function.instruction(&Instruction::I16x8ExtAddPairwiseI8x16S); }
-            (I16x8, ExtAddPairwiseU) => { function.instruction(&Instruction::I16x8ExtAddPairwiseI8x16U); }
-            (I32x4, ExtAddPairwiseS) => { function.instruction(&Instruction::I32x4ExtAddPairwiseI16x8S); }
-            (I32x4, ExtAddPairwiseU) => { function.instruction(&Instruction::I32x4ExtAddPairwiseI16x8U); }
+            (I16x8, ExtAddPairwiseS) => {
+                function.instruction(&Instruction::I16x8ExtAddPairwiseI8x16S);
+            }
+            (I16x8, ExtAddPairwiseU) => {
+                function.instruction(&Instruction::I16x8ExtAddPairwiseI8x16U);
+            }
+            (I32x4, ExtAddPairwiseS) => {
+                function.instruction(&Instruction::I32x4ExtAddPairwiseI16x8S);
+            }
+            (I32x4, ExtAddPairwiseU) => {
+                function.instruction(&Instruction::I32x4ExtAddPairwiseI16x8U);
+            }
 
             // === Narrowing ===
-            (I8x16, NarrowS) => { function.instruction(&Instruction::I8x16NarrowI16x8S); }
-            (I8x16, NarrowU) => { function.instruction(&Instruction::I8x16NarrowI16x8U); }
-            (I16x8, NarrowS) => { function.instruction(&Instruction::I16x8NarrowI32x4S); }
-            (I16x8, NarrowU) => { function.instruction(&Instruction::I16x8NarrowI32x4U); }
+            (I8x16, NarrowS) => {
+                function.instruction(&Instruction::I8x16NarrowI16x8S);
+            }
+            (I8x16, NarrowU) => {
+                function.instruction(&Instruction::I8x16NarrowI16x8U);
+            }
+            (I16x8, NarrowS) => {
+                function.instruction(&Instruction::I16x8NarrowI32x4S);
+            }
+            (I16x8, NarrowU) => {
+                function.instruction(&Instruction::I16x8NarrowI32x4U);
+            }
 
             // === Extending ===
-            (I16x8, ExtendLowS) => { function.instruction(&Instruction::I16x8ExtendLowI8x16S); }
-            (I16x8, ExtendHighS) => { function.instruction(&Instruction::I16x8ExtendHighI8x16S); }
-            (I16x8, ExtendLowU) => { function.instruction(&Instruction::I16x8ExtendLowI8x16U); }
-            (I16x8, ExtendHighU) => { function.instruction(&Instruction::I16x8ExtendHighI8x16U); }
-            (I32x4, ExtendLowS) => { function.instruction(&Instruction::I32x4ExtendLowI16x8S); }
-            (I32x4, ExtendHighS) => { function.instruction(&Instruction::I32x4ExtendHighI16x8S); }
-            (I32x4, ExtendLowU) => { function.instruction(&Instruction::I32x4ExtendLowI16x8U); }
-            (I32x4, ExtendHighU) => { function.instruction(&Instruction::I32x4ExtendHighI16x8U); }
-            (I64x2, ExtendLowS) => { function.instruction(&Instruction::I64x2ExtendLowI32x4S); }
-            (I64x2, ExtendHighS) => { function.instruction(&Instruction::I64x2ExtendHighI32x4S); }
-            (I64x2, ExtendLowU) => { function.instruction(&Instruction::I64x2ExtendLowI32x4U); }
-            (I64x2, ExtendHighU) => { function.instruction(&Instruction::I64x2ExtendHighI32x4U); }
+            (I16x8, ExtendLowS) => {
+                function.instruction(&Instruction::I16x8ExtendLowI8x16S);
+            }
+            (I16x8, ExtendHighS) => {
+                function.instruction(&Instruction::I16x8ExtendHighI8x16S);
+            }
+            (I16x8, ExtendLowU) => {
+                function.instruction(&Instruction::I16x8ExtendLowI8x16U);
+            }
+            (I16x8, ExtendHighU) => {
+                function.instruction(&Instruction::I16x8ExtendHighI8x16U);
+            }
+            (I32x4, ExtendLowS) => {
+                function.instruction(&Instruction::I32x4ExtendLowI16x8S);
+            }
+            (I32x4, ExtendHighS) => {
+                function.instruction(&Instruction::I32x4ExtendHighI16x8S);
+            }
+            (I32x4, ExtendLowU) => {
+                function.instruction(&Instruction::I32x4ExtendLowI16x8U);
+            }
+            (I32x4, ExtendHighU) => {
+                function.instruction(&Instruction::I32x4ExtendHighI16x8U);
+            }
+            (I64x2, ExtendLowS) => {
+                function.instruction(&Instruction::I64x2ExtendLowI32x4S);
+            }
+            (I64x2, ExtendHighS) => {
+                function.instruction(&Instruction::I64x2ExtendHighI32x4S);
+            }
+            (I64x2, ExtendLowU) => {
+                function.instruction(&Instruction::I64x2ExtendLowI32x4U);
+            }
+            (I64x2, ExtendHighU) => {
+                function.instruction(&Instruction::I64x2ExtendHighI32x4U);
+            }
 
             // Fallback: unsupported combination — emit i32.const 0
             _ => {
@@ -5815,17 +6806,29 @@ impl<'a> ModuleCompiler<'a> {
         locals_types: &mut HashMap<String, RecordTypeInfo>,
     ) -> Result<(), CompileError> {
         match stmt {
-            Statement::CompoundAssign { name, op, value } if self.shared_locals.contains(&name.name) => {
+            Statement::CompoundAssign { name, op, value }
+                if self.shared_locals.contains(&name.name) =>
+            {
                 // Desugar: shared_var += val → i32.atomic.rmw.add(offset, val)
                 if let Some(&idx) = locals.get(&name.name) {
                     function.instruction(&Instruction::LocalGet(idx)); // push memory offset
                 }
                 self.compile_expr_with_locals(function, value, locals, locals_types)?;
-                let memarg = wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 };
+                let memarg = wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                };
                 match op {
-                    BinOp::Add => { function.instruction(&Instruction::I32AtomicRmwAdd(memarg)); }
-                    BinOp::Sub => { function.instruction(&Instruction::I32AtomicRmwSub(memarg)); }
-                    _ => { function.instruction(&Instruction::I32AtomicRmwAdd(memarg)); }
+                    BinOp::Add => {
+                        function.instruction(&Instruction::I32AtomicRmwAdd(memarg));
+                    }
+                    BinOp::Sub => {
+                        function.instruction(&Instruction::I32AtomicRmwSub(memarg));
+                    }
+                    _ => {
+                        function.instruction(&Instruction::I32AtomicRmwAdd(memarg));
+                    }
                 }
                 function.instruction(&Instruction::Drop); // rmw returns old value; discard
             }
@@ -6013,6 +7016,103 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_guard_statement() {
+        let source = r#"
+            package local:test;
+
+            interface effects {
+                go: func(flag: bool) -> s32 {
+                    guard flag else {
+                        let fallback = 7;
+                        return fallback;
+                    };
+                    1;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("guard should compile");
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+    }
+
+    #[test]
+    fn test_compile_guard_with_continue() {
+        let source = r#"
+            package local:test;
+
+            interface effects {
+                go: func() -> s32 {
+                    let total = 0;
+                    for item in [1, 2, 3] {
+                        guard item != 2 else {
+                            continue;
+                        };
+                        total += item;
+                    };
+                    total;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("guard with continue should compile");
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+    }
+
+    #[test]
+    fn test_compile_guard_let_statement() {
+        let source = r#"
+            package local:test;
+
+            interface effects {
+                go: func(v: option<s32>) -> s32 {
+                    guard let value = v else {
+                        return 0;
+                    };
+                    value;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("guard let should compile");
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+    }
+
+    #[test]
+    fn test_compile_guard_let_result_statement() {
+        let source = r#"
+            package local:test;
+
+            interface effects {
+                go: func(v: result<s32, string>) -> s32 {
+                    guard let value = v else {
+                        return 0;
+                    };
+                    value;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("guard let result should compile");
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+    }
+
+    #[test]
     fn test_compile_atomic_block() {
         let source = r#"
             package local:test;
@@ -6074,7 +7174,10 @@ mod tests {
         let (ast, _) = parse_file(source);
         let ast = ast.expect("Should parse");
 
-        let options = CompileOptions { threads: true, ..Default::default() };
+        let options = CompileOptions {
+            threads: true,
+            ..Default::default()
+        };
         let wasm = compile_module(&ast, &options).expect("thread.join should compile");
         assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
     }
@@ -6099,7 +7202,10 @@ mod tests {
         let (ast, _) = parse_file(source);
         let ast = ast.expect("Should parse");
 
-        let options = CompileOptions { threads: true, ..Default::default() };
+        let options = CompileOptions {
+            threads: true,
+            ..Default::default()
+        };
         let wasm = compile_module(&ast, &options).expect("full spawn+join should compile");
         assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
     }
@@ -6145,7 +7251,10 @@ mod tests {
         let (ast, _) = parse_file(source);
         let ast = ast.expect("Should parse");
 
-        let options = CompileOptions { threads: true, ..Default::default() };
+        let options = CompileOptions {
+            threads: true,
+            ..Default::default()
+        };
         let wasm = compile_module(&ast, &options).expect("atomic block desugaring should compile");
         assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
     }
@@ -6167,7 +7276,10 @@ mod tests {
         let (ast, _) = parse_file(source);
         let ast = ast.expect("Should parse");
 
-        let options = CompileOptions { threads: true, ..Default::default() };
+        let options = CompileOptions {
+            threads: true,
+            ..Default::default()
+        };
         let wasm = compile_module(&ast, &options).expect("await thread-id should compile");
         assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
     }
@@ -6188,11 +7300,15 @@ mod tests {
         "#,
         );
 
-        let Expr::For { variable, range, .. } = expr else {
+        let Expr::For {
+            variable, range, ..
+        } = expr
+        else {
             panic!("expected for loop");
         };
 
-        let analysis = analyze_range_loop(&variable.name, range.as_ref()).expect("expected range facts");
+        let analysis =
+            analyze_range_loop(&variable.name, range.as_ref()).expect("expected range facts");
         assert_eq!(analysis.induction_variable, "i");
         assert!(!analysis.descending);
         assert_eq!(analysis.constant_step, Some(3));
@@ -6215,11 +7331,15 @@ mod tests {
         "#,
         );
 
-        let Expr::For { variable, range, .. } = expr else {
+        let Expr::For {
+            variable, range, ..
+        } = expr
+        else {
             panic!("expected for loop");
         };
 
-        let analysis = analyze_range_loop(&variable.name, range.as_ref()).expect("expected range facts");
+        let analysis =
+            analyze_range_loop(&variable.name, range.as_ref()).expect("expected range facts");
         assert_eq!(analysis.induction_variable, "i");
         assert!(analysis.descending);
         assert_eq!(analysis.constant_step, Some(2));
@@ -6242,11 +7362,15 @@ mod tests {
         "#,
         );
 
-        let Expr::For { variable, range, .. } = expr else {
+        let Expr::For {
+            variable, range, ..
+        } = expr
+        else {
             panic!("expected for loop");
         };
 
-        let analysis = analyze_range_loop(&variable.name, range.as_ref()).expect("expected range facts");
+        let analysis =
+            analyze_range_loop(&variable.name, range.as_ref()).expect("expected range facts");
         assert_eq!(analysis.constant_step, Some(1));
         assert_eq!(analysis.trip_count, Some(LoopTripCount::Constant(0)));
     }

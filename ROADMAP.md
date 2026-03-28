@@ -50,6 +50,16 @@
 - [x] Optional chaining: `x?.field`
 - [x] Try operator: `expr?`
 
+### Phase 9b: Guard Syntax ✓
+
+- [x] Parse `guard <condition> else { ... };` statements
+- [x] Parse `guard let name = value else { ... };` optional/result binding guards
+- [x] Require boolean guard conditions
+- [x] Unwrap `option<T>` / `result<T, E>` payloads into post-guard bindings
+- [x] Require the `else` block to exit the current scope
+- [x] Lower guard bodies for `return`, `break`, and `continue`
+- [x] Add parser, checker, and codegen coverage
+
 ### Phase 10: Modules & Imports ✓
 
 - [x] Multi-file compilation
