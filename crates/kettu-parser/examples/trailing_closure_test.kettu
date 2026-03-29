@@ -1,0 +1,43 @@
+package local:trailing-closure-test;
+
+interface trailing-closures {
+    @test
+    test-trailing-map: func() -> bool {
+        let arr = [1, 2, 3];
+        let doubled = map(arr) |x| x * 2;
+        return doubled[0] == 2 && doubled[1] == 4 && doubled[2] == 6;
+    }
+
+    @test
+    test-trailing-filter: func() -> bool {
+        let arr = [1, 2, 3, 4, 5, 6];
+        let bigs = filter(arr) |x| x > 3;
+        return bigs[0] == 4;
+    }
+
+    @test
+    test-trailing-reduce: func() -> bool {
+        let arr = [1, 2, 3, 4];
+        let sum = reduce(arr, 0) |acc, x| acc + x;
+        return sum == 10;
+    }
+
+    @test
+    test-trailing-vs-traditional: func() -> bool {
+        let arr = [1, 2, 3];
+        let a = map(arr, |x| x * 2);
+        let b = map(arr) |x| x * 2;
+        return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
+    }
+
+    @test
+    test-parens-free: func() -> bool {
+        let apply = |f| f(10);
+        let result = apply |x| x * 2;
+        return result == 20;
+    }
+}
+
+world tests {
+    export trailing-closures;
+}

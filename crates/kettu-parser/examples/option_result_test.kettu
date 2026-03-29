@@ -1,0 +1,43 @@
+package local:option-result-test;
+
+interface option-result-tests {
+    @test
+    test-some: func() -> bool {
+        let x = some(42);
+        return match x {
+            #some(v) => v == 42,
+            #none => false
+        };
+    }
+
+    @test
+    test-none: func() -> bool {
+        let x = none;
+        return match x {
+            #some(_) => false,
+            #none => true
+        };
+    }
+
+    @test
+    test-ok: func() -> bool {
+        let r = ok(10);
+        return match r {
+            #ok(v) => v == 10,
+            #err(_) => false
+        };
+    }
+
+    @test
+    test-err: func() -> bool {
+        let r = err(99);
+        return match r {
+            #ok(_) => false,
+            #err(e) => e == 99
+        };
+    }
+}
+
+world tests {
+    export option-result-tests;
+}

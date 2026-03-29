@@ -1,0 +1,50 @@
+// Math Tests Example
+// Demonstrates the @test annotation for unit tests
+
+package example:math-tests;
+
+/// Unit tests for math operations
+interface calculator-tests {
+    @test
+    test-addition: func() -> bool {
+        return 2 + 3 == 5;
+    }
+
+    @test
+    test-subtraction: func() -> bool {
+        return 10 - 4 == 6;
+    }
+
+    @test
+    test-multiplication: func() -> bool {
+        let result = 6 * 7;
+        return result == 42;
+    }
+
+    @test
+    test-division: func() -> bool {
+        return 10 / 2 == 5;
+    }
+
+    @test
+    test-comparison: func() -> bool {
+        if 10 > 5 {
+            return true;
+        } else {
+            return false;
+        };
+        return false;
+    }
+
+    @test
+    test-let-binding: func() -> bool {
+        let a = 10;
+        let b = 20;
+        let sum = a + b;
+        return sum == 30;
+    }
+}
+
+world tests {
+    export calculator-tests;
+}

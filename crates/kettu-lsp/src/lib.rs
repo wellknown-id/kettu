@@ -1481,37 +1481,30 @@ fn infer_match_arms_type(
 
     let mut arm_scope = scope.clone();
     for arm in arms {
-        // Collect which bindings are added by this pattern to undo later
-        let added_bindings = match &arm.pattern {
-            Pattern::Variant {
-                type_name,
-                case_name,
-                binding,
-                ..
-            } => {
-                let ty_source = type_name.as_ref().map(|t| t.name.as_str()).or(scrutinee_ty);
-                if let Some(binding) = binding {
-                    if let Some(payload_ty) = ty_source.and_then(|ty| {
-                        infer_variant_payload_type(ty, &case_name.name, inference_ctx)
-                    }) {
-                        let prev = arm_scope.insert(binding.name.clone(), payload_ty);
-                        Some((binding.name.clone(), prev))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+        let mut added_binding = None;
+
+        if let Pattern::Variant {
+            type_name,
+            case_name,
+            binding: Some(binding),
+            ..
+        } = &arm.pattern
+        {
+            let ty_source = type_name.as_ref().map(|t| t.name.as_str()).or(scrutinee_ty);
+
+            if let Some(payload_ty) = ty_source
+                .and_then(|ty| infer_variant_payload_type(ty, &case_name.name, inference_ctx))
+            {
+                let prev = arm_scope.insert(binding.name.clone(), payload_ty);
+                added_binding = Some((binding.name.clone(), prev));
             }
-            _ => None,
-        };
+        }
 
         let arm_ty = infer_block_tail_type(&arm.body, &arm_scope, inference_ctx);
 
-        // Undo bindings
-        if let Some((name, prev)) = added_bindings {
-            if let Some(old_val) = prev {
-                arm_scope.insert(name, old_val);
+        if let Some((name, prev)) = added_binding {
+            if let Some(old_ty) = prev {
+                arm_scope.insert(name, old_ty);
             } else {
                 arm_scope.remove(&name);
             }
@@ -1527,7 +1520,6 @@ fn infer_match_arms_type(
 
     inferred
 }
-
 
 fn infer_variant_payload_type(
     ty_name: &str,

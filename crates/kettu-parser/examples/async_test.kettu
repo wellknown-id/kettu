@@ -1,0 +1,30 @@
+// Async/Await Example
+//
+// Kettu supports async functions via the --wasip3 flag.
+// Async functions return WASI Preview 3 status codes and generate $callback exports.
+//
+// Note: `await` is supported for calling imported async functions.
+// Calling sibling interface functions requires import-based composition.
+
+package example:asyncdemo;
+
+interface async-api {
+    // Async function - compiles to stackless async with task.return
+    get-number: async func() -> s32 {
+        42;
+    }
+
+    // Another async function
+    fetch-data: async func() -> s32 {
+        100;
+    }
+
+    // Sync function for comparison
+    get-sync: func() -> s32 {
+        200;
+    }
+}
+
+world async-world {
+    export async-api;
+}

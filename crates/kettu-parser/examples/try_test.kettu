@@ -1,0 +1,25 @@
+package local:try-test;
+
+interface try-tests {
+    @test
+    test-try-some: func() -> bool {
+        let x = some(42);
+        return match x {
+            #some(v) => v == 42,
+            #none => false,
+        };
+    }
+
+    @test
+    test-optional-chain: func() -> bool {
+        let x = some(99);
+        return match x {
+            #some(v) => v == 99,
+            #none => false,
+        };
+    }
+}
+
+world tests {
+    export try-tests;
+}

@@ -1,0 +1,58 @@
+// Match Expression Tests
+package example:match-tests;
+
+interface match-tests {
+    @test
+    test-match-simple: func() -> bool {
+        let v = #ok;
+        let result = match v {
+            #ok => 42,
+            _ => 0
+        };
+        return result == 42;
+    }
+
+    @test
+    test-match-second-arm: func() -> bool {
+        let v = #err;
+        let result = match v {
+            #ok => 0,
+            #err => 99
+        };
+        return result == 99;
+    }
+
+    @test
+    test-match-payload-binding: func() -> bool {
+        let v = #ok(42);
+        let result = match v {
+            #ok(x) => x,
+            #err(e) => 0
+        };
+        return result == 42;
+    }
+
+    @test
+    test-match-payload-double: func() -> bool {
+        let v = #ok(21);
+        let result = match v {
+            #ok(x) => x * 2,
+            #err(e) => 0
+        };
+        return result == 42;
+    }
+
+    @test
+    test-match-payload-error-arm: func() -> bool {
+        let v = #err(99);
+        let result = match v {
+            #ok(x) => 0,
+            #err(code) => code
+        };
+        return result == 99;
+    }
+}
+
+world tests {
+    export match-tests;
+}

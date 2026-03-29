@@ -1,0 +1,95 @@
+// Higher-Order Function Tests
+package example:hof-tests;
+
+interface hof-tests {
+    @test
+    test-map-len: func() -> bool {
+        let arr = [1, 2, 3];
+        let mapped = map(arr, |x| x);
+        list-len(mapped) == 3;
+    }
+
+    @test
+    test-map-double: func() -> bool {
+        let arr = [1, 2, 3];
+        let doubled = map(arr, |x| x * 2);
+        doubled[1] == 4;
+    }
+
+    @test
+    test-filter-big: func() -> bool {
+        let arr = [1, 10, 2, 20, 3, 30];
+        let big = filter(arr, |x| x > 5);
+        list-len(big) == 3;
+    }
+
+    @test
+    test-filter-value: func() -> bool {
+        let arr = [5, 10, 15, 20, 25];
+        let big = filter(arr, |x| x > 12);
+        big[0] == 15;
+    }
+
+    @test
+    test-reduce-sum: func() -> bool {
+        let arr = [1, 2, 3, 4, 5];
+        let sum = reduce(arr, 0, |acc, x| acc + x);
+        sum == 15;
+    }
+
+    @test
+    test-reduce-product: func() -> bool {
+        let arr = [2, 3, 4];
+        let product = reduce(arr, 1, |acc, x| acc * x);
+        product == 24;
+    }
+
+    @test
+    test-reduce-single: func() -> bool {
+        let arr = [42];
+        let result = reduce(arr, 0, |acc, x| acc + x);
+        result == 42;
+    }
+
+    @test
+    test-lambda-stored: func() -> bool {
+        let f = |x| x * 2;
+        f > 0;
+    }
+
+    @test
+    test-lambda-call: func() -> bool {
+        let double = |x| x * 2;
+        let result = double(21);
+        result == 42;
+    }
+
+    // First-class function tests with HOFs
+    @test
+    test-map-with-var: func() -> bool {
+        let arr = [1, 2, 3];
+        let triple = |x| x * 3;
+        let tripled = map(arr, triple);
+        tripled[2] == 9;
+    }
+
+    @test
+    test-filter-with-var: func() -> bool {
+        let arr = [2, 4, 6, 8, 10];
+        let pred = |x| x > 5;
+        let big = filter(arr, pred);
+        list-len(big) == 3;
+    }
+
+    @test
+    test-reduce-with-var: func() -> bool {
+        let arr = [1, 2, 3, 4];
+        let add = |acc, x| acc + x;
+        let total = reduce(arr, 0, add);
+        total == 10;
+    }
+}
+
+world tests {
+    export hof-tests;
+}

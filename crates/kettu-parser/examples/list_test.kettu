@@ -1,0 +1,79 @@
+package local:list-test;
+
+/// Test interface for list operations
+interface lists {
+    /// Test list literal and index access
+    @test
+    test-list-index: func() -> bool {
+        let arr = [10, 20, 30];
+        arr[1] == 20;
+    }
+
+    /// Test accessing first element
+    @test
+    test-list-first: func() -> bool {
+        let arr = [5, 10, 15, 20];
+        arr[0] == 5;
+    }
+
+    /// Test accessing last element with computed index
+    @test
+    test-list-computed-index: func() -> bool {
+        let arr = [100, 200, 300];
+        let idx = 2;
+        arr[idx] == 300;
+    }
+
+    /// Test single element list
+    @test
+    test-list-single: func() -> bool {
+        let arr = [42];
+        arr[0] == 42;
+    }
+
+    /// Test list-len built-in
+    @test
+    test-list-len: func() -> bool {
+        let arr = [1, 2, 3, 4, 5];
+        list-len(arr) == 5;
+    }
+
+    /// Test for-each iteration
+    @test
+    test-for-each-sum: func() -> bool {
+        let arr = [10, 20, 30];
+        let sum = 0;
+        for item in arr {
+            sum = sum + item;
+        };
+        sum == 60;
+    }
+
+    /// Test list-set mutation
+    @test
+    test-list-set: func() -> bool {
+        let arr = [10, 20, 30];
+        list-set(arr, 1, 99);
+        arr[1] == 99;
+    }
+
+    /// Test slice syntax [start..end]
+    @test
+    test-slice: func() -> bool {
+        let arr = [10, 20, 30, 40, 50];
+        let sub = arr[1..4];
+        (list-len(sub) == 3) && (sub[0] == 20) && (sub[2] == 40);
+    }
+
+    /// Test list-push (returns new list)
+    @test
+    test-list-push: func() -> bool {
+        let arr = [10, 20];
+        let arr2 = list-push(arr, 30);
+        (list-len(arr2) == 3) && (arr2[2] == 30) && (list-len(arr) == 2);
+    }
+}
+
+world tests {
+    export lists;
+}
