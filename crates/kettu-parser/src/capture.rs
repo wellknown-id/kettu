@@ -77,12 +77,26 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
             scrutinee, arms, ..
         } => {
             analyze_captures(scrutinee, scope);
+            let mut arm_scope = scope.clone();
             for arm in arms {
                 // Patterns may bind new variables
-                let mut arm_scope = scope.clone();
-                collect_pattern_bindings(&arm.pattern, &mut arm_scope);
-                for stmt in &mut arm.body.clone() {
-                    analyze_statement(&mut stmt.clone(), &arm_scope);
+                let binding = get_pattern_binding(&arm.pattern);
+
+                let was_present = if let Some(ref name) = binding {
+                    !arm_scope.insert(name.clone())
+                } else {
+                    false
+                };
+
+                for stmt in &mut arm.body {
+                    analyze_statement(stmt, &arm_scope);
+                }
+
+                // Cleanup scope for next arm
+                if let Some(ref name) = binding {
+                    if !was_present {
+                        arm_scope.remove(name);
+                    }
                 }
             }
         }
@@ -276,11 +290,24 @@ fn collect_free_variables(expr: &Expr, bound: &HashSet<String>, free: &mut HashS
             scrutinee, arms, ..
         } => {
             collect_free_variables(scrutinee, bound, free);
+            let mut arm_bound = bound.clone();
             for arm in arms {
-                let mut arm_bound = bound.clone();
-                collect_pattern_bindings(&arm.pattern, &mut arm_bound);
+                let binding = get_pattern_binding(&arm.pattern);
+
+                let was_present = if let Some(ref name) = binding {
+                    !arm_bound.insert(name.clone())
+                } else {
+                    false
+                };
+
                 for stmt in &arm.body {
                     collect_free_in_statement(stmt, &arm_bound, free);
+                }
+
+                if let Some(ref name) = binding {
+                    if !was_present {
+                        arm_bound.remove(name);
+                    }
                 }
             }
         }
@@ -417,15 +444,11 @@ fn collect_free_in_statement(
     }
 }
 
-fn collect_pattern_bindings(pattern: &Pattern, bindings: &mut HashSet<String>) {
+fn get_pattern_binding(pattern: &Pattern) -> Option<String> {
     match pattern {
-        Pattern::Variant { binding, .. } => {
-            if let Some(id) = binding {
-                bindings.insert(id.name.clone());
-            }
-        }
-        Pattern::Wildcard(_) => {}
-        Pattern::Literal(_) => {}
+        Pattern::Variant { binding, .. } => binding.as_ref().map(|id| id.name.clone()),
+        Pattern::Wildcard(_) => None,
+        Pattern::Literal(_) => None,
     }
 }
 

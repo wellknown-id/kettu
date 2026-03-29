@@ -1479,10 +1479,45 @@ fn infer_match_arms_type(
 ) -> Option<String> {
     let mut inferred: Option<String> = None;
 
+    let mut arm_scope = scope.clone();
     for arm in arms {
-        let mut arm_scope = scope.clone();
-        add_pattern_binding_types(&arm.pattern, &mut arm_scope, inference_ctx, scrutinee_ty);
-        let arm_ty = infer_block_tail_type(&arm.body, &arm_scope, inference_ctx)?;
+        // Collect which bindings are added by this pattern to undo later
+        let added_bindings = match &arm.pattern {
+            Pattern::Variant {
+                type_name,
+                case_name,
+                binding,
+                ..
+            } => {
+                let ty_source = type_name.as_ref().map(|t| t.name.as_str()).or(scrutinee_ty);
+                if let Some(binding) = binding {
+                    if let Some(payload_ty) = ty_source.and_then(|ty| {
+                        infer_variant_payload_type(ty, &case_name.name, inference_ctx)
+                    }) {
+                        let prev = arm_scope.insert(binding.name.clone(), payload_ty);
+                        Some((binding.name.clone(), prev))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        let arm_ty = infer_block_tail_type(&arm.body, &arm_scope, inference_ctx);
+
+        // Undo bindings
+        if let Some((name, prev)) = added_bindings {
+            if let Some(old_val) = prev {
+                arm_scope.insert(name, old_val);
+            } else {
+                arm_scope.remove(&name);
+            }
+        }
+
+        let arm_ty = arm_ty?;
         match &inferred {
             Some(existing) if existing != &arm_ty => return None,
             None => inferred = Some(arm_ty),
@@ -1493,36 +1528,6 @@ fn infer_match_arms_type(
     inferred
 }
 
-fn add_pattern_binding_types(
-    pattern: &Pattern,
-    scope: &mut HashMap<String, String>,
-    inference_ctx: &InferenceContext,
-    scrutinee_ty: Option<&str>,
-) {
-    let Pattern::Variant {
-        type_name,
-        case_name,
-        binding,
-        ..
-    } = pattern
-    else {
-        return;
-    };
-
-    let Some(binding) = binding else {
-        return;
-    };
-
-    let ty_source = type_name.as_ref().map(|t| t.name.as_str()).or(scrutinee_ty);
-
-    let Some(payload_ty) =
-        ty_source.and_then(|ty| infer_variant_payload_type(ty, &case_name.name, inference_ctx))
-    else {
-        return;
-    };
-
-    scope.insert(binding.name.clone(), payload_ty);
-}
 
 fn infer_variant_payload_type(
     ty_name: &str,
