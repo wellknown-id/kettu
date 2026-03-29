@@ -613,7 +613,10 @@ mod tests {
         assert_eq!(iface.gates.len(), 4);
         assert!(matches!(iface.gates[0], crate::ast::Gate::Since { .. }));
         assert!(matches!(iface.gates[1], crate::ast::Gate::Unstable { .. }));
-        assert!(matches!(iface.gates[2], crate::ast::Gate::Deprecated { .. }));
+        assert!(matches!(
+            iface.gates[2],
+            crate::ast::Gate::Deprecated { .. }
+        ));
         assert!(matches!(iface.gates[3], crate::ast::Gate::Test));
     }
 
@@ -711,7 +714,10 @@ mod tests {
             crate::ast::InterfaceItem::TypeDef(td) => match &td.kind {
                 crate::ast::TypeDefKind::Resource { methods, .. } => {
                     assert_eq!(methods.len(), 3);
-                    assert!(matches!(methods[0], crate::ast::ResourceMethod::Constructor { .. }));
+                    assert!(matches!(
+                        methods[0],
+                        crate::ast::ResourceMethod::Constructor { .. }
+                    ));
                     assert!(matches!(methods[1], crate::ast::ResourceMethod::Static(_)));
                     assert!(matches!(methods[2], crate::ast::ResourceMethod::Method(_)));
                 }
