@@ -28,10 +28,14 @@ struct Variable {
 struct TraceEvent {
     line: i64,
     env_before: HashMap<String, SimpleValue>,
+    runtime_subprogram_start_line: Option<i64>,
+    runtime_locals: HashMap<u32, i64>,
+    runtime_closure_keys: Vec<i64>,
 }
 
 #[derive(Clone, Debug)]
 struct ClosureRange {
+    debug_key: i64,
     start_line: i64,
     end_line: i64,
     name: String,
@@ -97,10 +101,33 @@ struct DebugSymbol {
     end_line: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DwarfBindingKind {
+    Parameter,
+    Variable,
+}
+
+#[derive(Clone, Debug)]
+struct DwarfBinding {
+    name: String,
+    kind: DwarfBindingKind,
+    decl_line: i64,
+    local_index: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct DwarfSubprogram {
+    name: String,
+    start_line: i64,
+    end_line: i64,
+    bindings: Vec<DwarfBinding>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct DebugSymbols {
     functions: HashMap<String, DebugSymbol>,
     lambdas: Vec<DebugSymbol>,
+    subprograms: Vec<DwarfSubprogram>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,10 +138,20 @@ struct DwarfLineRow {
 
 #[derive(Default)]
 struct RuntimeTraceState {
-    lines: Vec<i64>,
+    events: Vec<RuntimeTraceEvent>,
+    pending_locals: HashMap<u32, i64>,
+    active_closure_keys: Vec<i64>,
 }
 
 #[derive(Clone, Debug)]
+struct RuntimeTraceEvent {
+    line: i64,
+    subprogram_start_line: Option<i64>,
+    locals: HashMap<u32, i64>,
+    active_closure_keys: Vec<i64>,
+}
+
+#[derive(Clone, Copy, Debug)]
 enum FrameTarget {
     Test,
     Closure(usize),
@@ -207,11 +244,35 @@ impl DebugSession {
     }
 
     fn active_closure_indices(&self) -> Vec<usize> {
-        let mut indices: Vec<usize> = self
+        let mut indices = Vec::new();
+
+        if let Some(entry) = current_trace_event(self) {
+            for closure_key in &entry.runtime_closure_keys {
+                if let Some(index) = self
+                    .closures
+                    .iter()
+                    .position(|closure| closure.debug_key == *closure_key)
+                {
+                    if !indices.contains(&index) {
+                        indices.push(index);
+                    }
+                }
+            }
+        }
+
+        for index in self
             .active_closures
             .iter()
             .map(|closure| closure.closure_index)
-            .collect();
+        {
+            if !indices.contains(&index) {
+                indices.push(index);
+            }
+        }
+
+        if !indices.is_empty() {
+            return indices;
+        }
 
         let mut derived: Vec<usize> = self
             .closures
@@ -805,19 +866,19 @@ fn build_runtime_test_traces(
 
     for test in tests {
         let simulated_trace = std::mem::take(&mut test.trace);
-        let actual_lines = run_test_with_runtime_trace(&engine, &module, &test.name)?;
-        if actual_lines.is_empty() {
+        let actual_events = run_test_with_runtime_trace(&engine, &module, &test.name)?;
+        if actual_events.is_empty() {
             test.trace = simulated_trace;
             continue;
         }
 
-        if let Some(first_line) = actual_lines.first().copied() {
+        if let Some(first_line) = actual_events.first().map(|event| event.line) {
             test.line = first_line;
         }
-        if let Some(max_line) = actual_lines.iter().max().copied() {
+        if let Some(max_line) = actual_events.iter().map(|event| event.line).max() {
             test.end_line = test.end_line.max(max_line);
         }
-        test.trace = merge_runtime_trace(actual_lines, &simulated_trace);
+        test.trace = merge_runtime_trace(actual_events, &simulated_trace);
     }
 
     Ok(())
@@ -885,19 +946,69 @@ fn run_test_with_runtime_trace(
     engine: &Engine,
     module: &Module,
     test_name: &str,
-) -> Result<Vec<i64>, String> {
+) -> Result<Vec<RuntimeTraceEvent>, String> {
     let mut linker = Linker::new(engine);
     linker
         .func_wrap(
             "kettu:debug",
             "line",
-            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>, line: i32| {
+            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>,
+             subprogram_start_line: i32,
+             line: i32| {
                 if line > 0 {
-                    caller.data_mut().lines.push(line as i64);
+                    let state = caller.data_mut();
+                    state.events.push(RuntimeTraceEvent {
+                        line: line as i64,
+                        subprogram_start_line: (subprogram_start_line > 0)
+                            .then_some(subprogram_start_line as i64),
+                        locals: std::mem::take(&mut state.pending_locals),
+                        active_closure_keys: state.active_closure_keys.clone(),
+                    });
                 }
             },
         )
         .map_err(|err| format!("Failed to wire debug line hook: {}", err))?;
+    linker
+        .func_wrap(
+            "kettu:debug",
+            "local",
+            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>, local_index: i32, value: i32| {
+                if local_index >= 0 {
+                    caller
+                        .data_mut()
+                        .pending_locals
+                        .insert(local_index as u32, value as i64);
+                }
+            },
+        )
+        .map_err(|err| format!("Failed to wire debug local hook: {}", err))?;
+    linker
+        .func_wrap(
+            "kettu:debug",
+            "enter",
+            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>, closure_key: i32| {
+                caller
+                    .data_mut()
+                    .active_closure_keys
+                    .push(closure_key as i64);
+            },
+        )
+        .map_err(|err| format!("Failed to wire debug enter hook: {}", err))?;
+    linker
+        .func_wrap(
+            "kettu:debug",
+            "exit",
+            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>, closure_key: i32| {
+                let closure_key = closure_key as i64;
+                let active = &mut caller.data_mut().active_closure_keys;
+                if active.last().copied() == Some(closure_key) {
+                    active.pop();
+                } else if let Some(index) = active.iter().rposition(|key| *key == closure_key) {
+                    active.remove(index);
+                }
+            },
+        )
+        .map_err(|err| format!("Failed to wire debug exit hook: {}", err))?;
 
     let mut store = Store::new(engine, RuntimeTraceState::default());
     let instance = linker
@@ -910,7 +1021,7 @@ fn run_test_with_runtime_trace(
         .map_err(|err| format!("Failed to load test export '{}': {}", export_name, err))?;
 
     let _ = test_func.call(&mut store, ());
-    Ok(store.data().lines.clone())
+    Ok(store.data().events.clone())
 }
 
 fn find_test_export_name(
@@ -924,12 +1035,16 @@ fn find_test_export_name(
         .find(|name| name == test_name || name.ends_with(&format!("#{}", test_name)))
 }
 
-fn merge_runtime_trace(lines: Vec<i64>, simulated_trace: &[TraceEvent]) -> Vec<TraceEvent> {
+fn merge_runtime_trace(
+    events: Vec<RuntimeTraceEvent>,
+    simulated_trace: &[TraceEvent],
+) -> Vec<TraceEvent> {
     let mut search_start = 0usize;
 
-    lines
+    events
         .into_iter()
-        .map(|line| {
+        .map(|event| {
+            let line = event.line;
             let env_before = simulated_trace[search_start..]
                 .iter()
                 .position(|entry| entry.line == line)
@@ -946,7 +1061,13 @@ fn merge_runtime_trace(lines: Vec<i64>, simulated_trace: &[TraceEvent]) -> Vec<T
                 })
                 .unwrap_or_default();
 
-            TraceEvent { line, env_before }
+            TraceEvent {
+                line,
+                env_before,
+                runtime_subprogram_start_line: event.subprogram_start_line,
+                runtime_locals: event.locals,
+                runtime_closure_keys: event.active_closure_keys,
+            }
         })
         .collect()
 }
@@ -1313,6 +1434,7 @@ fn collect_closures_from_expr(
             let inline_invocation_line = preferred_name.is_none().then_some(start_line);
             let fallback_name = format!("closure#{}", closures.len() + 1);
             closures.push(ClosureRange {
+                debug_key: span.start as i64,
                 start_line,
                 end_line,
                 name: preferred_name.unwrap_or(fallback_name),
@@ -1596,37 +1718,91 @@ fn parse_debug_symbols(wasm: &[u8]) -> Result<DebugSymbols, String> {
             .map_err(|err| format!("Failed to read DWARF line rows: {}", err))?;
 
         let mut entries = unit.entries();
+        let mut active_subprograms: Vec<Option<usize>> = Vec::new();
         while let Some(entry) = entries
             .next_dfs()
             .map_err(|err| format!("Failed to walk DWARF entries: {}", err))?
         {
-            if entry.tag() != constants::DW_TAG_subprogram {
-                continue;
+            let depth = entry.depth().max(0) as usize;
+            active_subprograms.truncate(depth + 1);
+            if active_subprograms.len() <= depth {
+                active_subprograms.resize(depth + 1, None);
             }
 
-            let Some(name_attr) = entry.attr_value(constants::DW_AT_name) else {
-                continue;
-            };
-            let name = dwarf
-                .attr_string(&unit, name_attr)
-                .map_err(|err| format!("Failed to read DWARF symbol name: {}", err))?
-                .to_string_lossy()
-                .into_owned();
+            let name = entry
+                .attr_value(constants::DW_AT_name)
+                .map(|name_attr| {
+                    dwarf
+                        .attr_string(&unit, name_attr)
+                        .map(|value| value.to_string_lossy().into_owned())
+                })
+                .transpose()
+                .map_err(|err| format!("Failed to read DWARF symbol name: {}", err))?;
 
-            let start_line = entry
-                .attr_value(constants::DW_AT_decl_line)
-                .and_then(attribute_u64)
-                .map(|line| line as i64)
-                .unwrap_or(1);
-            let low_pc = entry
-                .attr_value(constants::DW_AT_low_pc)
-                .and_then(attribute_address);
-            let high_pc = entry
-                .attr_value(constants::DW_AT_high_pc)
-                .and_then(|value| attribute_range_end(value, low_pc));
-            let end_line = max_line_for_range(&line_rows, low_pc, high_pc).unwrap_or(start_line);
+            match entry.tag() {
+                constants::DW_TAG_subprogram => {
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    let start_line = entry
+                        .attr_value(constants::DW_AT_decl_line)
+                        .and_then(attribute_u64)
+                        .map(|line| line as i64)
+                        .unwrap_or(1);
+                    let low_pc = entry
+                        .attr_value(constants::DW_AT_low_pc)
+                        .and_then(attribute_address);
+                    let high_pc = entry
+                        .attr_value(constants::DW_AT_high_pc)
+                        .and_then(|value| attribute_range_end(value, low_pc));
+                    let end_line =
+                        max_line_for_range(&line_rows, low_pc, high_pc).unwrap_or(start_line);
 
-            register_debug_symbol(&mut symbols, name, start_line, end_line);
+                    register_debug_symbol(&mut symbols, name.clone(), start_line, end_line);
+                    symbols.subprograms.push(DwarfSubprogram {
+                        name,
+                        start_line,
+                        end_line,
+                        bindings: Vec::new(),
+                    });
+                    active_subprograms[depth] = Some(symbols.subprograms.len() - 1);
+                }
+                constants::DW_TAG_formal_parameter | constants::DW_TAG_variable => {
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    let Some(subprogram_index) =
+                        active_subprograms.iter().rev().find_map(|index| *index)
+                    else {
+                        continue;
+                    };
+                    let kind = if entry.tag() == constants::DW_TAG_formal_parameter {
+                        DwarfBindingKind::Parameter
+                    } else {
+                        DwarfBindingKind::Variable
+                    };
+                    let decl_line = entry
+                        .attr_value(constants::DW_AT_decl_line)
+                        .and_then(attribute_u64)
+                        .map(|line| line as i64)
+                        .unwrap_or(0);
+                    let local_index = entry
+                        .attr_value(constants::DW_AT_location)
+                        .map(|value| parse_wasm_local(value, unit.encoding()))
+                        .transpose()
+                        .map_err(|err| format!("Failed to parse DWARF location: {}", err))?
+                        .flatten();
+                    symbols.subprograms[subprogram_index]
+                        .bindings
+                        .push(DwarfBinding {
+                            name,
+                            kind,
+                            decl_line,
+                            local_index,
+                        });
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1660,6 +1836,20 @@ fn attribute_u64<R: Reader>(value: gimli::AttributeValue<R>) -> Option<u64> {
         gimli::AttributeValue::Data4(value) => Some(value.into()),
         gimli::AttributeValue::Data8(value) => Some(value),
         _ => None,
+    }
+}
+
+fn parse_wasm_local<R: Reader>(
+    value: gimli::AttributeValue<R>,
+    encoding: gimli::Encoding,
+) -> Result<Option<u32>, gimli::Error> {
+    let gimli::AttributeValue::Exprloc(expression) = value else {
+        return Ok(None);
+    };
+    let mut ops = expression.operations(encoding);
+    match ops.next()? {
+        Some(gimli::Operation::WasmLocal { index }) => Ok(Some(index)),
+        _ => Ok(None),
     }
 }
 
@@ -1718,6 +1908,115 @@ fn register_debug_symbol(symbols: &mut DebugSymbols, name: String, start_line: i
     } else {
         symbols.functions.insert(name, symbol);
     }
+}
+
+fn resolve_dwarf_subprogram(
+    session: &DebugSession,
+    target: FrameTarget,
+) -> Option<&DwarfSubprogram> {
+    match target {
+        FrameTarget::Test => {
+            let test = session.active_test()?;
+            session.debug_symbols.subprograms.iter().find(|subprogram| {
+                subprogram.name == test.name
+                    || subprogram.name.ends_with(&format!("#{}", test.name))
+            })
+        }
+        FrameTarget::Closure(closure_index) => {
+            let closure = &session.closures[closure_index];
+            session
+                .debug_symbols
+                .subprograms
+                .iter()
+                .find(|subprogram| {
+                    subprogram.name == closure.name
+                        || (subprogram.name.starts_with("lambda#")
+                            && subprogram.start_line == closure.start_line
+                            && subprogram.end_line == closure.end_line)
+                })
+                .or_else(|| {
+                    session.debug_symbols.subprograms.iter().find(|subprogram| {
+                        subprogram.name.starts_with("lambda#")
+                            && subprogram.start_line == closure.start_line
+                    })
+                })
+        }
+    }
+}
+
+fn current_trace_event(session: &DebugSession) -> Option<&TraceEvent> {
+    let test = session.active_test()?;
+    let index = session.current_trace_index?;
+    test.trace.get(index)
+}
+
+fn binding_visible_at_line(
+    binding: &DwarfBinding,
+    line: i64,
+    capture_names: Option<&HashSet<String>>,
+) -> bool {
+    match binding.kind {
+        DwarfBindingKind::Parameter => true,
+        DwarfBindingKind::Variable => capture_names
+            .filter(|captures| captures.contains(&binding.name))
+            .map(|_| binding.decl_line <= line)
+            .unwrap_or(binding.decl_line < line),
+    }
+}
+
+fn runtime_value_to_simple(raw: i64, fallback: Option<&SimpleValue>) -> SimpleValue {
+    match fallback {
+        Some(SimpleValue::Bool(_)) => SimpleValue::Bool(raw != 0),
+        _ => SimpleValue::Int(raw),
+    }
+}
+
+fn runtime_binding_values_for_target(
+    session: &DebugSession,
+    target: FrameTarget,
+    fallback_values: &HashMap<String, SimpleValue>,
+) -> Option<HashMap<String, SimpleValue>> {
+    let subprogram = resolve_dwarf_subprogram(session, target)?;
+    let entry = current_trace_event(session)?;
+    if entry.runtime_subprogram_start_line != Some(subprogram.start_line) {
+        return None;
+    }
+
+    Some(
+        subprogram
+            .bindings
+            .iter()
+            .filter_map(|binding| {
+                let local_index = binding.local_index?;
+                let raw = entry.runtime_locals.get(&local_index)?;
+                Some((
+                    binding.name.clone(),
+                    runtime_value_to_simple(*raw, fallback_values.get(&binding.name)),
+                ))
+            })
+            .collect(),
+    )
+}
+
+fn variables_from_dwarf_bindings<'a>(
+    bindings: impl IntoIterator<Item = &'a DwarfBinding>,
+    values: &HashMap<String, SimpleValue>,
+) -> Vec<Variable> {
+    let mut variables = Vec::new();
+    let mut seen = HashSet::new();
+
+    for binding in bindings {
+        if !seen.insert(binding.name.clone()) {
+            continue;
+        }
+        let value = values
+            .get(&binding.name)
+            .cloned()
+            .unwrap_or_else(|| SimpleValue::Unknown(binding.name.clone()));
+        variables.push(Variable::from_value(binding.name.clone(), value));
+    }
+
+    variables
 }
 
 fn apply_debug_symbols(
@@ -2173,6 +2472,9 @@ fn record_trace_event(trace: &mut Vec<TraceEvent>, line: i64, env: &HashMap<Stri
     trace.push(TraceEvent {
         line,
         env_before: env.clone(),
+        runtime_subprogram_start_line: None,
+        runtime_locals: HashMap::new(),
+        runtime_closure_keys: Vec::new(),
     });
 }
 
@@ -2388,9 +2690,21 @@ fn frame_local_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable>
         return Vec::new();
     };
 
+    let dwarf_subprogram = resolve_dwarf_subprogram(session, target);
+
     match target {
         FrameTarget::Test => {
-            variables_from_env(&test_environment_for_line(session, session.current_line))
+            let locals = test_environment_for_line(session, session.current_line);
+            dwarf_subprogram
+                .map(|subprogram| {
+                    variables_from_dwarf_bindings(
+                        subprogram.bindings.iter().filter(|binding| {
+                            binding_visible_at_line(binding, session.current_line, None)
+                        }),
+                        &locals,
+                    )
+                })
+                .unwrap_or_else(|| variables_from_env(&locals))
         }
         FrameTarget::Closure(closure_index) => {
             let closure = &session.closures[closure_index];
@@ -2434,7 +2748,31 @@ fn frame_local_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable>
                 }
             }
 
-            variables_from_env(&locals)
+            if let Some(runtime_values) =
+                runtime_binding_values_for_target(session, target, &locals)
+            {
+                for (name, value) in runtime_values {
+                    if !capture_names.contains(&name) {
+                        locals.insert(name, value);
+                    }
+                }
+            }
+
+            dwarf_subprogram
+                .map(|subprogram| {
+                    variables_from_dwarf_bindings(
+                        subprogram.bindings.iter().filter(|binding| {
+                            !capture_names.contains(&binding.name)
+                                && binding_visible_at_line(
+                                    binding,
+                                    session.current_line,
+                                    Some(&capture_names),
+                                )
+                        }),
+                        &locals,
+                    )
+                })
+                .unwrap_or_else(|| variables_from_env(&locals))
         }
     }
 }
@@ -2450,8 +2788,40 @@ fn frame_capture_variables(session: &DebugSession, frame_id: i64) -> Vec<Variabl
         let base = frame_base_environment(session, FrameTarget::Closure(closure_index));
         capture_values_for_closure(session, closure_index, &base)
     };
+    let mut captures = captures;
 
-    variables_from_env(&captures)
+    let capture_names: HashSet<String> = session.closures[closure_index]
+        .captures
+        .iter()
+        .cloned()
+        .collect();
+
+    if let Some(runtime_values) =
+        runtime_binding_values_for_target(session, FrameTarget::Closure(closure_index), &captures)
+    {
+        for (name, value) in runtime_values {
+            if capture_names.contains(&name) {
+                captures.insert(name, value);
+            }
+        }
+    }
+
+    resolve_dwarf_subprogram(session, FrameTarget::Closure(closure_index))
+        .map(|subprogram| {
+            variables_from_dwarf_bindings(
+                subprogram.bindings.iter().filter(|binding| {
+                    binding.kind == DwarfBindingKind::Variable
+                        && capture_names.contains(&binding.name)
+                        && binding_visible_at_line(
+                            binding,
+                            session.current_line,
+                            Some(&capture_names),
+                        )
+                }),
+                &captures,
+            )
+        })
+        .unwrap_or_else(|| variables_from_env(&captures))
 }
 
 fn frame_environment(session: &DebugSession, frame_id: i64) -> HashMap<String, SimpleValue> {
@@ -2514,17 +2884,43 @@ fn test_environment_for_line(session: &DebugSession, line: i64) -> HashMap<Strin
         return HashMap::new();
     };
 
+    let overlay_runtime_locals = |mut env: HashMap<String, SimpleValue>, entry: &TraceEvent| {
+        let Some(subprogram) = resolve_dwarf_subprogram(session, FrameTarget::Test) else {
+            return env;
+        };
+        if entry.runtime_subprogram_start_line != Some(subprogram.start_line) {
+            return env;
+        }
+        for binding in subprogram
+            .bindings
+            .iter()
+            .filter(|binding| binding_visible_at_line(binding, line, None))
+        {
+            let Some(local_index) = binding.local_index else {
+                continue;
+            };
+            let Some(raw) = entry.runtime_locals.get(&local_index) else {
+                continue;
+            };
+            env.insert(
+                binding.name.clone(),
+                runtime_value_to_simple(*raw, env.get(&binding.name)),
+            );
+        }
+        env
+    };
+
     if !test.trace.is_empty() {
         if line == session.current_line {
             if let Some(index) = session.current_trace_index {
                 if let Some(entry) = test.trace.get(index) {
-                    return entry.env_before.clone();
+                    return overlay_runtime_locals(entry.env_before.clone(), entry);
                 }
             }
         }
 
         if let Some(entry) = test.trace.iter().find(|entry| entry.line == line) {
-            return entry.env_before.clone();
+            return overlay_runtime_locals(entry.env_before.clone(), entry);
         }
     }
 
@@ -3281,7 +3677,11 @@ fn read_dap_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DebugSession, ListedTest, infer_locals, parse_closures};
+    use super::{
+        DebugSession, DwarfBindingKind, ListedTest, infer_locals, parse_closures,
+        parse_debug_symbols,
+    };
+    use kettu_codegen::CompileOptions;
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -3411,5 +3811,61 @@ mod tests {
 
         let value = super::evaluate_expression("base + n", &env).unwrap();
         assert_eq!(value, super::SimpleValue::Int(15));
+    }
+
+    #[test]
+    fn parse_debug_symbols_reads_dwarf_bindings() {
+        let source = r#"package local:test;
+interface math {
+    add: func(a: s32, b: s32) -> s32 {
+        let sum = a + b;
+        return sum;
+    }
+}"#;
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+
+        let wasm = kettu_codegen::build_core_module(
+            &ast,
+            &CompileOptions {
+                core_only: true,
+                memory_pages: 1,
+                wasip3: false,
+                threads: false,
+                emit_dwarf: true,
+                keep_names: true,
+                debug_source: Some(source.to_string()),
+                debug_path: Some("math.kettu".to_string()),
+                emit_debug_hooks: false,
+            },
+        )
+        .expect("build debug wasm");
+
+        let symbols = parse_debug_symbols(&wasm).expect("parse debug symbols");
+        let add = symbols
+            .subprograms
+            .iter()
+            .find(|subprogram| subprogram.name == "add" || subprogram.name.ends_with("#add"))
+            .expect("add subprogram");
+
+        assert!(add.bindings.iter().any(|binding| {
+            binding.name == "a"
+                && binding.kind == DwarfBindingKind::Parameter
+                && binding.decl_line == 3
+                && binding.local_index == Some(0)
+        }));
+        assert!(add.bindings.iter().any(|binding| {
+            binding.name == "b"
+                && binding.kind == DwarfBindingKind::Parameter
+                && binding.decl_line == 3
+                && binding.local_index == Some(1)
+        }));
+        assert!(add.bindings.iter().any(|binding| {
+            binding.name == "sum"
+                && binding.kind == DwarfBindingKind::Variable
+                && binding.decl_line == 4
+                && binding.local_index == Some(2)
+        }));
     }
 }

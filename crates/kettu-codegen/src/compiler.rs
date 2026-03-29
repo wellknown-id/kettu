@@ -3,7 +3,8 @@
 //! Compiles Kettu AST (with function bodies) into a core WASM module.
 
 use gimli::write::{
-    Address, AttributeValue, DwarfUnit, EndianVec, LineProgram, LineString, Sections,
+    Address, AttributeValue, DwarfUnit, EndianVec, Expression as DwarfExpression, LineProgram,
+    LineString, Sections,
 };
 use gimli::{
     Encoding as DwarfEncoding, Format as DwarfFormat, LineEncoding, LittleEndian, SectionId,
@@ -29,6 +30,32 @@ use wasm_encoder::{
 struct RecordTypeInfo {
     /// Field names to offsets (in bytes)
     fields: Vec<(String, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugBindingKind {
+    Parameter,
+    Variable,
+}
+
+#[derive(Debug, Clone)]
+struct DebugBinding {
+    name: String,
+    decl_line: u64,
+    local_index: u32,
+    kind: DebugBindingKind,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FunctionDebugInfo {
+    bindings: Vec<DebugBinding>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveDebugHookContext {
+    subprogram_start_line: i64,
+    bindings: Vec<DebugBinding>,
+    snapshottable_locals: std::collections::HashSet<u32>,
 }
 
 impl RecordTypeInfo {
@@ -187,6 +214,318 @@ fn statement_start_line(stmt: &Statement, source: &str) -> i64 {
             .unwrap_or(0),
         Statement::Guard { condition, .. } => expr_start_line(condition, source),
     }
+}
+
+fn line_for_span_or(span: &Range<usize>, source: &str, fallback: u64) -> u64 {
+    if span.start == 0 && span.end == 0 {
+        fallback
+    } else {
+        offset_to_line(source, span.start) as u64
+    }
+}
+
+fn debug_runtime_key_for_span(span: &Range<usize>) -> i32 {
+    span.start.min(i32::MAX as usize) as i32
+}
+
+fn push_debug_binding(
+    bindings: &mut Vec<DebugBinding>,
+    name: &str,
+    decl_line: u64,
+    local_index: u32,
+    kind: DebugBindingKind,
+) {
+    if bindings.iter().any(|binding| {
+        binding.name == name && binding.local_index == local_index && binding.kind == kind
+    }) {
+        return;
+    }
+
+    bindings.push(DebugBinding {
+        name: name.to_string(),
+        decl_line,
+        local_index,
+        kind,
+    });
+}
+
+fn collect_debug_bindings_from_statements(
+    statements: &[Statement],
+    source: &str,
+    locals: &HashMap<String, u32>,
+    bindings: &mut Vec<DebugBinding>,
+) {
+    for statement in statements {
+        match statement {
+            Statement::Expr(expr) | Statement::Return(Some(expr)) => {
+                collect_debug_bindings_from_expr(expr, source, locals, bindings);
+            }
+            Statement::Let { name, value }
+            | Statement::SharedLet {
+                name,
+                initial_value: value,
+            } => {
+                if let Some(&local_index) = locals.get(&name.name) {
+                    push_debug_binding(
+                        bindings,
+                        &name.name,
+                        offset_to_line(source, name.span.start) as u64,
+                        local_index,
+                        DebugBindingKind::Variable,
+                    );
+                }
+                collect_debug_bindings_from_expr(value, source, locals, bindings);
+            }
+            Statement::Assign { value, .. } | Statement::CompoundAssign { value, .. } => {
+                collect_debug_bindings_from_expr(value, source, locals, bindings);
+            }
+            Statement::GuardLet {
+                name,
+                value,
+                else_body,
+            } => {
+                collect_debug_bindings_from_expr(value, source, locals, bindings);
+                collect_debug_bindings_from_statements(else_body, source, locals, bindings);
+                if let Some(&local_index) = locals.get(&name.name) {
+                    push_debug_binding(
+                        bindings,
+                        &name.name,
+                        offset_to_line(source, name.span.start) as u64,
+                        local_index,
+                        DebugBindingKind::Variable,
+                    );
+                }
+            }
+            Statement::Guard {
+                condition,
+                else_body,
+            } => {
+                collect_debug_bindings_from_expr(condition, source, locals, bindings);
+                collect_debug_bindings_from_statements(else_body, source, locals, bindings);
+            }
+            Statement::Break {
+                condition: Some(expr),
+            }
+            | Statement::Continue {
+                condition: Some(expr),
+            } => {
+                collect_debug_bindings_from_expr(expr, source, locals, bindings);
+            }
+            Statement::Break { condition: None }
+            | Statement::Continue { condition: None }
+            | Statement::Return(None) => {}
+        }
+    }
+}
+
+fn collect_debug_bindings_from_expr(
+    expr: &Expr,
+    source: &str,
+    locals: &HashMap<String, u32>,
+    bindings: &mut Vec<DebugBinding>,
+) {
+    match expr {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_debug_bindings_from_expr(cond, source, locals, bindings);
+            collect_debug_bindings_from_statements(then_branch, source, locals, bindings);
+            if let Some(else_branch) = else_branch {
+                collect_debug_bindings_from_statements(else_branch, source, locals, bindings);
+            }
+        }
+        Expr::While {
+            condition, body, ..
+        } => {
+            collect_debug_bindings_from_expr(condition, source, locals, bindings);
+            collect_debug_bindings_from_statements(body, source, locals, bindings);
+        }
+        Expr::For {
+            variable,
+            body,
+            range,
+            ..
+        } => {
+            if let Some(&local_index) = locals.get(&variable.name) {
+                push_debug_binding(
+                    bindings,
+                    &variable.name,
+                    offset_to_line(source, variable.span.start) as u64,
+                    local_index,
+                    DebugBindingKind::Variable,
+                );
+            }
+            collect_debug_bindings_from_expr(range, source, locals, bindings);
+            collect_debug_bindings_from_statements(body, source, locals, bindings);
+        }
+        Expr::ForEach {
+            variable,
+            collection,
+            body,
+            ..
+        }
+        | Expr::SimdForEach {
+            variable,
+            collection,
+            body,
+            ..
+        } => {
+            if let Some(&local_index) = locals.get(&variable.name) {
+                push_debug_binding(
+                    bindings,
+                    &variable.name,
+                    offset_to_line(source, variable.span.start) as u64,
+                    local_index,
+                    DebugBindingKind::Variable,
+                );
+            }
+            collect_debug_bindings_from_expr(collection, source, locals, bindings);
+            collect_debug_bindings_from_statements(body, source, locals, bindings);
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_debug_bindings_from_expr(scrutinee, source, locals, bindings);
+            for arm in arms {
+                collect_debug_bindings_from_statements(&arm.body, source, locals, bindings);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_debug_bindings_from_expr(lhs, source, locals, bindings);
+            collect_debug_bindings_from_expr(rhs, source, locals, bindings);
+        }
+        Expr::Assert(expr, _)
+        | Expr::Not(expr, _)
+        | Expr::Neg(expr, _)
+        | Expr::StrLen(expr, _)
+        | Expr::ListLen(expr, _)
+        | Expr::Field { expr, .. }
+        | Expr::OptionalChain { expr, .. }
+        | Expr::Try { expr, .. }
+        | Expr::Await { expr, .. } => {
+            collect_debug_bindings_from_expr(expr, source, locals, bindings);
+        }
+        Expr::Call { func, args, .. } => {
+            collect_debug_bindings_from_expr(func, source, locals, bindings);
+            for arg in args {
+                collect_debug_bindings_from_expr(arg, source, locals, bindings);
+            }
+        }
+        Expr::InterpolatedString(parts, _) => {
+            for part in parts {
+                if let StringPart::Expr(expr) = part {
+                    collect_debug_bindings_from_expr(expr, source, locals, bindings);
+                }
+            }
+        }
+        Expr::Range {
+            start, end, step, ..
+        } => {
+            collect_debug_bindings_from_expr(start, source, locals, bindings);
+            collect_debug_bindings_from_expr(end, source, locals, bindings);
+            if let Some(step) = step {
+                collect_debug_bindings_from_expr(step, source, locals, bindings);
+            }
+        }
+        Expr::Map { list, .. } | Expr::Filter { list, .. } => {
+            collect_debug_bindings_from_expr(list, source, locals, bindings);
+        }
+        Expr::Reduce { list, init, .. } => {
+            collect_debug_bindings_from_expr(list, source, locals, bindings);
+            collect_debug_bindings_from_expr(init, source, locals, bindings);
+        }
+        Expr::Lambda { .. }
+        | Expr::Integer(_, _)
+        | Expr::Bool(_, _)
+        | Expr::String(_, _)
+        | Expr::Ident(_)
+        | Expr::ListLiteral { .. }
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::RecordLiteral { .. }
+        | Expr::VariantLiteral { .. }
+        | Expr::StrEq(_, _, _)
+        | Expr::ListSet(_, _, _, _)
+        | Expr::ListPush(_, _, _)
+        | Expr::AtomicLoad { .. }
+        | Expr::AtomicStore { .. }
+        | Expr::AtomicAdd { .. }
+        | Expr::AtomicSub { .. }
+        | Expr::AtomicCmpxchg { .. }
+        | Expr::AtomicWait { .. }
+        | Expr::AtomicNotify { .. }
+        | Expr::Spawn { .. }
+        | Expr::AtomicBlock { .. }
+        | Expr::ThreadJoin { .. }
+        | Expr::SimdOp { .. } => {}
+    }
+}
+
+fn build_function_debug_info(
+    func: &Func,
+    locals: &HashMap<String, u32>,
+    source: &str,
+) -> FunctionDebugInfo {
+    let mut bindings = Vec::new();
+
+    for param in &func.params {
+        if let Some(&local_index) = locals.get(&param.name.name) {
+            push_debug_binding(
+                &mut bindings,
+                &param.name.name,
+                offset_to_line(source, param.name.span.start) as u64,
+                local_index,
+                DebugBindingKind::Parameter,
+            );
+        }
+    }
+
+    if let Some(body) = &func.body {
+        collect_debug_bindings_from_statements(&body.statements, source, locals, &mut bindings);
+    }
+
+    FunctionDebugInfo { bindings }
+}
+
+fn build_lambda_debug_info(
+    captures: &[Id],
+    params: &[Id],
+    body: &Expr,
+    locals: &HashMap<String, u32>,
+    source: &str,
+    fallback_decl_line: u64,
+) -> FunctionDebugInfo {
+    let mut bindings = Vec::new();
+
+    for capture in captures {
+        if let Some(&local_index) = locals.get(&capture.name) {
+            push_debug_binding(
+                &mut bindings,
+                &capture.name,
+                line_for_span_or(&capture.span, source, fallback_decl_line),
+                local_index,
+                DebugBindingKind::Variable,
+            );
+        }
+    }
+
+    for param in params {
+        if let Some(&local_index) = locals.get(&param.name) {
+            push_debug_binding(
+                &mut bindings,
+                &param.name,
+                line_for_span_or(&param.span, source, fallback_decl_line),
+                local_index,
+                DebugBindingKind::Parameter,
+            );
+        }
+    }
+
+    collect_debug_bindings_from_expr(body, source, locals, &mut bindings);
+    FunctionDebugInfo { bindings }
 }
 
 fn collect_code_section_ranges(
@@ -348,6 +687,8 @@ struct ModuleCompiler<'a> {
     func_spans: Vec<(u32, Range<usize>)>,
     /// Debug symbol names for non-exported functions such as lambdas
     func_debug_names: HashMap<u32, String>,
+    /// DWARF binding metadata for emitted functions and lambdas
+    func_debug_info: HashMap<u32, FunctionDebugInfo>,
     /// Function bodies to compile
     func_bodies: Vec<(String, Func)>,
     /// String literal data: (offset, bytes)
@@ -374,6 +715,14 @@ struct ModuleCompiler<'a> {
     task_return_func_idx: Option<u32>,
     /// Index of the debugger line hook import
     debug_hook_idx: Option<u32>,
+    /// Index of the debugger local snapshot hook import
+    debug_value_hook_idx: Option<u32>,
+    /// Index of the debugger frame-enter hook import
+    debug_enter_hook_idx: Option<u32>,
+    /// Index of the debugger frame-exit hook import
+    debug_exit_hook_idx: Option<u32>,
+    /// Active debug hook context while compiling a function/lambda body
+    active_debug_hook_context: Option<ActiveDebugHookContext>,
     /// Type index for task.return for each result type
     task_return_types: HashMap<Vec<ValType>, u32>,
     /// Callback function bodies for async functions: (entry_func_name, func, state_local_count)
@@ -409,6 +758,7 @@ impl<'a> ModuleCompiler<'a> {
             exports: Vec::new(),
             func_spans: Vec::new(),
             func_debug_names: HashMap::new(),
+            func_debug_info: HashMap::new(),
             func_bodies: Vec::new(),
             string_data: Vec::new(),
             string_offset: 0,
@@ -422,6 +772,10 @@ impl<'a> ModuleCompiler<'a> {
             imported_interfaces: HashMap::new(),
             task_return_func_idx: None,
             debug_hook_idx: None,
+            debug_value_hook_idx: None,
+            debug_enter_hook_idx: None,
+            debug_exit_hook_idx: None,
+            active_debug_hook_context: None,
             task_return_types: HashMap::new(),
             callback_bodies: Vec::new(),
             waitable_set_new_idx: None,
@@ -437,6 +791,9 @@ impl<'a> ModuleCompiler<'a> {
         };
         if options.emit_debug_hooks {
             compiler.ensure_debug_hook_import();
+            compiler.ensure_debug_value_hook_import();
+            compiler.ensure_debug_enter_hook_import();
+            compiler.ensure_debug_exit_hook_import();
         }
         compiler
     }
@@ -446,13 +803,66 @@ impl<'a> ModuleCompiler<'a> {
             return idx;
         }
 
-        let type_idx = self.get_or_create_type(&[ValType::I32], &[]);
+        let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
         let func_idx = self.import_count;
         self.import_count += 1;
         self.functions
             .insert("$debug_line".to_string(), (type_idx, func_idx, true));
         self.debug_hook_idx = Some(func_idx);
         func_idx
+    }
+
+    fn ensure_debug_value_hook_import(&mut self) -> u32 {
+        if let Some(idx) = self.debug_value_hook_idx {
+            return idx;
+        }
+
+        let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
+        let func_idx = self.import_count;
+        self.import_count += 1;
+        self.functions
+            .insert("$debug_local".to_string(), (type_idx, func_idx, true));
+        self.debug_value_hook_idx = Some(func_idx);
+        func_idx
+    }
+
+    fn ensure_debug_enter_hook_import(&mut self) -> u32 {
+        if let Some(idx) = self.debug_enter_hook_idx {
+            return idx;
+        }
+
+        let type_idx = self.get_or_create_type(&[ValType::I32], &[]);
+        let func_idx = self.import_count;
+        self.import_count += 1;
+        self.functions
+            .insert("$debug_enter".to_string(), (type_idx, func_idx, true));
+        self.debug_enter_hook_idx = Some(func_idx);
+        func_idx
+    }
+
+    fn ensure_debug_exit_hook_import(&mut self) -> u32 {
+        if let Some(idx) = self.debug_exit_hook_idx {
+            return idx;
+        }
+
+        let type_idx = self.get_or_create_type(&[ValType::I32], &[]);
+        let func_idx = self.import_count;
+        self.import_count += 1;
+        self.functions
+            .insert("$debug_exit".to_string(), (type_idx, func_idx, true));
+        self.debug_exit_hook_idx = Some(func_idx);
+        func_idx
+    }
+
+    fn with_active_debug_hook_context<T>(
+        &mut self,
+        context: Option<ActiveDebugHookContext>,
+        build: impl FnOnce(&mut Self) -> Result<T, CompileError>,
+    ) -> Result<T, CompileError> {
+        let previous = std::mem::replace(&mut self.active_debug_hook_context, context);
+        let result = build(self);
+        self.active_debug_hook_context = previous;
+        result
     }
 
     fn emit_debug_line_hook(&mut self, function: &mut Function, line: i64) {
@@ -464,6 +874,22 @@ impl<'a> ModuleCompiler<'a> {
             return;
         };
 
+        if let (Some(debug_value_hook_idx), Some(context)) = (
+            self.debug_value_hook_idx,
+            self.active_debug_hook_context.as_ref(),
+        ) {
+            for binding in context.bindings.iter().filter(|binding| {
+                binding.decl_line <= line as u64
+                    && context.snapshottable_locals.contains(&binding.local_index)
+            }) {
+                function.instruction(&Instruction::I32Const(binding.local_index as i32));
+                function.instruction(&Instruction::LocalGet(binding.local_index));
+                function.instruction(&Instruction::Call(debug_value_hook_idx));
+            }
+            function.instruction(&Instruction::I32Const(context.subprogram_start_line as i32));
+        } else {
+            function.instruction(&Instruction::I32Const(0));
+        }
         function.instruction(&Instruction::I32Const(line as i32));
         function.instruction(&Instruction::Call(debug_hook_idx));
     }
@@ -480,6 +906,92 @@ impl<'a> ModuleCompiler<'a> {
             return;
         };
         self.emit_debug_line_hook(function, statement_start_line(stmt, source));
+    }
+
+    fn emit_debug_enter_hook(&mut self, function: &mut Function, key: i32) {
+        if !self.options.emit_debug_hooks {
+            return;
+        }
+        let Some(debug_enter_hook_idx) = self.debug_enter_hook_idx else {
+            return;
+        };
+        function.instruction(&Instruction::I32Const(key));
+        function.instruction(&Instruction::Call(debug_enter_hook_idx));
+    }
+
+    fn emit_debug_exit_hook(&mut self, function: &mut Function, key: i32) {
+        if !self.options.emit_debug_hooks {
+            return;
+        }
+        let Some(debug_exit_hook_idx) = self.debug_exit_hook_idx else {
+            return;
+        };
+        function.instruction(&Instruction::I32Const(key));
+        function.instruction(&Instruction::Call(debug_exit_hook_idx));
+    }
+
+    fn function_snapshottable_locals(
+        &self,
+        func: &Func,
+        locals: &HashMap<String, u32>,
+        v128_locals: &std::collections::HashSet<u32>,
+    ) -> Result<std::collections::HashSet<u32>, CompileError> {
+        let mut indices: std::collections::HashSet<u32> = locals.values().copied().collect();
+        indices.retain(|index| !v128_locals.contains(index));
+
+        for param in &func.params {
+            let Some(&local_index) = locals.get(&param.name.name) else {
+                continue;
+            };
+            if self.ty_to_valtype(&param.ty)? != ValType::I32 {
+                indices.remove(&local_index);
+            }
+        }
+
+        Ok(indices)
+    }
+
+    fn active_debug_hook_context_for_function(
+        &self,
+        func: &Func,
+        debug_info: &FunctionDebugInfo,
+        locals: &HashMap<String, u32>,
+        v128_locals: &std::collections::HashSet<u32>,
+    ) -> Result<Option<ActiveDebugHookContext>, CompileError> {
+        let Some(source) = self.options.debug_source.as_deref() else {
+            return Ok(None);
+        };
+
+        Ok(Some(ActiveDebugHookContext {
+            subprogram_start_line: offset_to_line(source, func.span.start) as i64,
+            bindings: debug_info.bindings.clone(),
+            snapshottable_locals: self.function_snapshottable_locals(func, locals, v128_locals)?,
+        }))
+    }
+
+    fn active_debug_hook_context_for_lambda(
+        &self,
+        func_idx: u32,
+        body: &Expr,
+        debug_info: &FunctionDebugInfo,
+    ) -> Option<ActiveDebugHookContext> {
+        let source = self.options.debug_source.as_deref()?;
+        let subprogram_start_line = self
+            .func_spans
+            .iter()
+            .find(|(idx, _)| *idx == func_idx)
+            .map(|(_, span)| offset_to_line(source, span.start) as i64)
+            .unwrap_or_else(|| expr_start_line(body, source));
+
+        Some(ActiveDebugHookContext {
+            subprogram_start_line,
+            bindings: debug_info.bindings.clone(),
+            snapshottable_locals: debug_info
+                .bindings
+                .iter()
+                .map(|binding| binding.local_index)
+                .collect(),
+        })
     }
 
     fn emit_name_section(&self, module: &mut Module) {
@@ -607,6 +1119,55 @@ impl<'a> ModuleCompiler<'a> {
                 AttributeValue::Address(Address::Constant(code_range.start)),
             );
             subprogram_entry.set(constants::DW_AT_high_pc, AttributeValue::Udata(length));
+
+            let lexical_block = self
+                .func_debug_info
+                .get(&idx)
+                .filter(|info| {
+                    info.bindings
+                        .iter()
+                        .any(|binding| binding.kind == DebugBindingKind::Variable)
+                })
+                .map(|_| {
+                    let block = dwarf.unit.add(subprogram, constants::DW_TAG_lexical_block);
+                    let block_entry = dwarf.unit.get_mut(block);
+                    block_entry.set(
+                        constants::DW_AT_low_pc,
+                        AttributeValue::Address(Address::Constant(code_range.start)),
+                    );
+                    block_entry.set(constants::DW_AT_high_pc, AttributeValue::Udata(length));
+                    block
+                });
+
+            if let Some(debug_info) = self.func_debug_info.get(&idx) {
+                for binding in &debug_info.bindings {
+                    let parent = match binding.kind {
+                        DebugBindingKind::Parameter => subprogram,
+                        DebugBindingKind::Variable => lexical_block.unwrap_or(subprogram),
+                    };
+                    let tag = match binding.kind {
+                        DebugBindingKind::Parameter => constants::DW_TAG_formal_parameter,
+                        DebugBindingKind::Variable => constants::DW_TAG_variable,
+                    };
+                    let binding_entry = dwarf.unit.add(parent, tag);
+                    let entry = dwarf.unit.get_mut(binding_entry);
+                    entry.set(
+                        constants::DW_AT_name,
+                        AttributeValue::String(binding.name.as_bytes().to_vec()),
+                    );
+                    entry.set(
+                        constants::DW_AT_decl_file,
+                        AttributeValue::FileIndex(Some(file_id)),
+                    );
+                    entry.set(
+                        constants::DW_AT_decl_line,
+                        AttributeValue::Udata(binding.decl_line),
+                    );
+                    let mut location = DwarfExpression::new();
+                    location.op_wasm_local(binding.local_index);
+                    entry.set(constants::DW_AT_location, AttributeValue::Exprloc(location));
+                }
+            }
 
             let line_program = &mut dwarf.unit.line_program;
             line_program.begin_sequence(Some(Address::Constant(code_range.start)));
@@ -769,21 +1330,54 @@ impl<'a> ModuleCompiler<'a> {
             let current_lambdas = std::mem::take(&mut self.lambda_bodies);
 
             for lambda in current_lambdas {
-                let (_, _, captures, params, body) = &lambda;
+                let (_, func_idx, captures, params, body) = &lambda;
                 let mut locals = HashMap::new();
-                // Captures come first as hidden parameters
-                for (i, capture) in captures.iter().enumerate() {
-                    locals.insert(capture.name.clone(), i as u32);
-                }
-                // Then regular parameters
-                let capture_count = captures.len();
+                // Regular parameters come first, followed by hidden captures.
                 for (i, param) in params.iter().enumerate() {
-                    locals.insert(param.name.clone(), (capture_count + i) as u32);
+                    locals.insert(param.name.clone(), i as u32);
+                }
+                let param_count = params.len();
+                for (i, capture) in captures.iter().enumerate() {
+                    locals.insert(capture.name.clone(), (param_count + i) as u32);
                 }
                 let locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();
                 let mut func = Function::new(vec![(16, ValType::I32)]);
-                self.emit_debug_line_hook_for_expr(&mut func, body);
-                self.compile_expr_with_locals(&mut func, body, &locals, &locals_types)?;
+                let debug_runtime_key = self
+                    .func_spans
+                    .iter()
+                    .find(|(idx, _)| idx == func_idx)
+                    .map(|(_, span)| debug_runtime_key_for_span(span));
+                let debug_context = if let Some(source) = self.options.debug_source.as_deref() {
+                    let fallback_decl_line = self
+                        .func_spans
+                        .iter()
+                        .find(|(idx, _)| idx == func_idx)
+                        .map(|(_, span)| offset_to_line(source, span.start) as u64)
+                        .unwrap_or_else(|| expr_start_line(body, source) as u64);
+                    let debug_info = build_lambda_debug_info(
+                        captures,
+                        params,
+                        body,
+                        &locals,
+                        source,
+                        fallback_decl_line,
+                    );
+                    self.func_debug_info.insert(*func_idx, debug_info.clone());
+                    self.active_debug_hook_context_for_lambda(*func_idx, body, &debug_info)
+                } else {
+                    None
+                };
+                self.with_active_debug_hook_context(debug_context, |compiler| {
+                    if let Some(key) = debug_runtime_key {
+                        compiler.emit_debug_enter_hook(&mut func, key);
+                    }
+                    compiler.emit_debug_line_hook_for_expr(&mut func, body);
+                    compiler.compile_expr_with_locals(&mut func, body, &locals, &locals_types)?;
+                    if let Some(key) = debug_runtime_key {
+                        compiler.emit_debug_exit_hook(&mut func, key);
+                    }
+                    Ok(())
+                })?;
                 func.instruction(&Instruction::End);
                 compiled_lambdas.push(func);
 
@@ -880,8 +1474,20 @@ impl<'a> ModuleCompiler<'a> {
         let mut imports = ImportSection::new();
 
         if self.debug_hook_idx.is_some() {
-            let type_idx = self.get_or_create_type(&[ValType::I32], &[]);
+            let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
             imports.import("kettu:debug", "line", EntityType::Function(type_idx));
+        }
+        if self.debug_value_hook_idx.is_some() {
+            let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
+            imports.import("kettu:debug", "local", EntityType::Function(type_idx));
+        }
+        if self.debug_enter_hook_idx.is_some() {
+            let type_idx = self.get_or_create_type(&[ValType::I32], &[]);
+            imports.import("kettu:debug", "enter", EntityType::Function(type_idx));
+        }
+        if self.debug_exit_hook_idx.is_some() {
+            let type_idx = self.get_or_create_type(&[ValType::I32], &[]);
+            imports.import("kettu:debug", "exit", EntityType::Function(type_idx));
         }
 
         // Add interface function imports
@@ -2129,7 +2735,7 @@ impl<'a> ModuleCompiler<'a> {
         body: &Expr,
         span: &Range<usize>,
     ) -> Result<u32, CompileError> {
-        // Build param types: captures first, then regular params (all i32 for now)
+        // Build param types: regular params first, then hidden captures (all i32 for now)
         let total_params = captures.len() + params.len();
         let param_types: Vec<ValType> = (0..total_params).map(|_| ValType::I32).collect();
         let result_types = vec![ValType::I32]; // All lambdas return i32 for now
@@ -2174,6 +2780,14 @@ impl<'a> ModuleCompiler<'a> {
     fn compile_function(&mut self, func: &Func) -> Result<Function, CompileError> {
         // Check if this async function has await points - if so, we need a callback
         let needs_callback = func.is_async && self.options.wasip3 && Self::has_await_points(func);
+        let func_idx = self
+            .functions
+            .get(&func.name.name)
+            .map(|(_, func_idx, _)| *func_idx)
+            .ok_or_else(|| CompileError {
+                message: format!("Missing function index for {}", func.name.name),
+                span: Some(func.span.clone()),
+            })?;
 
         // Build local variable map: param_name -> index, let_name -> index
         // For canonical ABI, string/list params expand to 2 WASM locals (ptr, len).
@@ -2490,6 +3104,14 @@ impl<'a> ModuleCompiler<'a> {
             locals.insert(name.clone(), synth_idx);
         }
 
+        let debug_context = if let Some(source) = self.options.debug_source.as_deref() {
+            let debug_info = build_function_debug_info(func, &locals, source);
+            self.func_debug_info.insert(func_idx, debug_info.clone());
+            self.active_debug_hook_context_for_function(func, &debug_info, &locals, &v128_locals)?
+        } else {
+            None
+        };
+
         // Declare locals with correct types (v128 for SIMD, i32 for everything else)
         // +1 for temp record pointer
         // +3 for match expressions (scrutinee + binding + spare)
@@ -2552,176 +3174,179 @@ impl<'a> ModuleCompiler<'a> {
         // Track type info for record variables
         let mut locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();
 
-        if let Some(ref body) = func.body {
-            let stmts = &body.statements;
-            if !stmts.is_empty() {
-                // Compile all but last statement normally
-                for stmt in &stmts[..stmts.len() - 1] {
-                    self.compile_statement_with_locals(
-                        &mut function,
-                        stmt,
-                        &locals,
-                        &mut locals_types,
-                    )?;
-                }
-                // Last statement: if it's an expression, leave value on stack for return
-                let last = &stmts[stmts.len() - 1];
-                self.emit_debug_line_hook_for_statement(&mut function, last);
-                match last {
-                    Statement::CompoundAssign { name, op, value } => {
-                        // Compile as: local.get + value + op + local.set
-                        if let Some(&idx) = locals.get(&name.name) {
-                            function.instruction(&Instruction::LocalGet(idx));
-                        }
-                        self.compile_expr_with_locals(
+        self.with_active_debug_hook_context(debug_context, |compiler| {
+            if let Some(ref body) = func.body {
+                let stmts = &body.statements;
+                if !stmts.is_empty() {
+                    // Compile all but last statement normally
+                    for stmt in &stmts[..stmts.len() - 1] {
+                        compiler.compile_statement_with_locals(
                             &mut function,
-                            value,
+                            stmt,
                             &locals,
-                            &locals_types,
+                            &mut locals_types,
                         )?;
-                        match op {
-                            BinOp::Add => function.instruction(&Instruction::I32Add),
-                            BinOp::Sub => function.instruction(&Instruction::I32Sub),
-                            _ => function.instruction(&Instruction::I32Add),
-                        };
-                        if let Some(&idx) = locals.get(&name.name) {
-                            function.instruction(&Instruction::LocalSet(idx));
-                        }
-                        function.instruction(&Instruction::I32Const(0));
                     }
-                    Statement::Expr(expr) => {
-                        // Compile the expression
-                        self.compile_expr_with_locals(&mut function, expr, &locals, &locals_types)?;
-
-                        // For async functions with --wasip3: call task.return then return 0 (DONE)
-                        if func.is_async && self.options.wasip3 {
-                            if let Some(ref result_ty) = func.result {
-                                let result_valtype = self.ty_to_valtype(result_ty)?;
-                                let task_return_idx =
-                                    self.ensure_task_return_import(&[result_valtype]);
-                                function.instruction(&Instruction::Call(task_return_idx));
+                    // Last statement: if it's an expression, leave value on stack for return
+                    let last = &stmts[stmts.len() - 1];
+                    compiler.emit_debug_line_hook_for_statement(&mut function, last);
+                    match last {
+                        Statement::CompoundAssign { name, op, value } => {
+                            // Compile as: local.get + value + op + local.set
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalGet(idx));
                             }
-                            function.instruction(&Instruction::I32Const(0)); // status: DONE
-                        }
-                        // For sync (or async without wasip3): value is already on stack
-                    }
-                    Statement::Return(Some(expr)) => {
-                        self.compile_expr_with_locals(&mut function, expr, &locals, &locals_types)?;
-
-                        if func.is_async && self.options.wasip3 {
-                            if let Some(ref result_ty) = func.result {
-                                let result_valtype = self.ty_to_valtype(result_ty)?;
-                                let task_return_idx =
-                                    self.ensure_task_return_import(&[result_valtype]);
-                                function.instruction(&Instruction::Call(task_return_idx));
+                            compiler.compile_expr_with_locals(
+                                &mut function,
+                                value,
+                                &locals,
+                                &locals_types,
+                            )?;
+                            match op {
+                                BinOp::Add => function.instruction(&Instruction::I32Add),
+                                BinOp::Sub => function.instruction(&Instruction::I32Sub),
+                                _ => function.instruction(&Instruction::I32Add),
+                            };
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalSet(idx));
                             }
-                            function.instruction(&Instruction::I32Const(0)); // status: DONE
+                            function.instruction(&Instruction::I32Const(0));
+                        }
+                        Statement::Expr(expr) => {
+                            compiler.compile_expr_with_locals(
+                                &mut function,
+                                expr,
+                                &locals,
+                                &locals_types,
+                            )?;
+
+                            if func.is_async && compiler.options.wasip3 {
+                                if let Some(ref result_ty) = func.result {
+                                    let result_valtype = compiler.ty_to_valtype(result_ty)?;
+                                    let task_return_idx =
+                                        compiler.ensure_task_return_import(&[result_valtype]);
+                                    function.instruction(&Instruction::Call(task_return_idx));
+                                }
+                                function.instruction(&Instruction::I32Const(0));
+                            }
+                        }
+                        Statement::Return(Some(expr)) => {
+                            compiler.compile_expr_with_locals(
+                                &mut function,
+                                expr,
+                                &locals,
+                                &locals_types,
+                            )?;
+
+                            if func.is_async && compiler.options.wasip3 {
+                                if let Some(ref result_ty) = func.result {
+                                    let result_valtype = compiler.ty_to_valtype(result_ty)?;
+                                    let task_return_idx =
+                                        compiler.ensure_task_return_import(&[result_valtype]);
+                                    function.instruction(&Instruction::Call(task_return_idx));
+                                }
+                                function.instruction(&Instruction::I32Const(0));
+                                function.instruction(&Instruction::Return);
+                            } else {
+                                function.instruction(&Instruction::Return);
+                            }
+                        }
+                        Statement::Return(None) => {
+                            if func.is_async && compiler.options.wasip3 {
+                                let task_return_idx = compiler.ensure_task_return_import(&[]);
+                                function.instruction(&Instruction::Call(task_return_idx));
+                                function.instruction(&Instruction::I32Const(0));
+                            }
                             function.instruction(&Instruction::Return);
-                        } else {
-                            function.instruction(&Instruction::Return);
                         }
-                    }
-                    Statement::Return(None) => {
-                        if func.is_async && self.options.wasip3 {
-                            let task_return_idx = self.ensure_task_return_import(&[]);
-                            function.instruction(&Instruction::Call(task_return_idx));
-                            function.instruction(&Instruction::I32Const(0)); // status: DONE
+                        Statement::Let { name, value } => {
+                            if let Expr::RecordLiteral { fields, .. } = value {
+                                let field_info: Vec<_> = fields
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, (field_name, _))| (field_name.name.clone(), i * 4))
+                                    .collect();
+                                locals_types.insert(
+                                    name.name.clone(),
+                                    RecordTypeInfo::from_fields(&field_info),
+                                );
+                            }
+                            compiler.compile_expr_with_locals(
+                                &mut function,
+                                value,
+                                &locals,
+                                &locals_types,
+                            )?;
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalSet(idx));
+                            }
+                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
+                                function.instruction(&Instruction::I32Const(0));
+                            }
                         }
-                        function.instruction(&Instruction::Return);
-                    }
-                    Statement::Let { name, value } => {
-                        // Track record type info
-                        if let Expr::RecordLiteral { fields, .. } = value {
-                            let field_info: Vec<_> = fields
-                                .iter()
-                                .enumerate()
-                                .map(|(i, (field_name, _))| (field_name.name.clone(), i * 4))
-                                .collect();
-                            locals_types.insert(
-                                name.name.clone(),
-                                RecordTypeInfo::from_fields(&field_info),
-                            );
+                        Statement::Assign { name, value } => {
+                            compiler.compile_expr_with_locals(
+                                &mut function,
+                                value,
+                                &locals,
+                                &locals_types,
+                            )?;
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalSet(idx));
+                            }
+                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
+                                function.instruction(&Instruction::I32Const(0));
+                            }
                         }
-                        // Compile and store, but also leave copy on stack if func returns value
-                        self.compile_expr_with_locals(
-                            &mut function,
-                            value,
-                            &locals,
-                            &locals_types,
-                        )?;
-                        if let Some(&idx) = locals.get(&name.name) {
-                            function.instruction(&Instruction::LocalSet(idx));
+                        Statement::Break { .. } | Statement::Continue { .. } => {
+                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
+                                function.instruction(&Instruction::I32Const(0));
+                            }
                         }
-                        // For async with wasip3: push 0 (status: DONE); for sync: push default if has result
-                        if (func.is_async && self.options.wasip3) || func.result.is_some() {
-                            function.instruction(&Instruction::I32Const(0));
+                        Statement::SharedLet { .. } => {
+                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
+                                function.instruction(&Instruction::I32Const(0));
+                            }
                         }
-                    }
-                    Statement::Assign { name, value } => {
-                        // Compile value and store to existing local
-                        self.compile_expr_with_locals(
-                            &mut function,
-                            value,
-                            &locals,
-                            &locals_types,
-                        )?;
-                        if let Some(&idx) = locals.get(&name.name) {
-                            function.instruction(&Instruction::LocalSet(idx));
-                        }
-                        // For async with wasip3: push 0 (status: DONE); for sync: push default if has result
-                        if (func.is_async && self.options.wasip3) || func.result.is_some() {
-                            function.instruction(&Instruction::I32Const(0));
-                        }
-                    }
-                    Statement::Break { .. } | Statement::Continue { .. } => {
-                        // These only make sense inside while loops; handled there
-                        if (func.is_async && self.options.wasip3) || func.result.is_some() {
-                            function.instruction(&Instruction::I32Const(0));
-                        }
-                    }
-                    Statement::SharedLet { .. } => {
-                        if (func.is_async && self.options.wasip3) || func.result.is_some() {
-                            function.instruction(&Instruction::I32Const(0));
-                        }
-                    }
-                    Statement::GuardLet {
-                        name,
-                        value,
-                        else_body,
-                    } => {
-                        self.compile_guard_let_statement_with_locals(
-                            &mut function,
+                        Statement::GuardLet {
                             name,
                             value,
                             else_body,
-                            &locals,
-                            &mut locals_types,
-                        )?;
-                        if (func.is_async && self.options.wasip3) || func.result.is_some() {
-                            function.instruction(&Instruction::I32Const(0));
+                        } => {
+                            compiler.compile_guard_let_statement_with_locals(
+                                &mut function,
+                                name,
+                                value,
+                                else_body,
+                                &locals,
+                                &mut locals_types,
+                            )?;
+                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
+                                function.instruction(&Instruction::I32Const(0));
+                            }
                         }
-                    }
-                    Statement::Guard {
-                        condition,
-                        else_body,
-                    } => {
-                        self.compile_guard_statement_with_locals(
-                            &mut function,
+                        Statement::Guard {
                             condition,
                             else_body,
-                            &locals,
-                            &mut locals_types,
-                        )?;
-                        if (func.is_async && self.options.wasip3) || func.result.is_some() {
-                            function.instruction(&Instruction::I32Const(0));
+                        } => {
+                            compiler.compile_guard_statement_with_locals(
+                                &mut function,
+                                condition,
+                                else_body,
+                                &locals,
+                                &mut locals_types,
+                            )?;
+                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
+                                function.instruction(&Instruction::I32Const(0));
+                            }
                         }
                     }
+                } else if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
+                    function.instruction(&Instruction::I32Const(0));
                 }
-            } else if (func.is_async && self.options.wasip3) || func.result.is_some() {
-                // Empty body - push default value (0 for async status or sync result)
-                function.instruction(&Instruction::I32Const(0));
             }
-        }
+            Ok(())
+        })?;
 
         // If this async function has await points, register a callback export
         if needs_callback {
@@ -3946,7 +4571,12 @@ impl<'a> ModuleCompiler<'a> {
                 function.instruction(&Instruction::I32Add);
 
                 // Compile lambda body with param bound to elem_local
-                if let Expr::Lambda { params, body, .. } = lambda.as_ref() {
+                if let Expr::Lambda {
+                    params, body, span, ..
+                } = lambda.as_ref()
+                {
+                    let debug_runtime_key = debug_runtime_key_for_span(span);
+                    self.emit_debug_enter_hook(function, debug_runtime_key);
                     self.emit_debug_line_hook_for_expr(function, body);
                     if !params.is_empty() {
                         // Bind the lambda param to elem_local
@@ -3957,6 +4587,7 @@ impl<'a> ModuleCompiler<'a> {
                         // No params - just compile body (identity)
                         self.compile_expr_with_locals(function, body, locals, locals_types)?;
                     }
+                    self.emit_debug_exit_hook(function, debug_runtime_key);
                 } else if let Expr::Ident(id) = lambda.as_ref() {
                     // Function variable - lookup and call_indirect
                     if let Some(&local_idx) = locals.get(&id.name) {
@@ -4081,7 +4712,12 @@ impl<'a> ModuleCompiler<'a> {
                 function.instruction(&Instruction::LocalSet(elem_local));
 
                 // Evaluate predicate with param bound to elem_local
-                if let Expr::Lambda { params, body, .. } = lambda.as_ref() {
+                if let Expr::Lambda {
+                    params, body, span, ..
+                } = lambda.as_ref()
+                {
+                    let debug_runtime_key = debug_runtime_key_for_span(span);
+                    self.emit_debug_enter_hook(function, debug_runtime_key);
                     self.emit_debug_line_hook_for_expr(function, body);
                     if !params.is_empty() {
                         let mut inner_locals = locals.clone();
@@ -4090,6 +4726,7 @@ impl<'a> ModuleCompiler<'a> {
                     } else {
                         self.compile_expr_with_locals(function, body, locals, locals_types)?;
                     }
+                    self.emit_debug_exit_hook(function, debug_runtime_key);
                 } else if let Expr::Ident(id) = lambda.as_ref() {
                     // Function variable - call_indirect
                     if let Some(&local_idx) = locals.get(&id.name) {
@@ -4213,7 +4850,12 @@ impl<'a> ModuleCompiler<'a> {
                 function.instruction(&Instruction::BrIf(1));
 
                 // Compile lambda body with acc and elem bound
-                if let Expr::Lambda { params, body, .. } = lambda.as_ref() {
+                if let Expr::Lambda {
+                    params, body, span, ..
+                } = lambda.as_ref()
+                {
+                    let debug_runtime_key = debug_runtime_key_for_span(span);
+                    self.emit_debug_enter_hook(function, debug_runtime_key);
                     self.emit_debug_line_hook_for_expr(function, body);
                     let mut inner_locals = locals.clone();
                     // Bind first param to acc
@@ -4241,6 +4883,7 @@ impl<'a> ModuleCompiler<'a> {
                         inner_locals.insert(params[1].name.clone(), elem_local);
                     }
                     self.compile_expr_with_locals(function, body, &inner_locals, locals_types)?;
+                    self.emit_debug_exit_hook(function, debug_runtime_key);
                 } else if let Expr::Ident(id) = lambda.as_ref() {
                     // Function variable - call_indirect with (acc, elem) -> result
                     if let Some(&local_idx) = locals.get(&id.name) {
@@ -5075,6 +5718,7 @@ impl<'a> ModuleCompiler<'a> {
                 function.instruction(&Instruction::I32Eqz);
                 function.instruction(&Instruction::BrIf(1)); // break to outer block
                 for stmt in body {
+                    self.emit_debug_line_hook_for_statement(function, stmt);
                     match stmt {
                         Statement::Expr(e) => {
                             self.compile_expr_with_locals(function, e, locals, locals_types)?;
@@ -5285,6 +5929,7 @@ impl<'a> ModuleCompiler<'a> {
 
                     // Compile body statements
                     for stmt in body {
+                        self.emit_debug_line_hook_for_statement(function, stmt);
                         match stmt {
                             Statement::Expr(e) => {
                                 self.compile_expr_with_locals(function, e, locals, locals_types)?;
@@ -5831,6 +6476,7 @@ impl<'a> ModuleCompiler<'a> {
 
                 // Compile body statements
                 for stmt in body {
+                    self.emit_debug_line_hook_for_statement(function, stmt);
                     match stmt {
                         Statement::Expr(e) => {
                             self.compile_expr_with_locals(function, e, locals, locals_types)?;
@@ -6333,6 +6979,7 @@ impl<'a> ModuleCompiler<'a> {
                 // Compile body statements: last expression's v128 result stays on stack
                 let mut has_result = false;
                 for (i, stmt) in body.iter().enumerate() {
+                    self.emit_debug_line_hook_for_statement(function, stmt);
                     match stmt {
                         Statement::Expr(e) => {
                             self.compile_expr_with_locals(function, e, locals, locals_types)?;

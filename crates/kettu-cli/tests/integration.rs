@@ -50,6 +50,22 @@ struct ParsedDwarf {
     compile_units: Vec<String>,
     subprograms: Vec<String>,
     line_rows: Vec<DwarfLineRow>,
+    bindings: Vec<DwarfBinding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DwarfBindingKind {
+    Parameter,
+    Variable,
+}
+
+#[derive(Debug)]
+struct DwarfBinding {
+    owner: String,
+    name: String,
+    decl_line: u64,
+    wasm_local: Option<u32>,
+    kind: DwarfBindingKind,
 }
 
 #[derive(Debug)]
@@ -97,6 +113,7 @@ fn parse_real_dwarf_sections(sections: &HashMap<String, Vec<u8>>) -> Result<Pars
     let mut compile_units = Vec::new();
     let mut subprograms = Vec::new();
     let mut line_rows = Vec::new();
+    let mut bindings = Vec::new();
     let mut unit_headers = dwarf.units();
 
     while let Some(unit_header) = unit_headers
@@ -108,22 +125,71 @@ fn parse_real_dwarf_sections(sections: &HashMap<String, Vec<u8>>) -> Result<Pars
             .map_err(|err| format!("failed to read DWARF unit: {}", err))?;
 
         let mut entries = unit.entries();
+        let mut active_subprograms: Vec<Option<String>> = Vec::new();
         while let Some(entry) = entries
             .next_dfs()
             .map_err(|err| format!("failed to walk DWARF entries: {}", err))?
         {
-            let Some(name_attr) = entry.attr_value(constants::DW_AT_name) else {
-                continue;
+            let depth = entry.depth().max(0) as usize;
+            active_subprograms.truncate(depth + 1);
+            if active_subprograms.len() <= depth {
+                active_subprograms.resize(depth + 1, None);
+            }
+
+            let name = match entry.attr_value(constants::DW_AT_name) {
+                Some(name_attr) => Some(
+                    dwarf
+                        .attr_string(&unit, name_attr)
+                        .map_err(|err| format!("failed to read DWARF name: {}", err))?
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                None => None,
             };
-            let name = dwarf
-                .attr_string(&unit, name_attr)
-                .map_err(|err| format!("failed to read DWARF name: {}", err))?
-                .to_string_lossy()
-                .into_owned();
 
             match entry.tag() {
-                constants::DW_TAG_compile_unit => compile_units.push(name),
-                constants::DW_TAG_subprogram => subprograms.push(name),
+                constants::DW_TAG_compile_unit => {
+                    if let Some(name) = name {
+                        compile_units.push(name);
+                    }
+                }
+                constants::DW_TAG_subprogram => {
+                    if let Some(name) = name {
+                        active_subprograms[depth] = Some(name.clone());
+                        subprograms.push(name);
+                    }
+                }
+                constants::DW_TAG_formal_parameter | constants::DW_TAG_variable => {
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    let owner = active_subprograms
+                        .iter()
+                        .rev()
+                        .find_map(|owner| owner.clone())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let decl_line = entry
+                        .attr_value(constants::DW_AT_decl_line)
+                        .and_then(attribute_u64)
+                        .unwrap_or(0);
+                    let wasm_local = entry
+                        .attr_value(constants::DW_AT_location)
+                        .map(|value| parse_wasm_local(value, unit.encoding()))
+                        .transpose()?
+                        .flatten();
+                    let kind = if entry.tag() == constants::DW_TAG_formal_parameter {
+                        DwarfBindingKind::Parameter
+                    } else {
+                        DwarfBindingKind::Variable
+                    };
+                    bindings.push(DwarfBinding {
+                        owner,
+                        name,
+                        decl_line,
+                        wasm_local,
+                        kind,
+                    });
+                }
                 _ => {}
             }
         }
@@ -156,7 +222,36 @@ fn parse_real_dwarf_sections(sections: &HashMap<String, Vec<u8>>) -> Result<Pars
         compile_units,
         subprograms,
         line_rows,
+        bindings,
     })
+}
+
+fn parse_wasm_local<R: gimli::Reader>(
+    value: gimli::AttributeValue<R>,
+    encoding: gimli::Encoding,
+) -> Result<Option<u32>, String> {
+    let gimli::AttributeValue::Exprloc(expression) = value else {
+        return Ok(None);
+    };
+    let mut ops = expression.operations(encoding);
+    match ops
+        .next()
+        .map_err(|err| format!("failed to read DWARF location expression: {}", err))?
+    {
+        Some(gimli::Operation::WasmLocal { index }) => Ok(Some(index)),
+        _ => Ok(None),
+    }
+}
+
+fn attribute_u64<R: gimli::Reader>(value: gimli::AttributeValue<R>) -> Option<u64> {
+    match value {
+        gimli::AttributeValue::Udata(value) => Some(value),
+        gimli::AttributeValue::Data1(value) => Some(value.into()),
+        gimli::AttributeValue::Data2(value) => Some(value.into()),
+        gimli::AttributeValue::Data4(value) => Some(value.into()),
+        gimli::AttributeValue::Data8(value) => Some(value),
+        _ => None,
+    }
 }
 
 fn assert_real_dwarf_for_function(
@@ -192,6 +287,39 @@ fn assert_real_dwarf_for_function(
         "expected a DWARF line row for {source_name} within {:?}, got {:?}",
         expected_lines,
         dwarf.line_rows
+    );
+}
+
+fn assert_dwarf_binding(
+    dwarf: &ParsedDwarf,
+    owner: &str,
+    name: &str,
+    kind: DwarfBindingKind,
+    decl_line: u64,
+    wasm_local: u32,
+) {
+    let binding = dwarf
+        .bindings
+        .iter()
+        .find(|binding| {
+            binding.owner.contains(owner) && binding.name == name && binding.kind == kind
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected DWARF binding {name:?} ({kind:?}) under {owner:?}, got {:?}",
+                dwarf.bindings
+            )
+        });
+    assert_eq!(
+        binding.decl_line, decl_line,
+        "unexpected decl line for binding {name:?}: {:?}",
+        binding
+    );
+    assert_eq!(
+        binding.wasm_local,
+        Some(wasm_local),
+        "unexpected wasm local for binding {name:?}: {:?}",
+        binding
     );
 }
 
@@ -428,6 +556,144 @@ fn test_build_debug_sections_include_lambda_locations() {
     let debug_output = inspect_debug_output(&wasm).expect("inspect debug output");
 
     assert_real_dwarf_for_function(&debug_output.dwarf, &source_name, "lambda#0", 5..=6);
+    assert_dwarf_binding(
+        &debug_output.dwarf,
+        "lambda#0",
+        "x",
+        DwarfBindingKind::Parameter,
+        5,
+        0,
+    );
+}
+
+#[test]
+fn test_build_debug_sections_include_variable_locations() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(file, "package local:test;").unwrap();
+    writeln!(file, "interface math {{").unwrap();
+    writeln!(file, "    add: func(a: s32, b: s32) -> s32 {{").unwrap();
+    writeln!(file, "        let sum = a + b;").unwrap();
+    writeln!(file, "        return sum;").unwrap();
+    writeln!(file, "    }}").unwrap();
+    writeln!(file, "}}").unwrap();
+
+    let output_file = NamedTempFile::new().unwrap();
+
+    let output = kettu_cmd()
+        .args([
+            "build",
+            "--core",
+            "--debug",
+            file.path().to_str().unwrap(),
+            "-o",
+            output_file.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run kettu build --debug");
+
+    assert!(
+        output.status.success(),
+        "Debug build should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let wasm = std::fs::read(output_file.path()).unwrap();
+    let debug_output = inspect_debug_output(&wasm).expect("inspect debug output");
+
+    assert_dwarf_binding(
+        &debug_output.dwarf,
+        "add",
+        "a",
+        DwarfBindingKind::Parameter,
+        3,
+        0,
+    );
+    assert_dwarf_binding(
+        &debug_output.dwarf,
+        "add",
+        "b",
+        DwarfBindingKind::Parameter,
+        3,
+        1,
+    );
+    assert_dwarf_binding(
+        &debug_output.dwarf,
+        "add",
+        "sum",
+        DwarfBindingKind::Variable,
+        4,
+        2,
+    );
+}
+
+#[test]
+fn test_build_debug_sections_are_readable_by_llvm_dwarfdump() {
+    match Command::new("llvm-dwarfdump").arg("--version").output() {
+        Ok(output) => {
+            assert!(
+                output.status.success(),
+                "llvm-dwarfdump should be runnable: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping llvm-dwarfdump validation: tool not installed");
+            return;
+        }
+        Err(err) => panic!("failed to invoke llvm-dwarfdump: {err}"),
+    }
+
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(file, "package local:test;").unwrap();
+    writeln!(file, "interface math {{").unwrap();
+    writeln!(file, "    add: func(a: s32, b: s32) -> s32 {{").unwrap();
+    writeln!(file, "        let sum = a + b;").unwrap();
+    writeln!(file, "        return sum;").unwrap();
+    writeln!(file, "    }}").unwrap();
+    writeln!(file, "}}").unwrap();
+
+    let output_file = NamedTempFile::new().unwrap();
+    let output = kettu_cmd()
+        .args([
+            "build",
+            "--core",
+            "--debug",
+            file.path().to_str().unwrap(),
+            "-o",
+            output_file.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run kettu build --debug");
+
+    assert!(
+        output.status.success(),
+        "Debug build should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let dwarfdump = Command::new("llvm-dwarfdump")
+        .arg(output_file.path())
+        .output()
+        .expect("run llvm-dwarfdump");
+    assert!(
+        dwarfdump.status.success(),
+        "llvm-dwarfdump should succeed: {}",
+        String::from_utf8_lossy(&dwarfdump.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&dwarfdump.stdout);
+    assert!(
+        stdout.contains("DW_TAG_formal_parameter"),
+        "expected llvm-dwarfdump to show formal parameters: {stdout}"
+    );
+    assert!(
+        stdout.contains("DW_TAG_lexical_block"),
+        "expected llvm-dwarfdump to show lexical blocks: {stdout}"
+    );
+    assert!(
+        stdout.contains("DW_OP_WASM_location"),
+        "expected llvm-dwarfdump to show Wasm local locations: {stdout}"
+    );
 }
 
 #[test]
