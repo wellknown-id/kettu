@@ -79,12 +79,22 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
             scrutinee, arms, ..
         } => {
             analyze_captures(scrutinee, scope);
+            let mut arm_scope = scope.clone();
             for arm in arms {
                 // Patterns may bind new variables
-                let mut arm_scope = scope.clone();
-                collect_pattern_bindings(&arm.pattern, &mut arm_scope);
+                let mut added_bindings = HashSet::new();
+                collect_pattern_bindings(&arm.pattern, &mut added_bindings);
+                let mut actually_added = Vec::new();
+                for binding in added_bindings {
+                    if arm_scope.insert(binding.clone()) {
+                        actually_added.push(binding);
+                    }
+                }
                 for stmt in &mut arm.body {
                     analyze_statement(stmt, &arm_scope);
+                }
+                for binding in actually_added {
+                    arm_scope.remove(&binding);
                 }
             }
         }
@@ -359,11 +369,21 @@ fn collect_free_variables(expr: &Expr, bound: &HashSet<String>, free: &mut HashS
             scrutinee, arms, ..
         } => {
             collect_free_variables(scrutinee, bound, free);
+            let mut arm_bound = bound.clone();
             for arm in arms {
-                let mut arm_bound = bound.clone();
-                collect_pattern_bindings(&arm.pattern, &mut arm_bound);
+                let mut added_bindings = HashSet::new();
+                collect_pattern_bindings(&arm.pattern, &mut added_bindings);
+                let mut actually_added = Vec::new();
+                for binding in added_bindings {
+                    if arm_bound.insert(binding.clone()) {
+                        actually_added.push(binding);
+                    }
+                }
                 for stmt in &arm.body {
                     collect_free_in_statement(stmt, &arm_bound, free);
+                }
+                for binding in actually_added {
+                    arm_bound.remove(&binding);
                 }
             }
         }
