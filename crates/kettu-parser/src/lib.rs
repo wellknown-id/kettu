@@ -96,3 +96,27 @@ pub fn parse(source: &str) -> (Option<ast::WitFile>, Vec<ParseError>) {
 pub fn parse_file(source: &str) -> (Option<ast::WitFile>, Vec<ParseError>) {
     parse(source)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_file() {
+        let source = "interface test-iface {\n  test-func: func();\n}";
+        let (ast, errors) = parse_file(source);
+
+        assert!(errors.is_empty(), "expected no parse errors, got: {:?}", errors);
+        assert!(ast.is_some(), "expected AST to be present");
+
+        let ast = ast.unwrap();
+        assert_eq!(ast.items.len(), 1);
+
+        match &ast.items[0] {
+            ast::TopLevelItem::Interface(iface) => {
+                assert_eq!(iface.name.name, "test-iface");
+            }
+            _ => panic!("Expected Interface item"),
+        }
+    }
+}
