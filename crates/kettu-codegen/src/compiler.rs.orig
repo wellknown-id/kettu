@@ -1313,13 +1313,12 @@ impl<'a> ModuleCompiler<'a> {
         self.ensure_arena_reset_func();
 
         // Phase 3: Pre-compile all function bodies (discovers lambdas)
-        let bodies = std::mem::take(&mut self.func_bodies);
+        let bodies = self.func_bodies.clone();
         let mut compiled_funcs: Vec<Function> = Vec::new();
         for (_, func) in &bodies {
             let function = self.compile_function(func)?;
             compiled_funcs.push(function);
         }
-        self.func_bodies = bodies;
         let initial_heap_offset = self.string_offset;
 
         // Phase 4: Compile lambda bodies
@@ -1391,9 +1390,9 @@ impl<'a> ModuleCompiler<'a> {
         let has_lambdas = !compiled_lambdas.is_empty();
 
         // Phase 4b: Compile async callback bodies
-        let callback_bodies = std::mem::take(&mut self.callback_bodies);
+        let callback_bodies_clone = self.callback_bodies.clone();
         let mut compiled_callbacks: Vec<Function> = Vec::new();
-        for (func_name, _original_func, num_locals) in &callback_bodies {
+        for (func_name, _original_func, num_locals) in &callback_bodies_clone {
             // Callback signature: (event: i32, p1: i32, p2: i32) -> i32
             // For now, callbacks just return DONE status
             // Full implementation would restore state and resume execution
@@ -1413,7 +1412,6 @@ impl<'a> ModuleCompiler<'a> {
             callback.instruction(&Instruction::End);
             compiled_callbacks.push(callback);
         }
-        self.callback_bodies = callback_bodies;
         let _has_callbacks = !compiled_callbacks.is_empty();
 
         // Phase 4c: Compile spawn bodies
@@ -1616,7 +1614,7 @@ impl<'a> ModuleCompiler<'a> {
         // Callback signature: (event: i32, p1: i32, p2: i32) -> i32
         let callback_type_idx =
             self.get_or_create_type(&[ValType::I32, ValType::I32, ValType::I32], &[ValType::I32]);
-        for _ in &self.callback_bodies {
+        for _ in &callback_bodies_clone {
             funcs.function(callback_type_idx);
         }
         // Spawn body function types
@@ -1630,7 +1628,7 @@ impl<'a> ModuleCompiler<'a> {
         }
         if self.local_func_count > 0
             || has_lambdas
-            || !self.callback_bodies.is_empty()
+            || !callback_bodies_clone.is_empty()
             || has_spawns
         {
             module.section(&funcs);
@@ -1683,7 +1681,7 @@ impl<'a> ModuleCompiler<'a> {
             let wts_idx = self.import_count
                 + self.local_func_count
                 + self.lambda_bodies.len() as u32
-                + self.callback_bodies.len() as u32
+                + callback_bodies_clone.len() as u32
                 + self.spawn_bodies.len() as u32;
             exports.export("wasi_thread_start", ExportKind::Func, wts_idx);
         }
@@ -1730,7 +1728,7 @@ impl<'a> ModuleCompiler<'a> {
         for func in compiled_callbacks {
             code.function(&func);
         }
-        if self.local_func_count > 0 || has_lambdas || !self.callback_bodies.is_empty() {
+        if self.local_func_count > 0 || has_lambdas || !callback_bodies_clone.is_empty() {
             module.section(&code);
         }
 
@@ -7848,7 +7846,7 @@ mod tests {
     fn test_compile_simple_function() {
         let source = r#"
             package local:test;
-            
+
             interface host {
                 log: func(msg: string) {
                     println(msg)
@@ -7874,7 +7872,7 @@ mod tests {
     fn test_compile_with_locals() {
         let source = r#"
             package local:test;
-            
+
             interface math {
                 add-one: func(x: s32) -> s32 {
                     let y = x + 1;
@@ -7901,7 +7899,7 @@ mod tests {
     fn test_compile_binary_operators() {
         let source = r#"
             package local:test;
-            
+
             interface ops {
                 compute: func(a: s32, b: s32) -> s32 {
                     let sum = a + b;
