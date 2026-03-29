@@ -677,7 +677,7 @@ mod tests {
             type alias = u32;
             resource r {
                 constructor(v: u32);
-                static s: func() -> u32;
+                s: static func() -> u32;
                 m: func();
             }
         }";
