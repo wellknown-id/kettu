@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Maximum recursion depth for finding interfaces in the directory tree
+const MAX_RECURSION_DEPTH: u32 = 16;
+
 /// Resolved imports from a file
 pub struct ResolvedImports {
     /// Map of interface alias (e.g., "math") to file path and interface name
@@ -108,20 +111,25 @@ fn resolve_local_interface(
     current_file: &Path,
     interface_name: &str,
 ) -> Option<PathBuf> {
-    find_interface_in_tree(base_dir, current_file, interface_name)
+    find_interface_in_tree(base_dir, current_file, interface_name, 0)
 }
 
 fn find_interface_in_tree(
     base_dir: &Path,
     current_file: &Path,
     interface_name: &str,
+    depth: u32,
 ) -> Option<PathBuf> {
+    if depth > MAX_RECURSION_DEPTH {
+        return None;
+    }
+
     let entries = fs::read_dir(base_dir).ok()?;
 
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if let Some(found) = find_interface_in_tree(&path, current_file, interface_name) {
+            if let Some(found) = find_interface_in_tree(&path, current_file, interface_name, depth + 1) {
                 return Some(found);
             }
             continue;
@@ -195,5 +203,34 @@ mod tests {
             resolve_use_path(base, Path::new("/project/src/main.kettu"), &use_path).unwrap();
         assert_eq!(path, PathBuf::from("/project/src/helper/lib.kettu"));
         assert_eq!(interface, "math");
+    }
+
+    #[test]
+    fn test_find_interface_depth_limit() {
+        let temp_dir = std::env::temp_dir().join("kettu_depth_test");
+        if temp_dir.exists() {
+            fs::remove_dir_all(&temp_dir).unwrap();
+        }
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut current_dir = temp_dir.clone();
+        for i in 0..=(MAX_RECURSION_DEPTH + 1) {
+            current_dir = current_dir.join(format!("dir_{}", i));
+            fs::create_dir_all(&current_dir).unwrap();
+        }
+
+        let target_file = current_dir.join("test.kettu");
+        fs::write(&target_file, "interface target {}").unwrap();
+
+        // Should NOT find it because it's too deep
+        let found = find_interface_in_tree(&temp_dir, Path::new(""), "target", 0);
+        assert!(found.is_none());
+
+        // Should find it if we start deeper
+        let start_deeper = temp_dir.join("dir_0").join("dir_1");
+        let found = find_interface_in_tree(&start_deeper, Path::new(""), "target", 0);
+        assert!(found.is_some());
+
+        fs::remove_dir_all(&temp_dir).unwrap();
     }
 }
