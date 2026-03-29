@@ -129,7 +129,9 @@ fn find_interface_in_tree(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if let Some(found) = find_interface_in_tree(&path, current_file, interface_name, depth + 1) {
+            if let Some(found) =
+                find_interface_in_tree(&path, current_file, interface_name, depth + 1)
+            {
                 return Some(found);
             }
             continue;
