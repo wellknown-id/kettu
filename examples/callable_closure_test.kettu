@@ -1,0 +1,29 @@
+// Test callable closures with captures
+package example:callable-closure-tests;
+
+interface callable-closure-tests {
+    @test
+    test-capture-simple: func() -> bool {
+        let x = 10;
+        let add-x = |n| n + x;
+        add-x(5) == 15;
+    }
+    
+    @test
+    test-multiple-captures: func() -> bool {
+        let a = 10;
+        let b = 20;
+        let sum-with-ab = |n| n + a + b;
+        sum-with-ab(5) == 35;
+    }
+    
+    @test
+    test-no-captures: func() -> bool {
+        let double = |n| n * 2;
+        double(7) == 14;
+    }
+}
+
+world tests {
+    export callable-closure-tests;
+}

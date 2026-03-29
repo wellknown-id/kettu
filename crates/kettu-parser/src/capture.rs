@@ -16,14 +16,14 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
             captures,
             ..
         } => {
-            // Build scope for lambda body: outer scope + params
-            let mut inner_scope: HashSet<String> = scope.clone();
+            // Captures are free variables relative to the lambda's own bindings.
+            let mut lambda_scope: HashSet<String> = HashSet::new();
             for param in params.iter() {
-                inner_scope.insert(param.name.clone());
+                lambda_scope.insert(param.name.clone());
             }
 
             // Find free variables in body
-            let free_vars = find_free_variables(body, &inner_scope);
+            let free_vars = find_free_variables(body, &lambda_scope);
 
             // Populate captures with variables that are in outer scope
             *captures = free_vars
@@ -36,6 +36,8 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
                 .collect();
 
             // Recursively analyze nested lambdas
+            let mut inner_scope: HashSet<String> = scope.clone();
+            inner_scope.extend(lambda_scope);
             analyze_captures(body, &inner_scope);
         }
         Expr::Binary { lhs, rhs, .. } => {
@@ -78,25 +80,24 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
         } => {
             analyze_captures(scrutinee, scope);
             let mut arm_scope = scope.clone();
+            let mut bindings = HashSet::new();
+            let mut inserted = Vec::new();
             for arm in arms {
-                // Patterns may bind new variables
-                let binding = get_pattern_binding(&arm.pattern);
+                bindings.clear();
+                inserted.clear();
 
-                let was_present = if let Some(ref name) = binding {
-                    !arm_scope.insert(name.clone())
-                } else {
-                    false
-                };
-
+                collect_pattern_bindings(&arm.pattern, &mut bindings);
+                for name in &bindings {
+                    if !arm_scope.contains(name) {
+                        arm_scope.insert(name.clone());
+                        inserted.push(name.clone());
+                    }
+                }
                 for stmt in &mut arm.body {
                     analyze_statement(stmt, &arm_scope);
                 }
-
-                // Cleanup scope for next arm
-                if let Some(ref name) = binding {
-                    if !was_present {
-                        arm_scope.remove(name);
-                    }
+                for name in &inserted {
+                    arm_scope.remove(name);
                 }
             }
         }
@@ -186,7 +187,11 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
                 }
             }
         }
-        Expr::Assert(e, _) | Expr::Not(e, _) | Expr::StrLen(e, _) | Expr::ListLen(e, _) => {
+        Expr::Assert(e, _)
+        | Expr::Not(e, _)
+        | Expr::Neg(e, _)
+        | Expr::StrLen(e, _)
+        | Expr::ListLen(e, _) => {
             analyze_captures(e, scope);
         }
         Expr::StrEq(a, b, _) => {
@@ -210,6 +215,64 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
         Expr::Await { expr, .. } => {
             analyze_captures(expr, scope);
         }
+        Expr::AtomicLoad { addr, .. } => {
+            analyze_captures(addr, scope);
+        }
+        Expr::AtomicStore { addr, value, .. }
+        | Expr::AtomicAdd { addr, value, .. }
+        | Expr::AtomicSub { addr, value, .. }
+        | Expr::AtomicNotify {
+            addr, count: value, ..
+        } => {
+            analyze_captures(addr, scope);
+            analyze_captures(value, scope);
+        }
+        Expr::AtomicCmpxchg {
+            addr,
+            expected,
+            replacement,
+            ..
+        } => {
+            analyze_captures(addr, scope);
+            analyze_captures(expected, scope);
+            analyze_captures(replacement, scope);
+        }
+        Expr::AtomicWait {
+            addr,
+            expected,
+            timeout,
+            ..
+        } => {
+            analyze_captures(addr, scope);
+            analyze_captures(expected, scope);
+            analyze_captures(timeout, scope);
+        }
+        Expr::Spawn { body, .. } => {
+            for stmt in body {
+                analyze_statement(stmt, scope);
+            }
+        }
+        Expr::ThreadJoin { tid, .. } => {
+            analyze_captures(tid, scope);
+        }
+        Expr::AtomicBlock { body, .. } => {
+            for stmt in body {
+                analyze_statement(stmt, scope);
+            }
+        }
+        Expr::SimdOp { args, .. } => {
+            for arg in args {
+                analyze_captures(arg, scope);
+            }
+        }
+        Expr::SimdForEach {
+            collection, body, ..
+        } => {
+            analyze_captures(collection, scope);
+            for stmt in body {
+                analyze_statement(stmt, scope);
+            }
+        }
         // Terminals - no recursion needed
         Expr::Integer(_, _) | Expr::Bool(_, _) | Expr::String(_, _) | Expr::Ident(_) => {}
     }
@@ -220,12 +283,31 @@ fn analyze_statement(stmt: &mut Statement, scope: &HashSet<String>) {
         Statement::Expr(e) => analyze_captures(e, scope),
         Statement::Let { value, .. } => analyze_captures(value, scope),
         Statement::Assign { value, .. } => analyze_captures(value, scope),
+        Statement::CompoundAssign { value, .. } => analyze_captures(value, scope),
         Statement::Return(Some(e)) => analyze_captures(e, scope),
         Statement::Return(None) => {}
         Statement::Break { condition: Some(e) } => analyze_captures(e, scope),
         Statement::Break { condition: None } => {}
         Statement::Continue { condition: Some(e) } => analyze_captures(e, scope),
         Statement::Continue { condition: None } => {}
+        Statement::SharedLet { initial_value, .. } => analyze_captures(initial_value, scope),
+        Statement::GuardLet {
+            value, else_body, ..
+        } => {
+            analyze_captures(value, scope);
+            for stmt in else_body {
+                analyze_statement(stmt, scope);
+            }
+        }
+        Statement::Guard {
+            condition,
+            else_body,
+        } => {
+            analyze_captures(condition, scope);
+            for stmt in else_body {
+                analyze_statement(stmt, scope);
+            }
+        }
     }
 }
 
@@ -291,23 +373,24 @@ fn collect_free_variables(expr: &Expr, bound: &HashSet<String>, free: &mut HashS
         } => {
             collect_free_variables(scrutinee, bound, free);
             let mut arm_bound = bound.clone();
+            let mut bindings = HashSet::new();
+            let mut inserted = Vec::new();
             for arm in arms {
-                let binding = get_pattern_binding(&arm.pattern);
+                bindings.clear();
+                inserted.clear();
 
-                let was_present = if let Some(ref name) = binding {
-                    !arm_bound.insert(name.clone())
-                } else {
-                    false
-                };
-
+                collect_pattern_bindings(&arm.pattern, &mut bindings);
+                for name in &bindings {
+                    if !arm_bound.contains(name) {
+                        arm_bound.insert(name.clone());
+                        inserted.push(name.clone());
+                    }
+                }
                 for stmt in &arm.body {
                     collect_free_in_statement(stmt, &arm_bound, free);
                 }
-
-                if let Some(ref name) = binding {
-                    if !was_present {
-                        arm_bound.remove(name);
-                    }
+                for name in &inserted {
+                    arm_bound.remove(name);
                 }
             }
         }
@@ -397,7 +480,11 @@ fn collect_free_variables(expr: &Expr, bound: &HashSet<String>, free: &mut HashS
                 }
             }
         }
-        Expr::Assert(e, _) | Expr::Not(e, _) | Expr::StrLen(e, _) | Expr::ListLen(e, _) => {
+        Expr::Assert(e, _)
+        | Expr::Not(e, _)
+        | Expr::Neg(e, _)
+        | Expr::StrLen(e, _)
+        | Expr::ListLen(e, _) => {
             collect_free_variables(e, bound, free);
         }
         Expr::StrEq(a, b, _) => {
@@ -421,6 +508,64 @@ fn collect_free_variables(expr: &Expr, bound: &HashSet<String>, free: &mut HashS
         Expr::Await { expr, .. } => {
             collect_free_variables(expr, bound, free);
         }
+        Expr::AtomicLoad { addr, .. } => {
+            collect_free_variables(addr, bound, free);
+        }
+        Expr::AtomicStore { addr, value, .. }
+        | Expr::AtomicAdd { addr, value, .. }
+        | Expr::AtomicSub { addr, value, .. }
+        | Expr::AtomicNotify {
+            addr, count: value, ..
+        } => {
+            collect_free_variables(addr, bound, free);
+            collect_free_variables(value, bound, free);
+        }
+        Expr::AtomicCmpxchg {
+            addr,
+            expected,
+            replacement,
+            ..
+        } => {
+            collect_free_variables(addr, bound, free);
+            collect_free_variables(expected, bound, free);
+            collect_free_variables(replacement, bound, free);
+        }
+        Expr::AtomicWait {
+            addr,
+            expected,
+            timeout,
+            ..
+        } => {
+            collect_free_variables(addr, bound, free);
+            collect_free_variables(expected, bound, free);
+            collect_free_variables(timeout, bound, free);
+        }
+        Expr::Spawn { body, .. } => {
+            for stmt in body {
+                collect_free_in_statement(stmt, bound, free);
+            }
+        }
+        Expr::ThreadJoin { tid, .. } => {
+            collect_free_variables(tid, bound, free);
+        }
+        Expr::AtomicBlock { body, .. } => {
+            for stmt in body {
+                collect_free_in_statement(stmt, bound, free);
+            }
+        }
+        Expr::SimdOp { args, .. } => {
+            for arg in args {
+                collect_free_variables(arg, bound, free);
+            }
+        }
+        Expr::SimdForEach {
+            collection, body, ..
+        } => {
+            collect_free_variables(collection, bound, free);
+            for stmt in body {
+                collect_free_in_statement(stmt, bound, free);
+            }
+        }
         // Terminals
         Expr::Integer(_, _) | Expr::Bool(_, _) | Expr::String(_, _) => {}
     }
@@ -435,20 +580,45 @@ fn collect_free_in_statement(
         Statement::Expr(e) => collect_free_variables(e, bound, free),
         Statement::Let { value, .. } => collect_free_variables(value, bound, free),
         Statement::Assign { value, .. } => collect_free_variables(value, bound, free),
+        Statement::CompoundAssign { value, .. } => collect_free_variables(value, bound, free),
         Statement::Return(Some(e)) => collect_free_variables(e, bound, free),
         Statement::Return(None) => {}
         Statement::Break { condition: Some(e) } => collect_free_variables(e, bound, free),
         Statement::Break { condition: None } => {}
         Statement::Continue { condition: Some(e) } => collect_free_variables(e, bound, free),
         Statement::Continue { condition: None } => {}
+        Statement::SharedLet { initial_value, .. } => {
+            collect_free_variables(initial_value, bound, free)
+        }
+        Statement::GuardLet {
+            value, else_body, ..
+        } => {
+            collect_free_variables(value, bound, free);
+            for stmt in else_body {
+                collect_free_in_statement(stmt, bound, free);
+            }
+        }
+        Statement::Guard {
+            condition,
+            else_body,
+        } => {
+            collect_free_variables(condition, bound, free);
+            for stmt in else_body {
+                collect_free_in_statement(stmt, bound, free);
+            }
+        }
     }
 }
 
-fn get_pattern_binding(pattern: &Pattern) -> Option<String> {
+fn collect_pattern_bindings(pattern: &Pattern, bindings: &mut HashSet<String>) {
     match pattern {
-        Pattern::Variant { binding, .. } => binding.as_ref().map(|id| id.name.clone()),
-        Pattern::Wildcard(_) => None,
-        Pattern::Literal(_) => None,
+        Pattern::Variant { binding, .. } => {
+            if let Some(id) = binding {
+                bindings.insert(id.name.clone());
+            }
+        }
+        Pattern::Wildcard(_) => {}
+        Pattern::Literal(_) => {}
     }
 }
 
@@ -475,5 +645,43 @@ mod tests {
         bound_with_x.insert("x".to_string());
         let free = find_free_variables(&expr, &bound_with_x);
         assert!(!free.contains("x"));
+    }
+
+    #[test]
+    fn test_analyze_captures_tracks_outer_bindings() {
+        let mut lambda = Expr::Lambda {
+            params: vec![Id {
+                name: "n".to_string(),
+                span: 0..1,
+            }],
+            body: Box::new(Expr::Binary {
+                lhs: Box::new(Expr::Ident(Id {
+                    name: "n".to_string(),
+                    span: 0..1,
+                })),
+                op: crate::ast::BinOp::Add,
+                rhs: Box::new(Expr::Ident(Id {
+                    name: "x".to_string(),
+                    span: 4..5,
+                })),
+                span: 0..5,
+            }),
+            captures: vec![],
+            span: 0..5,
+        };
+
+        let scope = HashSet::from(["x".to_string()]);
+        analyze_captures(&mut lambda, &scope);
+
+        let Expr::Lambda { captures, .. } = lambda else {
+            panic!("expected lambda");
+        };
+        assert_eq!(
+            captures
+                .iter()
+                .map(|capture| capture.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x"]
+        );
     }
 }

@@ -1,18 +1,116 @@
 {
     "name": "kettu",
     "displayName": "Kettu",
-    "description": "Language support for Kettu (.kettu) and WIT (.wit) files",
+    "description": "Kettu language support — LSP diagnostics, syntax highlighting, and MCP tools for AI chat",
     "version": "0.1.0",
     "publisher": "kettu",
     "engines": {
-        "vscode": "^1.75.0"
+        "vscode": "^1.99.0"
     },
     "categories": [
-        "Programming Languages"
+        "Programming Languages",
+        "AI",
+        "Chat"
     ],
-    "activationEvents": [],
+    "activationEvents": [
+        "onStartupFinished",
+        "onDebugResolve:kettu",
+        "onDebugInitialConfigurations",
+        "onCommand:kettu.debugCurrentFileTests"
+    ],
     "main": "./extension.js",
     "contributes": {
+        "commands": [
+            {
+                "command": "kettu.debugCurrentFileTests",
+                "title": "Kettu: Debug Tests in Current File",
+                "category": "Kettu",
+                "icon": {
+                    "light": "./icons/kettu-file.svg",
+                    "dark": "./icons/kettu-file.svg"
+                }
+            }
+        ],
+        "menus": {
+            "editor/title": [
+                {
+                    "command": "kettu.debugCurrentFileTests",
+                    "when": "resourceLangId == kettu",
+                    "group": "navigation@9"
+                }
+            ]
+        },
+        "breakpoints": [
+            {
+                "language": "kettu"
+            }
+        ],
+        "debuggers": [
+            {
+                "type": "kettu",
+                "label": "Kettu",
+                "languages": [
+                    "kettu"
+                ],
+                "configurationAttributes": {
+                    "launch": {
+                        "required": [
+                            "program"
+                        ],
+                        "properties": {
+                            "program": {
+                                "type": "string",
+                                "description": "Absolute path to the .kettu file containing tests to debug"
+                            },
+                            "cwd": {
+                                "type": "string",
+                                "description": "Working directory for running tests"
+                            },
+                            "stopOnEntry": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Stop before the first test executes"
+                            },
+                            "enableEvaluate": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Enable simple expression evaluation in the debugger"
+                            },
+                            "kettuPath": {
+                                "type": "string",
+                                "description": "Path to kettu binary. Defaults to kettu.serverPath resolution"
+                            }
+                        }
+                    }
+                },
+                "initialConfigurations": [
+                    {
+                        "name": "Debug Kettu tests (current file)",
+                        "type": "kettu",
+                        "request": "launch",
+                        "program": "${file}",
+                        "cwd": "${workspaceFolder}",
+                        "stopOnEntry": false,
+                        "enableEvaluate": false
+                    }
+                ],
+                "configurationSnippets": [
+                    {
+                        "label": "Kettu: Debug tests in current file",
+                        "description": "Run Kettu tests in debug mode and stop on Kettu breakpoints",
+                        "body": {
+                            "name": "Debug Kettu tests (current file)",
+                            "type": "kettu",
+                            "request": "launch",
+                            "program": "${file}",
+                            "cwd": "${workspaceFolder}",
+                            "stopOnEntry": false,
+                            "enableEvaluate": false
+                        }
+                    }
+                ]
+            }
+        ],
         "languages": [
             {
                 "id": "kettu",
@@ -41,13 +139,120 @@
                 "language": "wit",
                 "scopeName": "source.wit",
                 "path": "./syntaxes/wit.tmLanguage.json"
+            },
+            {
+                "scopeName": "markdown.kettu.codeblock",
+                "path": "./syntaxes/kettu-markdown-injection.json",
+                "injectTo": ["text.html.markdown"],
+                "embeddedLanguages": {
+                    "meta.embedded.block.kettu": "kettu"
+                }
+            },
+            {
+                "scopeName": "markdown.wit.codeblock",
+                "path": "./syntaxes/wit-markdown-injection.json",
+                "injectTo": ["text.html.markdown"],
+                "embeddedLanguages": {
+                    "meta.embedded.block.wit": "wit"
+                }
             }
+        ],
+        "markdown.previewScripts": [
+            "./preview/kettu-preview.js",
+            "./preview/wit-preview.js"
+        ],
+        "markdown.previewStyles": [
+            "./preview/kettu-preview.css",
+            "./preview/wit-preview.css"
         ],
         "iconThemes": [
             {
                 "id": "kettu-icons",
                 "label": "Kettu Icons",
                 "path": "./kettu-icon-theme.json"
+            }
+        ],
+        "mcpServerDefinitionProviders": [
+            {
+                "id": "kettuMcpProvider",
+                "label": "Kettu MCP Server"
+            }
+        ],
+        "languageModelTools": [
+            {
+                "name": "kettu-check",
+                "displayName": "Kettu Check",
+                "modelDescription": "Type-check Kettu/WIT source code",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "Kettu source code to check"
+                        }
+                    },
+                    "required": ["source"]
+                }
+            },
+            {
+                "name": "kettu-docs-search",
+                "displayName": "Kettu Docs Search",
+                "modelDescription": "Search the Kettu language guide by keyword",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query (e.g. 'lists', 'async', 'pattern matching')"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "kettu-parse",
+                "displayName": "Kettu Parse",
+                "modelDescription": "Parse Kettu/WIT source code and summarize the AST structure",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "Kettu source code to parse"
+                        }
+                    },
+                    "required": ["source"]
+                }
+            },
+            {
+                "name": "kettu-docs-read",
+                "displayName": "Kettu Docs Read",
+                "modelDescription": "Read a specific topic from the Kettu language guide",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "description": "Topic number (e.g. '1.2' for Data Types)"
+                        }
+                    },
+                    "required": ["topic"]
+                }
+            },
+            {
+                "name": "kettu-emit-wit",
+                "displayName": "Kettu Emit WIT",
+                "modelDescription": "Strip Kettu extensions and emit pure WIT",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "Kettu source code to convert to WIT"
+                        }
+                    },
+                    "required": ["source"]
+                }
             }
         ],
         "configuration": {
@@ -63,11 +268,11 @@
         }
     },
     "scripts": {
-        "vscode:prepublish": "echo 'Ready to publish'",
-        "test": "node ./tests/textmate-regex-tests.js"
+        "vscode:prepublish": "node -e \"try{require('fs').chmodSync('./bin/kettu',0o755)}catch(e){}\"",
+        "test": "node ./tests/textmate-regex-tests.js && node ./tests/debug-manifest-tests.js"
     },
     "devDependencies": {
-        "@types/vscode": "^1.75.0",
+        "@types/vscode": "^1.99.0",
         "vscode-languageclient": "^9.0.1"
     },
     "dependencies": {

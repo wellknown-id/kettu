@@ -1,6 +1,7 @@
 const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
+const cp = require('child_process');
 const { LanguageClient, TransportKind } = require('vscode-languageclient/node');
 
 let client;
@@ -20,7 +21,15 @@ function findServerPath(extensionPath) {
         return configPath;
     }
 
-    // 2. Try relative to extension (for development - extension is in editors/vscode)
+    // 2. Try bundled binary (platform-specific VSIX contains just bin/kettu)
+    const bundledBinary = process.platform === 'win32' ? 'kettu.exe' : 'kettu';
+    const bundledPath = path.join(extensionPath, 'bin', bundledBinary);
+    if (fs.existsSync(bundledPath)) {
+        console.log(`Kettu LSP: found bundled binary at ${bundledPath}`);
+        return bundledPath;
+    }
+
+    // 3. Try relative to extension (for development - extension is in editors/vscode)
     const kettuRoot = path.resolve(extensionPath, '..', '..');
     const debugFromExt = path.join(kettuRoot, 'target', 'debug', 'kettu');
     const releaseFromExt = path.join(kettuRoot, 'target', 'release', 'kettu');
@@ -35,8 +44,9 @@ function findServerPath(extensionPath) {
         return releaseFromExt;
     }
 
-    // 2b. Try workspace root (for cargo workspace builds - binary is in root target/)
-    const workspaceRoot = path.resolve(extensionPath, '..', '..', '..');
+    // 3b. Try workspace root (for cargo workspace builds - binary is in root target/)
+    // Extension is at crates/kettu-cli/editors/vscode — 4 levels up to repo root
+    const workspaceRoot = path.resolve(extensionPath, '..', '..', '..', '..');
     const debugFromRoot = path.join(workspaceRoot, 'target', 'debug', 'kettu');
     const releaseFromRoot = path.join(workspaceRoot, 'target', 'release', 'kettu');
 
@@ -76,6 +86,14 @@ function activate(context) {
     const serverPath = findServerPath(context.extensionPath);
 
     console.log(`Kettu LSP: using server at ${serverPath}`);
+
+    // Add kettu binary directory to integrated terminal PATH via env contribution
+    const binDir = path.dirname(path.resolve(serverPath));
+    if (binDir && binDir !== '.') {
+        const envCollection = context.environmentVariableCollection;
+        envCollection.prepend('PATH', binDir + path.delimiter);
+        envCollection.description = 'Adds the Kettu compiler to PATH';
+    }
 
     // Gutter decorations for test pass/fail
     passDecorationType = vscode.window.createTextEditorDecorationType({
@@ -143,6 +161,128 @@ function activate(context) {
             `Build with 'cargo build --bin kettu' or set 'kettu.serverPath'.`
         );
     });
+
+    const debugConfigProvider = new KettuDebugConfigurationProvider(serverPath);
+    const debugAdapterFactory = new KettuDebugAdapterFactory(serverPath);
+    context.subscriptions.push(
+        vscode.debug.registerDebugConfigurationProvider('kettu', debugConfigProvider)
+    );
+    context.subscriptions.push(
+        vscode.debug.registerDebugAdapterDescriptorFactory('kettu', debugAdapterFactory)
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('kettu.debugCurrentFileTests', async () => {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor || editor.document.languageId !== 'kettu') {
+                vscode.window.showErrorMessage('Open a .kettu file to debug tests.');
+                return;
+            }
+
+            const program = editor.document.uri.fsPath;
+            const folder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
+            const cwd = folder ? folder.uri.fsPath : path.dirname(program);
+
+            const config = {
+                type: 'kettu',
+                request: 'launch',
+                name: 'Debug Kettu Tests',
+                program,
+                cwd,
+                stopOnEntry: false,
+                enableEvaluate: false,
+                kettuPath: serverPath,
+            };
+
+            const ok = await vscode.debug.startDebugging(folder, config);
+            if (!ok) {
+                vscode.window.showErrorMessage('Failed to start Kettu debug session.');
+            }
+        })
+    );
+
+    // ─── MCP Tool Implementations (CoPilot Chat tools) ──────────────────
+    // These invoke `kettu mcp` via JSON-RPC tools/call over stdio.
+
+    function registerMcpTool(toolName) {
+        return vscode.lm.registerTool(`kettu-${toolName}`, {
+            async invoke(options, _token) {
+                const result = await callMcpTool(serverPath, toolName, options.input);
+                return new vscode.LanguageModelToolResult([
+                    new vscode.LanguageModelTextPart(result),
+                ]);
+            },
+        });
+    }
+
+    context.subscriptions.push(registerMcpTool('check'));
+    context.subscriptions.push(registerMcpTool('parse'));
+    context.subscriptions.push(registerMcpTool('docs-search'));
+    context.subscriptions.push(registerMcpTool('docs-read'));
+    context.subscriptions.push(registerMcpTool('emit-wit'));
+
+    // ─── MCP Server Definition Provider (CoPilot Agent Mode) ────────────
+    // This makes "kettu mcp" appear in the MCP server list.
+
+    const didChangeEmitter = new vscode.EventEmitter();
+    context.subscriptions.push(
+        vscode.lm.registerMcpServerDefinitionProvider('kettuMcpProvider', {
+            onDidChangeMcpServerDefinitions: didChangeEmitter.event,
+            provideMcpServerDefinitions: async () => {
+                return [
+                    new vscode.McpStdioServerDefinition(
+                        'Kettu',
+                        serverPath,
+                        ['mcp'],
+                    ),
+                ];
+            },
+            resolveMcpServerDefinition: async (server) => server,
+        })
+    );
+}
+
+class KettuDebugConfigurationProvider {
+    constructor(defaultKettuPath) {
+        this.defaultKettuPath = defaultKettuPath;
+    }
+
+    resolveDebugConfiguration(_folder, config) {
+        if (!config.type) {
+            config.type = 'kettu';
+        }
+        if (!config.request) {
+            config.request = 'launch';
+        }
+
+        if (!config.program) {
+            const editor = vscode.window.activeTextEditor;
+            if (editor && editor.document.languageId === 'kettu') {
+                config.program = editor.document.uri.fsPath;
+            }
+        }
+
+        if (!config.program) {
+            vscode.window.showErrorMessage('Kettu debug: set a .kettu file in launch.json "program".');
+            return undefined;
+        }
+
+        config.cwd = config.cwd || path.dirname(config.program);
+        config.kettuPath = config.kettuPath || this.defaultKettuPath;
+        config.stopOnEntry = !!config.stopOnEntry;
+        config.enableEvaluate = !!config.enableEvaluate;
+        return config;
+    }
+}
+
+class KettuDebugAdapterFactory {
+    constructor(defaultKettuPath) {
+        this.defaultKettuPath = defaultKettuPath;
+    }
+
+    createDebugAdapterDescriptor(_session) {
+        return new vscode.DebugAdapterExecutable(this.defaultKettuPath, ['dap']);
+    }
 }
 
 /**
@@ -200,6 +340,50 @@ function applyCoverageDecorations(uriString, coverage) {
     editor.setDecorations(coverageFullDecorationType, full);
     editor.setDecorations(coveragePartialDecorationType, partial);
     editor.setDecorations(coverageNoneDecorationType, none);
+}
+
+/**
+ * Call a single MCP tool by spawning `kettu mcp`, sending a JSON-RPC
+ * tools/call request, and reading the response.
+ */
+function callMcpTool(kettuPath, toolName, args) {
+    return new Promise((resolve, reject) => {
+        const child = cp.spawn(kettuPath, ['mcp'], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+        const request = JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'tools/call',
+            params: { name: toolName, arguments: args },
+        });
+
+        let stdout = '';
+        child.stdout.on('data', (data) => {
+            stdout += data.toString();
+        });
+
+        child.on('close', () => {
+            try {
+                const response = JSON.parse(stdout.trim());
+                if (response.result?.content?.[0]?.text) {
+                    resolve(response.result.content[0].text);
+                } else if (response.error) {
+                    reject(new Error(response.error.message));
+                } else {
+                    resolve(stdout.trim());
+                }
+            } catch {
+                reject(new Error(`Failed to parse MCP response: ${stdout}`));
+            }
+        });
+
+        child.on('error', (err) => {
+            reject(new Error(`Failed to spawn kettu mcp: ${err.message}`));
+        });
+
+        child.stdin.write(request + '\n');
+        child.stdin.end();
+    });
 }
 
 function deactivate() {

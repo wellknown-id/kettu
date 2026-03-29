@@ -646,4 +646,530 @@ mod tests {
         eprintln!("Parse errors: {:?}", result.errors);
         eprintln!("Parse result is_some: {}", result.result.is_some());
     }
+
+    // ================================================================
+    // Phase 13e: Ergonomic atomics parsing
+    // ================================================================
+
+    #[test]
+    fn test_shared_let_statement_parse() {
+        let src = "interface i {\n  f: func() {\n    shared let counter = 0;\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected Interface"),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!("expected Func"),
+        };
+        let body = func.body.as_ref().expect("should have body");
+        match &body.statements[0] {
+            crate::ast::Statement::SharedLet {
+                name,
+                initial_value,
+            } => {
+                assert_eq!(name.name, "counter");
+                assert!(matches!(initial_value, crate::ast::Expr::Integer(0, _)));
+            }
+            other => panic!("expected SharedLet, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_atomic_block_expression_parse() {
+        let src = "interface i {\n  f: func() {\n    atomic {\n      42;\n    };\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected Interface"),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!("expected Func"),
+        };
+        let body = func.body.as_ref().expect("should have body");
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::AtomicBlock { body, .. }) => {
+                assert!(
+                    !body.is_empty(),
+                    "atomic block should have at least one statement"
+                );
+            }
+            other => panic!("expected AtomicBlock expression, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_shared_let_complex_initializer() {
+        let src = "interface i {\n  f: func() {\n    shared let x = 1 + 2;\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::SharedLet {
+                name,
+                initial_value,
+            } => {
+                assert_eq!(name.name, "x");
+                assert!(matches!(initial_value, crate::ast::Expr::Binary { .. }));
+            }
+            _ => panic!("expected SharedLet with binary expression"),
+        }
+    }
+
+    #[test]
+    fn test_atomic_block_multi_statement() {
+        let src = "interface i {\n  f: func() {\n    atomic {\n      let x = 1;\n      x + 1;\n    };\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::AtomicBlock { body, .. }) => {
+                assert_eq!(body.len(), 2, "atomic block should have 2 statements");
+            }
+            other => panic!("expected AtomicBlock, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_shared_let_and_atomic_block_together() {
+        let src = "interface i {\n  f: func() {\n    shared let counter = 0;\n    atomic {\n      counter + 1;\n    };\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        assert_eq!(body.statements.len(), 2);
+        assert!(matches!(
+            &body.statements[0],
+            crate::ast::Statement::SharedLet { .. }
+        ));
+        assert!(matches!(
+            &body.statements[1],
+            crate::ast::Statement::Expr(crate::ast::Expr::AtomicBlock { .. })
+        ));
+    }
+
+    // ================================================================
+    // Phase 13f: Thread join parsing
+    // ================================================================
+
+    #[test]
+    fn test_thread_join_parse() {
+        let src = "interface i {\n  f: func() {\n    let tid = spawn { 1; };\n    thread.join(tid);\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected Interface"),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!("expected Func"),
+        };
+        let body = func.body.as_ref().expect("should have body");
+        assert_eq!(body.statements.len(), 2);
+        match &body.statements[1] {
+            crate::ast::Statement::Expr(crate::ast::Expr::ThreadJoin { .. }) => {}
+            other => panic!("expected ThreadJoin, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_thread_join_standalone() {
+        let src = "interface i {\n  f: func() {\n    let tid = spawn { 42; };\n    let result = thread.join(tid);\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[1] {
+            crate::ast::Statement::Let { name, value } => {
+                assert_eq!(name.name, "result");
+                assert!(matches!(value, crate::ast::Expr::ThreadJoin { .. }));
+            }
+            _ => panic!("expected let binding with thread.join"),
+        }
+    }
+
+    // ================================================================
+    // Phase 13g: Compound assignments and atomic desugaring
+    // ================================================================
+
+    #[test]
+    fn test_compound_assign_add_parse() {
+        let src = "interface i {\n  f: func() {\n    let x = 0;\n    x += 1;\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[1] {
+            crate::ast::Statement::CompoundAssign { name, op, .. } => {
+                assert_eq!(name.name, "x");
+                assert_eq!(*op, crate::ast::BinOp::Add);
+            }
+            other => panic!("expected CompoundAssign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_compound_assign_sub_parse() {
+        let src = "interface i {\n  f: func() {\n    let x = 10;\n    x -= 3;\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[1] {
+            crate::ast::Statement::CompoundAssign { name, op, .. } => {
+                assert_eq!(name.name, "x");
+                assert_eq!(*op, crate::ast::BinOp::Sub);
+            }
+            other => panic!("expected CompoundAssign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_atomic_block_with_compound_assign() {
+        let src = "interface i {\n  f: func() {\n    shared let counter = 0;\n    atomic { counter += 1; };\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[1] {
+            crate::ast::Statement::Expr(crate::ast::Expr::AtomicBlock { body, .. }) => {
+                assert_eq!(body.len(), 1);
+                assert!(matches!(
+                    &body[0],
+                    crate::ast::Statement::CompoundAssign { .. }
+                ));
+            }
+            other => panic!("expected AtomicBlock with CompoundAssign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_guard_statement_parse() {
+        let src = "interface i {\n  f: func() -> s32 {\n    guard true else {\n      return 0;\n    };\n    42;\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected Interface"),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!("expected Func"),
+        };
+        let body = func.body.as_ref().expect("should have body");
+        match &body.statements[0] {
+            crate::ast::Statement::Guard {
+                condition,
+                else_body,
+            } => {
+                assert!(matches!(
+                    condition.as_ref(),
+                    crate::ast::Expr::Bool(true, _)
+                ));
+                assert_eq!(else_body.len(), 1);
+                assert!(matches!(
+                    &else_body[0],
+                    crate::ast::Statement::Return(Some(crate::ast::Expr::Integer(0, _)))
+                ));
+            }
+            other => panic!("expected Guard, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_guard_statement_with_multiple_else_statements() {
+        let src = "interface i {\n  f: func(flag: bool) -> s32 {\n    guard flag else {\n      let fallback = 7;\n      return fallback;\n    };\n    1;\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected Interface"),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!("expected Func"),
+        };
+        let body = func.body.as_ref().expect("should have body");
+        match &body.statements[0] {
+            crate::ast::Statement::Guard { else_body, .. } => {
+                assert_eq!(else_body.len(), 2);
+                assert!(matches!(&else_body[0], crate::ast::Statement::Let { .. }));
+                assert!(matches!(
+                    &else_body[1],
+                    crate::ast::Statement::Return(Some(_))
+                ));
+            }
+            other => panic!("expected Guard, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_guard_let_statement_parse() {
+        let src = "interface i {\n  f: func(maybe: option<s32>) -> s32 {\n    guard let value = maybe else {\n      return 0;\n    };\n    value;\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected Interface"),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!("expected Func"),
+        };
+        let body = func.body.as_ref().expect("should have body");
+        match &body.statements[0] {
+            crate::ast::Statement::GuardLet {
+                name,
+                value,
+                else_body,
+            } => {
+                assert_eq!(name.name, "value");
+                assert!(matches!(value, crate::ast::Expr::Ident(id) if id.name == "maybe"));
+                assert_eq!(else_body.len(), 1);
+                assert!(matches!(
+                    &else_body[0],
+                    crate::ast::Statement::Return(Some(crate::ast::Expr::Integer(0, _)))
+                ));
+            }
+            other => panic!("expected GuardLet, got {:?}", other),
+        }
+        assert!(matches!(
+            &body.statements[1],
+            crate::ast::Statement::Expr(crate::ast::Expr::Ident(id)) if id.name == "value"
+        ));
+    }
+
+    #[test]
+    fn test_simd_splat_parse() {
+        let src = "interface i {\n  f: func() {\n    i32x4.splat(42);\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdOp {
+                lane,
+                op,
+                args,
+                lane_idx,
+                ..
+            }) => {
+                assert!(matches!(lane, crate::ast::SimdLane::I32x4));
+                assert!(matches!(op, crate::ast::SimdOp::Splat));
+                assert_eq!(args.len(), 1);
+                assert!(lane_idx.is_none());
+            }
+            other => panic!("expected SimdOp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_simd_add_parse() {
+        let src = "interface i {\n  f: func() {\n    i32x4.add(a, b);\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdOp { lane, op, args, .. }) => {
+                assert!(matches!(lane, crate::ast::SimdLane::I32x4));
+                assert!(matches!(op, crate::ast::SimdOp::Add));
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected SimdOp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_simd_extract_lane_parse() {
+        let src = "interface i {\n  f: func() {\n    i32x4.extract_lane(v, 2);\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdOp {
+                lane,
+                op,
+                lane_idx,
+                args,
+                ..
+            }) => {
+                assert!(matches!(lane, crate::ast::SimdLane::I32x4));
+                assert!(matches!(op, crate::ast::SimdOp::ExtractLane));
+                assert_eq!(*lane_idx, Some(2));
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected SimdOp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_simd_v128_bitwise_parse() {
+        let src = "interface i {\n  f: func() {\n    v128.and(a, b);\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdOp { lane, op, args, .. }) => {
+                assert!(matches!(lane, crate::ast::SimdLane::V128));
+                assert!(matches!(op, crate::ast::SimdOp::And));
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected SimdOp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_simd_f64x2_parse() {
+        let src = "interface i {\n  f: func() {\n    f64x2.mul(a, b);\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdOp { lane, op, args, .. }) => {
+                assert!(matches!(lane, crate::ast::SimdLane::F64x2));
+                assert!(matches!(op, crate::ast::SimdOp::Mul));
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected SimdOp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_simd_for_each_parse() {
+        let src = "interface i {\n  f: func() {\n    simd for v in list {\n      i32x4.add(v, i32x4.splat(1));\n    };\n  }\n}";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!(),
+        };
+        let func = match &iface.items[0] {
+            crate::ast::InterfaceItem::Func(f) => f,
+            _ => panic!(),
+        };
+        let body = func.body.as_ref().unwrap();
+        match &body.statements[0] {
+            crate::ast::Statement::Expr(crate::ast::Expr::SimdForEach {
+                variable, body, ..
+            }) => {
+                assert_eq!(variable.name, "v");
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("expected SimdForEach, got {:?}", other),
+        }
+    }
 }

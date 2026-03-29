@@ -513,11 +513,35 @@ fn stmt(cst: &grammar::Stmt) -> ast::Statement {
             name: spanned_id(&a.name),
             value: sexpr_flat(&a.value),
         },
+        grammar::Stmt::AddAssign(a) => ast::Statement::CompoundAssign {
+            name: spanned_id(&a.name),
+            op: ast::BinOp::Add,
+            value: sexpr_flat(&a.value),
+        },
+        grammar::Stmt::SubAssign(a) => ast::Statement::CompoundAssign {
+            name: spanned_id(&a.name),
+            op: ast::BinOp::Sub,
+            value: sexpr_flat(&a.value),
+        },
         grammar::Stmt::ReturnValue(r) => ast::Statement::Return(Some(sexpr_flat(&r.value))),
         grammar::Stmt::ReturnVoid(_) => ast::Statement::Return(None),
         grammar::Stmt::Break(_) => ast::Statement::Break { condition: None },
         grammar::Stmt::Continue(_) => ast::Statement::Continue { condition: None },
+        grammar::Stmt::GuardLet(g) => ast::Statement::GuardLet {
+            name: spanned_id(&g.name),
+            value: sexpr_flat(&g.value),
+            else_body: g.else_body.iter().map(stmt).collect(),
+        },
+        grammar::Stmt::Guard(g) => ast::Statement::Guard {
+            condition: Box::new(sexpr(&g.condition)),
+            else_body: g.else_body.iter().map(stmt).collect(),
+        },
         grammar::Stmt::Expr(e) => ast::Statement::Expr(sexpr_flat(&e.expr)),
+        grammar::Stmt::TailExpr(e) => ast::Statement::Expr(sexpr_flat(&e.expr)),
+        grammar::Stmt::SharedLet(s) => ast::Statement::SharedLet {
+            name: spanned_id(&s.name),
+            initial_value: sexpr_flat(&s.value),
+        },
     }
 }
 
@@ -536,13 +560,43 @@ fn expr_with_span(cst: &grammar::Expr, outer_span: Range<usize>) -> ast::Expr {
             } else {
                 lit
             };
-            ast::Expr::String(inner.to_string(), outer_span)
+            // Check for string interpolation: {identifier} patterns
+            if inner.contains('{') {
+                let mut parts = Vec::new();
+                let mut rest = inner;
+                while let Some(open) = rest.find('{') {
+                    if open > 0 {
+                        parts.push(ast::StringPart::Literal(rest[..open].to_string()));
+                    }
+                    let after_open = &rest[open + 1..];
+                    if let Some(close) = after_open.find('}') {
+                        let ident = after_open[..close].trim().to_string();
+                        parts.push(ast::StringPart::Expr(Box::new(ast::Expr::Ident(ast::Id {
+                            name: ident,
+                            span: outer_span.clone(),
+                        }))));
+                        rest = &after_open[close + 1..];
+                    } else {
+                        // No closing brace — treat rest as literal
+                        parts.push(ast::StringPart::Literal(rest[open..].to_string()));
+                        rest = "";
+                        break;
+                    }
+                }
+                if !rest.is_empty() {
+                    parts.push(ast::StringPart::Literal(rest.to_string()));
+                }
+                ast::Expr::InterpolatedString(parts, outer_span)
+            } else {
+                ast::Expr::String(inner.to_string(), outer_span)
+            }
         }
         grammar::Expr::True => ast::Expr::Bool(true, outer_span),
         grammar::Expr::False => ast::Expr::Bool(false, outer_span),
         grammar::Expr::Ident(name) => ast::Expr::Ident(spanned_id(name)),
         grammar::Expr::Parens(p) => sexpr(&p.inner),
         grammar::Expr::Not(_, e) => ast::Expr::Not(Box::new(sexpr(e)), outer_span),
+        grammar::Expr::Neg(_, e) => ast::Expr::Neg(Box::new(sexpr(e)), outer_span),
         grammar::Expr::Assert(_, e) => ast::Expr::Assert(Box::new(sexpr(e)), outer_span),
         grammar::Expr::Await(_, e) => ast::Expr::Await {
             expr: Box::new(sexpr(e)),
@@ -701,6 +755,12 @@ fn expr_with_span(cst: &grammar::Expr, outer_span: Range<usize>) -> ast::Expr {
             body: f.body.iter().map(stmt).collect(),
             span: outer_span,
         },
+        grammar::Expr::SimdForEach(f) => ast::Expr::SimdForEach {
+            variable: spanned_id(&f.variable),
+            collection: Box::new(sexpr(&f.collection)),
+            body: f.body.iter().map(stmt).collect(),
+            span: outer_span,
+        },
         grammar::Expr::Match(m) => ast::Expr::Match {
             scrutinee: Box::new(sexpr(&m.scrutinee)),
             arms: m.arms.iter().map(spanned_match_arm).collect(),
@@ -835,6 +895,205 @@ fn expr_with_span(cst: &grammar::Expr, outer_span: Range<usize>) -> ast::Expr {
             payload: Some(Box::new(sexpr(&e.value))),
             span: outer_span,
         },
+
+        // Atomic operations
+        grammar::Expr::AtomicLoad(a) => ast::Expr::AtomicLoad {
+            addr: Box::new(sexpr(&a.addr)),
+            span: outer_span,
+        },
+        grammar::Expr::AtomicStore(a) => ast::Expr::AtomicStore {
+            addr: Box::new(sexpr(&a.addr)),
+            value: Box::new(sexpr(&a.value)),
+            span: outer_span,
+        },
+        grammar::Expr::AtomicAdd(a) => ast::Expr::AtomicAdd {
+            addr: Box::new(sexpr(&a.addr)),
+            value: Box::new(sexpr(&a.value)),
+            span: outer_span,
+        },
+        grammar::Expr::AtomicSub(a) => ast::Expr::AtomicSub {
+            addr: Box::new(sexpr(&a.addr)),
+            value: Box::new(sexpr(&a.value)),
+            span: outer_span,
+        },
+        grammar::Expr::AtomicCmpxchg(a) => ast::Expr::AtomicCmpxchg {
+            addr: Box::new(sexpr(&a.addr)),
+            expected: Box::new(sexpr(&a.expected)),
+            replacement: Box::new(sexpr(&a.replacement)),
+            span: outer_span,
+        },
+        grammar::Expr::AtomicWait(a) => ast::Expr::AtomicWait {
+            addr: Box::new(sexpr(&a.addr)),
+            expected: Box::new(sexpr(&a.expected)),
+            timeout: Box::new(sexpr(&a.timeout)),
+            span: outer_span,
+        },
+        grammar::Expr::AtomicNotify(a) => ast::Expr::AtomicNotify {
+            addr: Box::new(sexpr(&a.addr)),
+            count: Box::new(sexpr(&a.count)),
+            span: outer_span,
+        },
+
+        // Thread spawning
+        grammar::Expr::Spawn(s) => ast::Expr::Spawn {
+            body: s.body.iter().map(spanned_stmt).collect(),
+            span: outer_span,
+        },
+
+        // Thread join
+        grammar::Expr::ThreadJoin(t) => ast::Expr::ThreadJoin {
+            tid: Box::new(sexpr(&t.tid)),
+            span: outer_span,
+        },
+
+        // Atomic block sugar
+        grammar::Expr::AtomicBlock(a) => ast::Expr::AtomicBlock {
+            body: a.body.iter().map(spanned_stmt).collect(),
+            span: outer_span,
+        },
+
+        // SIMD operations
+        grammar::Expr::SimdV128(s) => convert_simd_expr(
+            ast::SimdLane::V128,
+            s.op.value.as_str(),
+            &s.call_args.args,
+            outer_span,
+        ),
+        grammar::Expr::SimdI8x16(s) => convert_simd_expr(
+            ast::SimdLane::I8x16,
+            s.op.value.as_str(),
+            &s.call_args.args,
+            outer_span,
+        ),
+        grammar::Expr::SimdI16x8(s) => convert_simd_expr(
+            ast::SimdLane::I16x8,
+            s.op.value.as_str(),
+            &s.call_args.args,
+            outer_span,
+        ),
+        grammar::Expr::SimdI32x4(s) => convert_simd_expr(
+            ast::SimdLane::I32x4,
+            s.op.value.as_str(),
+            &s.call_args.args,
+            outer_span,
+        ),
+        grammar::Expr::SimdI64x2(s) => convert_simd_expr(
+            ast::SimdLane::I64x2,
+            s.op.value.as_str(),
+            &s.call_args.args,
+            outer_span,
+        ),
+        grammar::Expr::SimdF32x4(s) => convert_simd_expr(
+            ast::SimdLane::F32x4,
+            s.op.value.as_str(),
+            &s.call_args.args,
+            outer_span,
+        ),
+        grammar::Expr::SimdF64x2(s) => convert_simd_expr(
+            ast::SimdLane::F64x2,
+            s.op.value.as_str(),
+            &s.call_args.args,
+            outer_span,
+        ),
+    }
+}
+
+/// Convert a SIMD grammar expression to `Expr::SimdOp`
+fn convert_simd_expr(
+    lane: ast::SimdLane,
+    op_name: &str,
+    args: &[Spanned<grammar::Expr>],
+    span: Range<usize>,
+) -> ast::Expr {
+    let op = parse_simd_op(op_name);
+    let mut converted_args: Vec<ast::Expr> = Vec::new();
+    let mut lane_idx: Option<u8> = None;
+
+    for (i, arg) in args.iter().enumerate() {
+        // For extract_lane/replace_lane, the lane index is a numeric arg
+        if (op == ast::SimdOp::ExtractLane && i == args.len() - 1)
+            || (op == ast::SimdOp::ReplaceLane && i == 1)
+        {
+            if let grammar::Expr::Integer(n) = &arg.value {
+                lane_idx = Some(*n as u8);
+                continue;
+            }
+        }
+        converted_args.push(sexpr_flat(arg));
+    }
+
+    ast::Expr::SimdOp {
+        lane,
+        op,
+        args: converted_args,
+        lane_idx,
+        span,
+    }
+}
+
+fn parse_simd_op(name: &str) -> ast::SimdOp {
+    match name {
+        "splat" => ast::SimdOp::Splat,
+        "add" => ast::SimdOp::Add,
+        "sub" => ast::SimdOp::Sub,
+        "mul" => ast::SimdOp::Mul,
+        "neg" => ast::SimdOp::Neg,
+        "abs" => ast::SimdOp::Abs,
+        "div" => ast::SimdOp::Div,
+        "sqrt" => ast::SimdOp::Sqrt,
+        "ceil" => ast::SimdOp::Ceil,
+        "floor" => ast::SimdOp::Floor,
+        "trunc" => ast::SimdOp::Trunc,
+        "nearest" => ast::SimdOp::Nearest,
+        "shl" => ast::SimdOp::Shl,
+        "shr-s" | "shr_s" => ast::SimdOp::ShrS,
+        "shr-u" | "shr_u" => ast::SimdOp::ShrU,
+        "min" => ast::SimdOp::Min,
+        "max" => ast::SimdOp::Max,
+        "extract-lane" | "extract_lane" => ast::SimdOp::ExtractLane,
+        "replace-lane" | "replace_lane" => ast::SimdOp::ReplaceLane,
+        "eq" => ast::SimdOp::Eq,
+        "ne" => ast::SimdOp::Ne,
+        "lt-s" | "lt_s" => ast::SimdOp::LtS,
+        "lt-u" | "lt_u" => ast::SimdOp::LtU,
+        "gt-s" | "gt_s" => ast::SimdOp::GtS,
+        "gt-u" | "gt_u" => ast::SimdOp::GtU,
+        "le-s" | "le_s" => ast::SimdOp::LeS,
+        "le-u" | "le_u" => ast::SimdOp::LeU,
+        "ge-s" | "ge_s" => ast::SimdOp::GeS,
+        "ge-u" | "ge_u" => ast::SimdOp::GeU,
+        "lt" => ast::SimdOp::Lt,
+        "gt" => ast::SimdOp::Gt,
+        "le" => ast::SimdOp::Le,
+        "ge" => ast::SimdOp::Ge,
+        "and" => ast::SimdOp::And,
+        "or" => ast::SimdOp::Or,
+        "xor" => ast::SimdOp::Xor,
+        "not" => ast::SimdOp::Not,
+        "andnot" => ast::SimdOp::AndNot,
+        "bitselect" => ast::SimdOp::Bitselect,
+        "any-true" | "any_true" => ast::SimdOp::AnyTrue,
+        "all-true" | "all_true" => ast::SimdOp::AllTrue,
+        "bitmask" => ast::SimdOp::Bitmask,
+        "swizzle" => ast::SimdOp::Swizzle,
+        "load" => ast::SimdOp::Load,
+        "store" => ast::SimdOp::Store,
+        "popcnt" => ast::SimdOp::Popcnt,
+        "avgr-u" | "avgr_u" => ast::SimdOp::AvgRU,
+        "ext-mul-low-s" | "ext_mul_low_s" => ast::SimdOp::ExtMulLowS,
+        "ext-mul-low-u" | "ext_mul_low_u" => ast::SimdOp::ExtMulLowU,
+        "ext-mul-high-s" | "ext_mul_high_s" => ast::SimdOp::ExtMulHighS,
+        "ext-mul-high-u" | "ext_mul_high_u" => ast::SimdOp::ExtMulHighU,
+        "ext-add-pairwise-s" | "ext_add_pairwise_s" => ast::SimdOp::ExtAddPairwiseS,
+        "ext-add-pairwise-u" | "ext_add_pairwise_u" => ast::SimdOp::ExtAddPairwiseU,
+        "narrow-s" | "narrow_s" => ast::SimdOp::NarrowS,
+        "narrow-u" | "narrow_u" => ast::SimdOp::NarrowU,
+        "extend-low-s" | "extend_low_s" => ast::SimdOp::ExtendLowS,
+        "extend-low-u" | "extend_low_u" => ast::SimdOp::ExtendLowU,
+        "extend-high-s" | "extend_high_s" => ast::SimdOp::ExtendHighS,
+        "extend-high-u" | "extend_high_u" => ast::SimdOp::ExtendHighU,
+        "dot" => ast::SimdOp::Dot,
+        _ => ast::SimdOp::Add, // fallback — checker will catch invalid ops
     }
 }
 

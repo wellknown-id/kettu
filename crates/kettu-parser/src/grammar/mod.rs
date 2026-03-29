@@ -751,12 +751,19 @@ pub struct FuncBody {
 #[derive(Debug, Clone, PartialEq, Rule)]
 pub enum Stmt {
     Let(LetStmt),
+    SharedLet(SharedLetStmt),
     Assign(AssignStmt),
+    AddAssign(AddAssignStmt),
+    SubAssign(SubAssignStmt),
     ReturnValue(ReturnValueStmt),
     ReturnVoid(ReturnVoidStmt),
     Break(BreakStmt),
     Continue(ContinueStmt),
+    GuardLet(GuardLetStmt),
+    Guard(GuardStmt),
     Expr(ExprStmt),
+    /// Trailing expression without semicolon (last item in a block)
+    TailExpr(TailExprStmt),
 }
 
 #[derive(Debug, Clone, PartialEq, Rule)]
@@ -773,11 +780,48 @@ pub struct LetStmt {
 }
 
 #[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SharedLetStmt {
+    #[leaf("shared")]
+    _shared_kw: (),
+    #[leaf("let")]
+    _let_kw: (),
+    #[leaf(KIdent)]
+    pub name: Spanned<String>,
+    #[leaf("=")]
+    _eq: (),
+    pub value: Spanned<Expr>,
+    #[leaf(";")]
+    _semi: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
 pub struct AssignStmt {
     #[leaf(KIdent)]
     pub name: Spanned<String>,
     #[leaf("=")]
     _eq: (),
+    pub value: Spanned<Expr>,
+    #[leaf(";")]
+    _semi: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AddAssignStmt {
+    #[leaf(KIdent)]
+    pub name: Spanned<String>,
+    #[leaf("+=")]
+    _op: (),
+    pub value: Spanned<Expr>,
+    #[leaf(";")]
+    _semi: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SubAssignStmt {
+    #[leaf(KIdent)]
+    pub name: Spanned<String>,
+    #[leaf("-=")]
+    _op: (),
     pub value: Spanned<Expr>,
     #[leaf(";")]
     _semi: (),
@@ -819,10 +863,54 @@ pub struct ContinueStmt {
 }
 
 #[derive(Debug, Clone, PartialEq, Rule)]
+pub struct GuardLetStmt {
+    #[leaf("guard")]
+    _kw: (),
+    #[leaf("let")]
+    _let_kw: (),
+    #[leaf(KIdent)]
+    pub name: Spanned<String>,
+    #[leaf("=")]
+    _eq: (),
+    pub value: Spanned<Expr>,
+    #[leaf("else")]
+    _else_kw: (),
+    #[leaf("{")]
+    _lb: (),
+    pub else_body: Vec<Stmt>,
+    #[leaf("}")]
+    _rb: (),
+    #[leaf(";")]
+    _semi: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct GuardStmt {
+    #[leaf("guard")]
+    _kw: (),
+    pub condition: Spanned<Box<Expr>>,
+    #[leaf("else")]
+    _else_kw: (),
+    #[leaf("{")]
+    _lb: (),
+    pub else_body: Vec<Stmt>,
+    #[leaf("}")]
+    _rb: (),
+    #[leaf(";")]
+    _semi: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
 pub struct ExprStmt {
     pub expr: Spanned<Expr>,
     #[leaf(";")]
     _semi: (),
+}
+
+/// Trailing expression without semicolon (for block final values like `{ 42 }`)
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct TailExprStmt {
+    pub expr: Spanned<Expr>,
 }
 
 // ============================================================================
@@ -848,6 +936,9 @@ pub enum Expr {
     /// `!expr`
     #[prec_left(7)]
     Not(#[leaf("!")] (), Spanned<Box<Expr>>),
+    /// `-expr` (unary negation)
+    #[prec_left(7)]
+    Neg(#[leaf("-")] (), Spanned<Box<Expr>>),
     /// `assert expr`
     #[prec_left(7)]
     Assert(#[leaf("assert")] (), Spanned<Box<Expr>>),
@@ -929,6 +1020,7 @@ pub enum Expr {
     While(WhileExpr),
     For(ForExpr),
     ForEach(ForEachExpr),
+    SimdForEach(SimdForEachExpr),
     Match(MatchExpr),
 
     // Built-in functions
@@ -952,6 +1044,7 @@ pub enum Expr {
     /// `#case` — variant literal (payload handled via Call if needed)
     VariantLiteral(#[leaf("#")] (), #[leaf(KIdent)] Spanned<String>),
     /// `type#case` — qualified variant literal (payload handled via Call if needed)
+    #[prec_left(10)]
     QualifiedVariantLiteral(
         #[leaf(KIdent)] Spanned<String>,
         #[leaf("#")] (),
@@ -963,6 +1056,33 @@ pub enum Expr {
     None_(NoneExpr),
     Ok_(OkExpr),
     Err_(ErrExpr),
+
+    // Atomic operations
+    AtomicLoad(AtomicLoadExpr),
+    AtomicStore(AtomicStoreExpr),
+    AtomicAdd(AtomicAddExpr),
+    AtomicSub(AtomicSubExpr),
+    AtomicCmpxchg(AtomicCmpxchgExpr),
+    AtomicWait(AtomicWaitExpr),
+    AtomicNotify(AtomicNotifyExpr),
+
+    // Thread spawning
+    Spawn(SpawnExpr),
+
+    // Thread join
+    ThreadJoin(ThreadJoinExpr),
+
+    // Atomic block sugar
+    AtomicBlock(AtomicBlockExpr),
+
+    // SIMD operations: interpretation.op(args)
+    SimdV128(SimdV128Expr),
+    SimdI8x16(SimdI8x16Expr),
+    SimdI16x8(SimdI16x8Expr),
+    SimdI32x4(SimdI32x4Expr),
+    SimdI64x2(SimdI64x2Expr),
+    SimdF32x4(SimdF32x4Expr),
+    SimdF64x2(SimdF64x2Expr),
 }
 
 /// Arguments for a function call: `(arg1, arg2, ...)`
@@ -994,6 +1114,7 @@ pub struct ParenExpr {
 }
 
 #[derive(Debug, Clone, PartialEq, Rule)]
+#[prec_right(10)]
 pub struct IfExpr {
     #[leaf("if")]
     _kw: (),
@@ -1065,6 +1186,24 @@ pub struct StepClause {
 
 #[derive(Debug, Clone, PartialEq, Rule)]
 pub struct ForEachExpr {
+    #[leaf("for")]
+    _for: (),
+    #[leaf(KIdent)]
+    pub variable: Spanned<String>,
+    #[leaf("in")]
+    _in: (),
+    pub collection: Spanned<Box<Expr>>,
+    #[leaf("{")]
+    _lb: (),
+    pub body: Vec<Stmt>,
+    #[leaf("}")]
+    _rb: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdForEachExpr {
+    #[leaf("simd")]
+    _simd: (),
     #[leaf("for")]
     _for: (),
     #[leaf(KIdent)]
@@ -1373,8 +1512,255 @@ pub struct ErrExpr {
     _rp: (),
 }
 
+// ── Atomic operations ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicLoadExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("load")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub addr: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicStoreExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("store")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub addr: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c1: (),
+    pub value: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicAddExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("add")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub addr: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c1: (),
+    pub value: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicSubExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("sub")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub addr: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c1: (),
+    pub value: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicCmpxchgExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("cmpxchg")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub addr: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c1: (),
+    pub expected: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c2: (),
+    pub replacement: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicWaitExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("wait")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub addr: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c1: (),
+    pub expected: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c2: (),
+    pub timeout: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicNotifyExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("notify")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub addr: Spanned<Box<Expr>>,
+    #[leaf(",")]
+    _c1: (),
+    pub count: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SpawnExpr {
+    #[leaf("spawn")]
+    _kw: (),
+    #[leaf("{")]
+    _lb: (),
+    pub body: Vec<Spanned<Stmt>>,
+    #[leaf("}")]
+    _rb: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct ThreadJoinExpr {
+    #[leaf("thread")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf("join")]
+    _op: (),
+    #[leaf("(")]
+    _lp: (),
+    pub tid: Spanned<Box<Expr>>,
+    #[leaf(")")]
+    _rp: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct AtomicBlockExpr {
+    #[leaf("atomic")]
+    _kw: (),
+    #[leaf("{")]
+    _lb: (),
+    pub body: Vec<Spanned<Stmt>>,
+    #[leaf("}")]
+    _rb: (),
+}
+
 // ============================================================================
-// World
+// SIMD operations: interpretation.op(args)
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdV128Expr {
+    #[leaf("v128")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf(KIdent)]
+    pub op: Spanned<String>,
+    pub call_args: CallArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdI8x16Expr {
+    #[leaf("i8x16")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf(KIdent)]
+    pub op: Spanned<String>,
+    pub call_args: CallArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdI16x8Expr {
+    #[leaf("i16x8")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf(KIdent)]
+    pub op: Spanned<String>,
+    pub call_args: CallArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdI32x4Expr {
+    #[leaf("i32x4")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf(KIdent)]
+    pub op: Spanned<String>,
+    pub call_args: CallArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdI64x2Expr {
+    #[leaf("i64x2")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf(KIdent)]
+    pub op: Spanned<String>,
+    pub call_args: CallArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdF32x4Expr {
+    #[leaf("f32x4")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf(KIdent)]
+    pub op: Spanned<String>,
+    pub call_args: CallArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct SimdF64x2Expr {
+    #[leaf("f64x2")]
+    _kw: (),
+    #[leaf(".")]
+    _dot: (),
+    #[leaf(KIdent)]
+    pub op: Spanned<String>,
+    pub call_args: CallArgs,
+}
+
 // ============================================================================
 
 /// `world name { items }`

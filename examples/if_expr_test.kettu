@@ -1,0 +1,73 @@
+package local:if-expr-test;
+
+interface if-expr-tests {
+    @test
+    test-if-as-expr-true: func() -> bool {
+        let x = if true { 42 } else { 0 };
+        x == 42;
+    }
+
+    @test
+    test-if-as-expr-false: func() -> bool {
+        let x = if false { 42 } else { 0 };
+        x == 0;
+    }
+
+    @test
+    test-if-as-expr-comparison: func() -> bool {
+        let a = 10;
+        let b = 5;
+        let max = if a > b { a } else { b };
+        max == 10;
+    }
+
+    @test
+    test-if-as-expr-nested: func() -> bool {
+        let x = 3;
+        let label = if x > 5 { 2 } else { if x > 0 { 1 } else { 0 } };
+        label == 1;
+    }
+
+    @test
+    test-break-while: func() -> bool {
+        let i = 0;
+        while i < 100 {
+            i += 1;
+            if i == 5 {
+                break;
+            };
+        };
+        i == 5;
+    }
+
+    @test
+    test-continue-for: func() -> bool {
+        let count = 0;
+        for i in 0 to 9 {
+            if i == 3 {
+                continue;
+            };
+            if i == 7 {
+                continue;
+            };
+            count += 1;
+        };
+        count == 8;
+    }
+
+    @test
+    test-break-for: func() -> bool {
+        let sum = 0;
+        for i in 0 to 99 {
+            if i == 5 {
+                break;
+            };
+            sum += i;
+        };
+        sum == 10;
+    }
+}
+
+world tests {
+    export if-expr-tests;
+}

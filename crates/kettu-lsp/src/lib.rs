@@ -9,6 +9,7 @@ use kettu_parser::{
     BinOp, Expr, ImportExportKind, InterfaceItem, Pattern, PrimitiveTy, Statement, TopLevelItem,
     Ty, TypeDefKind, WitFile, WorldItem, parse_file,
 };
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::RwLock;
@@ -263,6 +264,7 @@ fn primitive_to_string(p: &PrimitiveTy) -> &'static str {
         PrimitiveTy::Bool => "bool",
         PrimitiveTy::Char => "char",
         PrimitiveTy::String => "string",
+        PrimitiveTy::V128 => "v128",
     }
 }
 
@@ -338,9 +340,9 @@ fn strip_comments_preserve_layout(
     let mut bytes = source.as_bytes().to_vec();
 
     for range in comment_ranges {
-        for idx in range.clone() {
-            if bytes[idx] != b'\n' {
-                bytes[idx] = b' ';
+        for byte in &mut bytes[range.start..range.end] {
+            if *byte != b'\n' {
+                *byte = b' ';
             }
         }
     }
@@ -1296,6 +1298,14 @@ fn collect_let_bindings_before(
                     }
                 }
             }
+            Statement::GuardLet { name, value, .. } => {
+                collect_let_bindings_in_expr(value, before_offset, scope, inference_ctx);
+                if name.span.end < before_offset {
+                    if let Some(ty) = infer_guard_let_binding_type(value, scope, inference_ctx) {
+                        scope.insert(name.name.clone(), ty);
+                    }
+                }
+            }
             Statement::Expr(expr) => {
                 collect_let_bindings_in_expr(expr, before_offset, scope, inference_ctx)
             }
@@ -1303,9 +1313,14 @@ fn collect_let_bindings_before(
                 collect_let_bindings_in_expr(expr, before_offset, scope, inference_ctx)
             }
             Statement::Assign { .. }
+            | Statement::CompoundAssign { .. }
             | Statement::Return(None)
             | Statement::Break { .. }
-            | Statement::Continue { .. } => {}
+            | Statement::Continue { .. }
+            | Statement::SharedLet { .. } => {}
+            Statement::Guard { condition, .. } => {
+                collect_let_bindings_in_expr(condition, before_offset, scope, inference_ctx)
+            }
         }
     }
 }
@@ -1456,6 +1471,21 @@ fn infer_expr_type(
         }
         _ => None,
     }
+}
+
+fn infer_guard_let_binding_type(
+    value: &Expr,
+    scope: &HashMap<String, String>,
+    inference_ctx: &InferenceContext,
+) -> Option<String> {
+    let source_ty = infer_expr_type(value, scope, inference_ctx)?;
+    if let Some(inner) = parse_option_payload_type(&source_ty) {
+        return Some(inner);
+    }
+    if let Some((ok_ty, _)) = parse_result_payload_types(&source_ty) {
+        return ok_ty;
+    }
+    None
 }
 
 fn infer_block_tail_type(
@@ -1824,6 +1854,10 @@ impl LanguageServer for Backend {
                     ]),
                     ..Default::default()
                 }),
+                experimental: Some(json!({
+                    "dap": true,
+                    "supportsDebugAdapter": true
+                })),
                 ..Default::default()
             },
             ..Default::default()
@@ -3827,6 +3861,41 @@ interface effects {
 
         let hover = find_local_hover_info(source, &ast, Position::new(line, col))
             .expect("try-expression let hover should resolve inferred type");
+        assert!(hover.0.contains("**let**"));
+        assert!(hover.0.contains("`x`"));
+        assert!(hover.0.contains("s32"));
+    }
+
+    #[test]
+    fn test_find_local_hover_info_infers_guard_let_binding_type() {
+        let source = r#"package local:test;
+
+interface effects {
+    run: func(v: option<s32>) -> s32 {
+        guard let x = v else {
+            return 0;
+        };
+        x;
+    }
+}
+"#;
+
+        let (ast, errors) = parse_file(source);
+        assert!(errors.is_empty(), "Should parse cleanly: {:?}", errors);
+        let ast = ast.expect("Should parse");
+
+        let line = source
+            .lines()
+            .position(|l| l.trim() == "x;")
+            .expect("x line exists") as u32;
+        let col = source
+            .lines()
+            .nth(line as usize)
+            .and_then(|l| l.find("x"))
+            .expect("x exists") as u32;
+
+        let hover = find_local_hover_info(source, &ast, Position::new(line, col))
+            .expect("guard-let hover should resolve inferred type");
         assert!(hover.0.contains("**let**"));
         assert!(hover.0.contains("`x`"));
         assert!(hover.0.contains("s32"));

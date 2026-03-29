@@ -1,8 +1,327 @@
 //! Integration tests for the full Kettu compilation pipeline
 
+use gimli::{self, DwarfSections, EndianSlice, LittleEndian, constants};
+use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::io::Write;
 use std::process::Command;
 use tempfile::NamedTempFile;
+use wasmparser::{Parser, Payload};
+
+fn kettu_cmd() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_kettu"))
+}
+
+fn run_mcp_request(request: Value) -> Value {
+    let mut child = kettu_cmd()
+        .args(["mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("Failed to start kettu mcp");
+
+    let stdin = child.stdin.as_mut().expect("mcp stdin");
+    writeln!(stdin, "{}", request).expect("write MCP request");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("Failed to read MCP output");
+    assert!(
+        output.status.success(),
+        "kettu mcp should exit successfully"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .expect("MCP response line");
+    serde_json::from_str(line).expect("valid MCP JSON response")
+}
+
+#[derive(Debug)]
+struct DwarfLineRow {
+    file_name: String,
+    line: u64,
+}
+
+#[derive(Debug)]
+struct ParsedDwarf {
+    compile_units: Vec<String>,
+    subprograms: Vec<String>,
+    line_rows: Vec<DwarfLineRow>,
+    bindings: Vec<DwarfBinding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DwarfBindingKind {
+    Parameter,
+    Variable,
+}
+
+#[derive(Debug)]
+struct DwarfBinding {
+    owner: String,
+    name: String,
+    decl_line: u64,
+    wasm_local: Option<u32>,
+    kind: DwarfBindingKind,
+}
+
+#[derive(Debug)]
+struct DebugOutput {
+    has_name: bool,
+    dwarf: ParsedDwarf,
+}
+
+fn inspect_debug_output(wasm: &[u8]) -> Result<DebugOutput, String> {
+    let mut sections = HashMap::new();
+    let mut has_name = false;
+
+    for payload in Parser::new(0).parse_all(wasm) {
+        match payload.map_err(|err| format!("invalid wasm payload: {}", err))? {
+            Payload::CustomSection(section) => {
+                if section.name() == "name" {
+                    has_name = true;
+                } else {
+                    sections.insert(section.name().to_owned(), section.data().to_vec());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(DebugOutput {
+        has_name,
+        dwarf: parse_real_dwarf_sections(&sections)?,
+    })
+}
+
+fn parse_real_dwarf_sections(sections: &HashMap<String, Vec<u8>>) -> Result<ParsedDwarf, String> {
+    for required in [".debug_abbrev", ".debug_info", ".debug_line"] {
+        if !sections.contains_key(required) {
+            return Err(format!("missing {required} section"));
+        }
+    }
+
+    let dwarf_sections = DwarfSections::load(|id| -> Result<Vec<u8>, gimli::Error> {
+        Ok(sections.get(id.name()).cloned().unwrap_or_default())
+    })
+    .map_err(|err| format!("failed to load DWARF sections: {}", err))?;
+    let dwarf = dwarf_sections.borrow(|section| EndianSlice::new(section.as_slice(), LittleEndian));
+
+    let mut compile_units = Vec::new();
+    let mut subprograms = Vec::new();
+    let mut line_rows = Vec::new();
+    let mut bindings = Vec::new();
+    let mut unit_headers = dwarf.units();
+
+    while let Some(unit_header) = unit_headers
+        .next()
+        .map_err(|err| format!("failed to read DWARF unit header: {}", err))?
+    {
+        let unit = dwarf
+            .unit(unit_header)
+            .map_err(|err| format!("failed to read DWARF unit: {}", err))?;
+
+        let mut entries = unit.entries();
+        let mut active_subprograms: Vec<Option<String>> = Vec::new();
+        while let Some(entry) = entries
+            .next_dfs()
+            .map_err(|err| format!("failed to walk DWARF entries: {}", err))?
+        {
+            let depth = entry.depth().max(0) as usize;
+            active_subprograms.truncate(depth + 1);
+            if active_subprograms.len() <= depth {
+                active_subprograms.resize(depth + 1, None);
+            }
+
+            let name = match entry.attr_value(constants::DW_AT_name) {
+                Some(name_attr) => Some(
+                    dwarf
+                        .attr_string(&unit, name_attr)
+                        .map_err(|err| format!("failed to read DWARF name: {}", err))?
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                None => None,
+            };
+
+            match entry.tag() {
+                constants::DW_TAG_compile_unit => {
+                    if let Some(name) = name {
+                        compile_units.push(name);
+                    }
+                }
+                constants::DW_TAG_subprogram => {
+                    if let Some(name) = name {
+                        active_subprograms[depth] = Some(name.clone());
+                        subprograms.push(name);
+                    }
+                }
+                constants::DW_TAG_formal_parameter | constants::DW_TAG_variable => {
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    let owner = active_subprograms
+                        .iter()
+                        .rev()
+                        .find_map(|owner| owner.clone())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let decl_line = entry
+                        .attr_value(constants::DW_AT_decl_line)
+                        .and_then(attribute_u64)
+                        .unwrap_or(0);
+                    let wasm_local = entry
+                        .attr_value(constants::DW_AT_location)
+                        .map(|value| parse_wasm_local(value, unit.encoding()))
+                        .transpose()?
+                        .flatten();
+                    let kind = if entry.tag() == constants::DW_TAG_formal_parameter {
+                        DwarfBindingKind::Parameter
+                    } else {
+                        DwarfBindingKind::Variable
+                    };
+                    bindings.push(DwarfBinding {
+                        owner,
+                        name,
+                        decl_line,
+                        wasm_local,
+                        kind,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(program) = unit.line_program.clone() {
+            let mut rows = program.rows();
+            while let Some((header, row)) = rows
+                .next_row()
+                .map_err(|err| format!("failed to read DWARF line row: {}", err))?
+            {
+                let Some(line) = row.line().map(|line| line.get()) else {
+                    continue;
+                };
+                let file_name = row
+                    .file(header)
+                    .map(|file| {
+                        dwarf
+                            .attr_string(&unit, file.path_name())
+                            .map_err(|err| format!("failed to read DWARF file name: {}", err))
+                    })
+                    .transpose()?
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                line_rows.push(DwarfLineRow { file_name, line });
+            }
+        }
+    }
+
+    Ok(ParsedDwarf {
+        compile_units,
+        subprograms,
+        line_rows,
+        bindings,
+    })
+}
+
+fn parse_wasm_local<R: gimli::Reader>(
+    value: gimli::AttributeValue<R>,
+    encoding: gimli::Encoding,
+) -> Result<Option<u32>, String> {
+    let gimli::AttributeValue::Exprloc(expression) = value else {
+        return Ok(None);
+    };
+    let mut ops = expression.operations(encoding);
+    match ops
+        .next()
+        .map_err(|err| format!("failed to read DWARF location expression: {}", err))?
+    {
+        Some(gimli::Operation::WasmLocal { index }) => Ok(Some(index)),
+        _ => Ok(None),
+    }
+}
+
+fn attribute_u64<R: gimli::Reader>(value: gimli::AttributeValue<R>) -> Option<u64> {
+    match value {
+        gimli::AttributeValue::Udata(value) => Some(value),
+        gimli::AttributeValue::Data1(value) => Some(value.into()),
+        gimli::AttributeValue::Data2(value) => Some(value.into()),
+        gimli::AttributeValue::Data4(value) => Some(value.into()),
+        gimli::AttributeValue::Data8(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn assert_real_dwarf_for_function(
+    dwarf: &ParsedDwarf,
+    source_name: &str,
+    function_hint: &str,
+    expected_lines: std::ops::RangeInclusive<u64>,
+) {
+    assert!(
+        !dwarf.compile_units.is_empty(),
+        "expected at least one DWARF compile unit"
+    );
+    assert!(
+        dwarf
+            .compile_units
+            .iter()
+            .any(|name| name.contains(source_name)),
+        "expected a compile unit for source {source_name}, got {:?}",
+        dwarf.compile_units
+    );
+    assert!(
+        dwarf
+            .subprograms
+            .iter()
+            .any(|name| name.contains(function_hint)),
+        "expected a DWARF subprogram containing {function_hint:?}, got {:?}",
+        dwarf.subprograms
+    );
+    assert!(
+        dwarf.line_rows.iter().any(|row| {
+            row.file_name.contains(source_name) && expected_lines.contains(&row.line)
+        }),
+        "expected a DWARF line row for {source_name} within {:?}, got {:?}",
+        expected_lines,
+        dwarf.line_rows
+    );
+}
+
+fn assert_dwarf_binding(
+    dwarf: &ParsedDwarf,
+    owner: &str,
+    name: &str,
+    kind: DwarfBindingKind,
+    decl_line: u64,
+    wasm_local: u32,
+) {
+    let binding = dwarf
+        .bindings
+        .iter()
+        .find(|binding| {
+            binding.owner.contains(owner) && binding.name == name && binding.kind == kind
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected DWARF binding {name:?} ({kind:?}) under {owner:?}, got {:?}",
+                dwarf.bindings
+            )
+        });
+    assert_eq!(
+        binding.decl_line, decl_line,
+        "unexpected decl line for binding {name:?}: {:?}",
+        binding
+    );
+    assert_eq!(
+        binding.wasm_local,
+        Some(wasm_local),
+        "unexpected wasm local for binding {name:?}: {:?}",
+        binding
+    );
+}
 
 #[test]
 fn test_parse_command() {
@@ -12,15 +331,8 @@ fn test_parse_command() {
     writeln!(file, "    greet: func(name: string) -> string;").unwrap();
     writeln!(file, "}}").unwrap();
 
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "-p",
-            "kettu-cli",
-            "--",
-            "parse",
-            file.path().to_str().unwrap(),
-        ])
+    let output = kettu_cmd()
+        .args(["parse", file.path().to_str().unwrap()])
         .output()
         .expect("Failed to run kettu parse");
 
@@ -35,15 +347,8 @@ fn test_check_command() {
     writeln!(file, "    greet: func(name: string) -> string;").unwrap();
     writeln!(file, "}}").unwrap();
 
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "-p",
-            "kettu-cli",
-            "--",
-            "check",
-            file.path().to_str().unwrap(),
-        ])
+    let output = kettu_cmd()
+        .args(["check", file.path().to_str().unwrap()])
         .output()
         .expect("Failed to run kettu check");
 
@@ -60,15 +365,8 @@ fn test_emit_wit_command() {
     writeln!(file, "    }}").unwrap();
     writeln!(file, "}}").unwrap();
 
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "-p",
-            "kettu-cli",
-            "--",
-            "emit-wit",
-            file.path().to_str().unwrap(),
-        ])
+    let output = kettu_cmd()
+        .args(["emit-wit", file.path().to_str().unwrap()])
         .output()
         .expect("Failed to run kettu emit-wit");
 
@@ -102,12 +400,8 @@ fn test_build_core_command() {
 
     let output_file = NamedTempFile::new().unwrap();
 
-    let output = Command::new("cargo")
+    let output = kettu_cmd()
         .args([
-            "run",
-            "-p",
-            "kettu-cli",
-            "--",
             "build",
             "--core",
             file.path().to_str().unwrap(),
@@ -146,12 +440,8 @@ fn test_build_with_expressions() {
 
     let output_file = NamedTempFile::new().unwrap();
 
-    let output = Command::new("cargo")
+    let output = kettu_cmd()
         .args([
-            "run",
-            "-p",
-            "kettu-cli",
-            "--",
             "build",
             "--core",
             file.path().to_str().unwrap(),
@@ -177,6 +467,305 @@ fn test_build_with_expressions() {
 }
 
 #[test]
+fn test_build_debug_sections() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(file, "package local:test;").unwrap();
+    writeln!(file, "interface api {{").unwrap();
+    writeln!(file, "    add: func(a: s32, b: s32) -> s32 {{").unwrap();
+    writeln!(file, "        return a + b;").unwrap();
+    writeln!(file, "    }}").unwrap();
+    writeln!(file, "}}").unwrap();
+
+    let output_file = NamedTempFile::new().unwrap();
+
+    let output = kettu_cmd()
+        .args([
+            "build",
+            "--core",
+            "--debug",
+            file.path().to_str().unwrap(),
+            "-o",
+            output_file.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run kettu build --debug");
+
+    assert!(
+        output.status.success(),
+        "Debug build should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let wasm = std::fs::read(output_file.path()).unwrap();
+    let source_name = file
+        .path()
+        .file_name()
+        .expect("source file name")
+        .to_string_lossy()
+        .into_owned();
+    let debug_output = inspect_debug_output(&wasm).expect("inspect debug output");
+
+    assert!(
+        debug_output.has_name,
+        "should emit name section for debugging"
+    );
+
+    assert_real_dwarf_for_function(&debug_output.dwarf, &source_name, "add", 3..=4);
+}
+
+#[test]
+fn test_build_debug_sections_include_lambda_locations() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(file, "package local:test;").unwrap();
+    writeln!(file, "interface tests {{").unwrap();
+    writeln!(file, "    @test").unwrap();
+    writeln!(file, "    closure: func() -> bool {{").unwrap();
+    writeln!(file, "        let add-one = |x|").unwrap();
+    writeln!(file, "            x + 1;").unwrap();
+    writeln!(file, "        return add-one(1) == 2;").unwrap();
+    writeln!(file, "    }}").unwrap();
+    writeln!(file, "}}").unwrap();
+
+    let output_file = NamedTempFile::new().unwrap();
+
+    let output = kettu_cmd()
+        .args([
+            "build",
+            "--core",
+            "--debug",
+            file.path().to_str().unwrap(),
+            "-o",
+            output_file.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run kettu build --debug");
+
+    assert!(
+        output.status.success(),
+        "Debug build should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let wasm = std::fs::read(output_file.path()).unwrap();
+    let source_name = file
+        .path()
+        .file_name()
+        .expect("source file name")
+        .to_string_lossy()
+        .into_owned();
+    let debug_output = inspect_debug_output(&wasm).expect("inspect debug output");
+
+    assert_real_dwarf_for_function(&debug_output.dwarf, &source_name, "lambda#0", 5..=6);
+    assert_dwarf_binding(
+        &debug_output.dwarf,
+        "lambda#0",
+        "x",
+        DwarfBindingKind::Parameter,
+        5,
+        0,
+    );
+}
+
+#[test]
+fn test_build_debug_sections_include_variable_locations() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(file, "package local:test;").unwrap();
+    writeln!(file, "interface math {{").unwrap();
+    writeln!(file, "    add: func(a: s32, b: s32) -> s32 {{").unwrap();
+    writeln!(file, "        let sum = a + b;").unwrap();
+    writeln!(file, "        return sum;").unwrap();
+    writeln!(file, "    }}").unwrap();
+    writeln!(file, "}}").unwrap();
+
+    let output_file = NamedTempFile::new().unwrap();
+
+    let output = kettu_cmd()
+        .args([
+            "build",
+            "--core",
+            "--debug",
+            file.path().to_str().unwrap(),
+            "-o",
+            output_file.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run kettu build --debug");
+
+    assert!(
+        output.status.success(),
+        "Debug build should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let wasm = std::fs::read(output_file.path()).unwrap();
+    let debug_output = inspect_debug_output(&wasm).expect("inspect debug output");
+
+    assert_dwarf_binding(
+        &debug_output.dwarf,
+        "add",
+        "a",
+        DwarfBindingKind::Parameter,
+        3,
+        0,
+    );
+    assert_dwarf_binding(
+        &debug_output.dwarf,
+        "add",
+        "b",
+        DwarfBindingKind::Parameter,
+        3,
+        1,
+    );
+    assert_dwarf_binding(
+        &debug_output.dwarf,
+        "add",
+        "sum",
+        DwarfBindingKind::Variable,
+        4,
+        2,
+    );
+}
+
+#[test]
+fn test_build_debug_sections_are_readable_by_llvm_dwarfdump() {
+    match Command::new("llvm-dwarfdump").arg("--version").output() {
+        Ok(output) => {
+            assert!(
+                output.status.success(),
+                "llvm-dwarfdump should be runnable: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping llvm-dwarfdump validation: tool not installed");
+            return;
+        }
+        Err(err) => panic!("failed to invoke llvm-dwarfdump: {err}"),
+    }
+
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(file, "package local:test;").unwrap();
+    writeln!(file, "interface math {{").unwrap();
+    writeln!(file, "    add: func(a: s32, b: s32) -> s32 {{").unwrap();
+    writeln!(file, "        let sum = a + b;").unwrap();
+    writeln!(file, "        return sum;").unwrap();
+    writeln!(file, "    }}").unwrap();
+    writeln!(file, "}}").unwrap();
+
+    let output_file = NamedTempFile::new().unwrap();
+    let output = kettu_cmd()
+        .args([
+            "build",
+            "--core",
+            "--debug",
+            file.path().to_str().unwrap(),
+            "-o",
+            output_file.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run kettu build --debug");
+
+    assert!(
+        output.status.success(),
+        "Debug build should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let dwarfdump = Command::new("llvm-dwarfdump")
+        .arg(output_file.path())
+        .output()
+        .expect("run llvm-dwarfdump");
+    assert!(
+        dwarfdump.status.success(),
+        "llvm-dwarfdump should succeed: {}",
+        String::from_utf8_lossy(&dwarfdump.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&dwarfdump.stdout);
+    assert!(
+        stdout.contains("DW_TAG_formal_parameter"),
+        "expected llvm-dwarfdump to show formal parameters: {stdout}"
+    );
+    assert!(
+        stdout.contains("DW_TAG_lexical_block"),
+        "expected llvm-dwarfdump to show lexical blocks: {stdout}"
+    );
+    assert!(
+        stdout.contains("DW_OP_WASM_location"),
+        "expected llvm-dwarfdump to show Wasm local locations: {stdout}"
+    );
+}
+
+#[test]
+fn test_test_list_json() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(file, "package local:test;").unwrap();
+    writeln!(file, "interface tests {{").unwrap();
+    writeln!(file, "    @test").unwrap();
+    writeln!(file, "    smoke: func() -> bool {{ return true; }}").unwrap();
+    writeln!(file, "    @test").unwrap();
+    writeln!(file, "    smoke-extra: func() -> bool {{ return true; }}").unwrap();
+    writeln!(file, "}}").unwrap();
+
+    let output = kettu_cmd()
+        .args(["test", file.path().to_str().unwrap(), "--list", "--json"])
+        .output()
+        .expect("Failed to run kettu test --list --json");
+
+    assert!(
+        output.status.success(),
+        "List tests should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_str(&stdout).expect("valid json output");
+    let tests = parsed["tests"].as_array().expect("tests should be array");
+    assert_eq!(tests.len(), 2, "should list two tests");
+    for test in tests {
+        let line = test["line"].as_u64().expect("line should be number");
+        let end_line = test["endLine"].as_u64().expect("endLine should be number");
+        assert!(end_line >= line, "endLine should be >= line");
+    }
+}
+
+#[test]
+fn test_test_exact_filter_runs_one() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(file, "package local:test;").unwrap();
+    writeln!(file, "interface tests {{").unwrap();
+    writeln!(file, "    @test").unwrap();
+    writeln!(file, "    smoke: func() -> bool {{ return true; }}").unwrap();
+    writeln!(file, "    @test").unwrap();
+    writeln!(file, "    smoke-extra: func() -> bool {{ return true; }}").unwrap();
+    writeln!(file, "}}").unwrap();
+
+    let output = kettu_cmd()
+        .args([
+            "test",
+            file.path().to_str().unwrap(),
+            "--filter",
+            "smoke",
+            "--exact",
+        ])
+        .output()
+        .expect("Failed to run kettu test --exact");
+
+    assert!(
+        output.status.success(),
+        "Exact test run should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Running 1 test(s)"),
+        "Exact filter should run one test: {}",
+        stdout
+    );
+}
+
+#[test]
 fn test_check_type_error() {
     let mut file = NamedTempFile::new().unwrap();
     writeln!(file, "package local:test;").unwrap();
@@ -186,15 +775,8 @@ fn test_check_type_error() {
     writeln!(file, "    }}").unwrap();
     writeln!(file, "}}").unwrap();
 
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "-p",
-            "kettu-cli",
-            "--",
-            "check",
-            file.path().to_str().unwrap(),
-        ])
+    let output = kettu_cmd()
+        .args(["check", file.path().to_str().unwrap()])
         .output()
         .expect("Failed to run kettu check");
 
@@ -211,4 +793,206 @@ fn test_check_type_error() {
         "Check should report unknown variable error: {}",
         combined
     );
+}
+
+#[test]
+fn test_docs_command() {
+    let output = kettu_cmd()
+        .args(["docs"])
+        .output()
+        .expect("Failed to run kettu docs");
+
+    assert!(output.status.success(), "Docs command should succeed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Language Topics"),
+        "Output should contain 'Language Topics' section"
+    );
+    assert!(
+        stdout.contains("Advanced Topics"),
+        "Output should contain 'Advanced Topics' section"
+    );
+    assert!(
+        stdout.contains("1.1"),
+        "Output should contain numbered sub-topics"
+    );
+}
+
+#[test]
+fn test_docs_topic_command() {
+    let output = kettu_cmd()
+        .args(["docs", "1.1"])
+        .output()
+        .expect("Failed to run kettu docs 1.1");
+
+    assert!(output.status.success(), "Docs topic command should succeed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Hello World"),
+        "Output should contain the Hello World topic content"
+    );
+}
+
+#[test]
+fn test_docs_check_command() {
+    let output = kettu_cmd()
+        .args(["docs", "--check"])
+        .output()
+        .expect("Failed to run kettu docs --check");
+
+    assert!(
+        output.status.success(),
+        "Doc-tests should all pass: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("passed"),
+        "Output should contain test results"
+    );
+    assert!(
+        !stdout.contains("failed, ") || stdout.contains("0 failed"),
+        "No doc-tests should fail"
+    );
+}
+
+#[test]
+fn test_docs_search_command() {
+    let output = kettu_cmd()
+        .args(["docs", "search", "lists"])
+        .output()
+        .expect("Failed to run kettu docs search");
+
+    assert!(
+        output.status.success(),
+        "Search should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Lists"),
+        "Search for 'lists' should find Lists topic"
+    );
+    assert!(
+        stdout.contains("Search results"),
+        "Output should contain search header"
+    );
+}
+
+#[test]
+fn test_mcp_initialize() {
+    let response = run_mcp_request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "test" }
+        }
+    }));
+
+    assert!(
+        response.pointer("/result/protocolVersion") == Some(&json!("2024-11-05")),
+        "Should return protocolVersion: {}",
+        response
+    );
+    assert!(
+        response.pointer("/result/capabilities/tools").is_some(),
+        "Should advertise tools capability: {}",
+        response
+    );
+}
+
+#[test]
+fn test_mcp_tools_call_check() {
+    let response = run_mcp_request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "check",
+            "arguments": {
+                "source": "interface math { add: func(a: s32, b: s32) -> s32 { a + b } }"
+            }
+        }
+    }));
+
+    assert!(
+        response.pointer("/result/content/0/text") == Some(&json!("OK — no errors or warnings.")),
+        "Valid code should pass check: {}",
+        response
+    );
+    assert!(
+        response.pointer("/result/isError") == Some(&json!(false)),
+        "Should not be an error: {}",
+        response
+    );
+}
+
+#[test]
+fn test_mcp_tools_list_includes_parse() {
+    let response = run_mcp_request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {}
+    }));
+
+    let tools = response
+        .pointer("/result/tools")
+        .and_then(Value::as_array)
+        .expect("tools array");
+    let names: Vec<_> = tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect();
+
+    assert_eq!(names.len(), 5, "expected all advertised MCP tools");
+    assert!(
+        names.contains(&"parse"),
+        "parse tool should be listed: {:?}",
+        names
+    );
+}
+
+#[test]
+fn test_mcp_tools_call_parse() {
+    let response = run_mcp_request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "parse",
+            "arguments": {
+                "source": "package local:test; interface api { greet: func(name: string) -> string; }"
+            }
+        }
+    }));
+
+    let text = response
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .expect("parse tool text");
+
+    assert!(
+        text.contains("Package: local:test"),
+        "should summarize the package: {}",
+        text
+    );
+    assert!(
+        text.contains("Interface: api"),
+        "should summarize the interface: {}",
+        text
+    );
+    assert!(
+        text.contains("func: greet"),
+        "should summarize functions: {}",
+        text
+    );
+    assert_eq!(response.pointer("/result/isError"), Some(&json!(false)));
 }

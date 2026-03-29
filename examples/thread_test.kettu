@@ -1,0 +1,46 @@
+package local:threads;
+
+interface thread-tests {
+    @test
+    test-atomic-store-load: func() -> bool {
+        atomic.store(0, 42);
+        atomic.load(0) == 42;
+    }
+
+    @test
+    test-atomic-add: func() -> bool {
+        atomic.store(0, 10);
+        let old = atomic.add(0, 5);
+        old == 10;
+    }
+
+    @test
+    test-atomic-sub: func() -> bool {
+        atomic.store(0, 100);
+        let old = atomic.sub(0, 30);
+        old == 100;
+    }
+
+    @test
+    test-atomic-cmpxchg-success: func() -> bool {
+        atomic.store(0, 10);
+        let old = atomic.cmpxchg(0, 10, 20);
+        old == 10;
+    }
+
+    @test
+    test-atomic-cmpxchg-fail: func() -> bool {
+        atomic.store(0, 10);
+        let old = atomic.cmpxchg(0, 99, 20);
+        // Should return current value (10) since expected (99) didn't match
+        old == 10;
+    }
+
+    @test
+    test-atomic-load-after-add: func() -> bool {
+        atomic.store(0, 0);
+        atomic.add(0, 7);
+        atomic.add(0, 3);
+        atomic.load(0) == 10;
+    }
+}

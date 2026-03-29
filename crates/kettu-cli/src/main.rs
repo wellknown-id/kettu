@@ -6,6 +6,11 @@ use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
 
+mod dap;
+mod docs;
+mod doctest;
+mod mcp;
+
 fn load_imported_asts(
     file: &PathBuf,
     ast: &kettu_parser::WitFile,
@@ -75,6 +80,15 @@ enum Commands {
         /// Enable WASI Preview 3 async ABI (experimental)
         #[arg(long)]
         wasip3: bool,
+        /// Enable WASM threads (shared memory + atomics)
+        #[arg(long)]
+        threads: bool,
+        /// Emit DWARF debug info and keep names (useful for DAP)
+        #[arg(long)]
+        debug: bool,
+        /// Keep function names even without DWARF sections
+        #[arg(long, default_value_t = false)]
+        keep_names: bool,
     },
     /// Run tests in a .kettu file
     Test {
@@ -83,6 +97,18 @@ enum Commands {
         /// Filter tests by name
         #[arg(long)]
         filter: Option<String>,
+        /// Match filter exactly instead of substring
+        #[arg(long, default_value_t = false)]
+        exact: bool,
+        /// List discovered tests without running them
+        #[arg(long, default_value_t = false)]
+        list: bool,
+        /// Emit machine-readable JSON output (with --list)
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Enable WASM threads (shared memory + atomics)
+        #[arg(long)]
+        threads: bool,
     },
     /// Start the LSP server (stdio)
     Lsp {
@@ -95,6 +121,18 @@ enum Commands {
         /// Input file
         file: PathBuf,
     },
+    /// Browse the embedded language guide
+    Docs {
+        /// Topic number (e.g. 1.2), or 'search <query>'
+        topic: Vec<String>,
+        /// Verify code snippets in the docs (doc-testing)
+        #[arg(long)]
+        check: bool,
+    },
+    /// Start the MCP server (stdio)
+    Mcp,
+    /// Start the Debug Adapter Protocol (DAP) server over stdio
+    Dap,
 }
 
 #[tokio::main]
@@ -180,6 +218,9 @@ async fn main() {
             output,
             core,
             wasip3,
+            threads,
+            debug,
+            keep_names,
         } => {
             let content = match fs::read_to_string(&file) {
                 Ok(c) => c,
@@ -241,6 +282,12 @@ async fn main() {
                 core_only: core,
                 memory_pages: 1,
                 wasip3,
+                threads,
+                emit_dwarf: debug,
+                keep_names: keep_names || debug,
+                debug_source: Some(content.clone()),
+                debug_path: Some(file.display().to_string()),
+                emit_debug_hooks: false,
             };
 
             let wasm = if core {
@@ -311,7 +358,39 @@ async fn main() {
             }
         }
 
-        Commands::Test { file, filter } => {
+        Commands::Test {
+            file,
+            filter,
+            exact,
+            list,
+            json,
+            threads,
+        } => {
+            if list {
+                let tests = list_tests(&file, filter.as_deref(), exact);
+                if json {
+                    let json_tests: Vec<_> = tests
+                        .iter()
+                        .map(|t| {
+                            serde_json::json!({
+                                "name": t.name,
+                                "line": t.line,
+                                "endLine": t.end_line,
+                                "file": t.file.display().to_string(),
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::json!({ "tests": json_tests }));
+                } else if tests.is_empty() {
+                    println!("No tests found");
+                } else {
+                    for t in tests {
+                        println!("{}:{} {}", t.file.display(), t.line, t.name);
+                    }
+                }
+                return;
+            }
+
             if file.is_dir() {
                 // Recursively find all .kettu files
                 use walkdir::WalkDir;
@@ -325,7 +404,7 @@ async fn main() {
                     .filter(|e| e.path().extension().map_or(false, |ext| ext == "kettu"))
                 {
                     let path = entry.path().to_path_buf();
-                    let (passed, failed) = run_tests(&path, filter.as_deref());
+                    let (passed, failed) = run_tests(&path, filter.as_deref(), exact, threads);
                     total_passed += passed;
                     total_failed += failed;
                     files_tested += 1;
@@ -345,18 +424,155 @@ async fn main() {
                     std::process::exit(1);
                 }
             } else {
-                let (passed, failed) = run_tests(&file, filter.as_deref());
+                let (passed, failed) = run_tests(&file, filter.as_deref(), exact, threads);
                 if failed > 0 {
                     std::process::exit(1);
                 }
                 let _ = (passed, failed); // Suppress unused warning
             }
         }
+
+        Commands::Docs { topic, check } => {
+            if check {
+                let selector = topic.first().map(|s| s.as_str());
+                let pages = docs::get_pages_for_testing(selector);
+                let refs: Vec<(&str, &str, Option<&str>)> = pages
+                    .iter()
+                    .map(|(t, c, p)| (t.as_str(), c.as_str(), p.as_deref()))
+                    .collect();
+                let (passed, failed, skipped) = doctest::run_doctests(&refs);
+                println!();
+                println!(
+                    "Doc-tests: {} passed, {} failed, {} skipped",
+                    passed, failed, skipped
+                );
+                if failed > 0 {
+                    std::process::exit(1);
+                }
+            } else if topic.is_empty() {
+                docs::print_index();
+            } else if topic[0] == "search" {
+                if topic.len() < 2 {
+                    eprintln!("Usage: kettu docs search <query>");
+                    std::process::exit(1);
+                }
+                let query = topic[1..].join(" ");
+                docs::search_docs(&query);
+            } else {
+                docs::print_topic(&topic[0]);
+            }
+        }
+
+        Commands::Mcp => {
+            mcp::run_server();
+        }
+
+        Commands::Dap => {
+            if let Err(err) = dap::run_server() {
+                eprintln!("DAP server error: {}", err);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
+/// Convert a byte offset to a 1-based line number.
+fn offset_to_line(source: &str, offset: usize) -> usize {
+    source[..offset.min(source.len())]
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .count()
+        + 1
+}
+
+struct ListedTest {
+    file: PathBuf,
+    name: String,
+    line: usize,
+    end_line: usize,
+}
+
+fn list_tests(file: &PathBuf, filter: Option<&str>, exact: bool) -> Vec<ListedTest> {
+    if file.is_dir() {
+        use walkdir::WalkDir;
+        let mut all = Vec::new();
+
+        for entry in WalkDir::new(file)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "kettu"))
+        {
+            let path = entry.path().to_path_buf();
+            all.extend(list_tests_single_file(&path, filter, exact));
+        }
+
+        return all;
+    }
+
+    list_tests_single_file(file, filter, exact)
+}
+
+fn list_tests_single_file(file: &PathBuf, filter: Option<&str>, exact: bool) -> Vec<ListedTest> {
+    use kettu_parser::{Gate, InterfaceItem, TopLevelItem};
+
+    let content = match fs::read_to_string(file) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error reading file: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let (ast, parse_errors) = kettu_parser::parse_file(&content);
+    if !parse_errors.is_empty() {
+        for error in &parse_errors {
+            eprintln!("Parse error: {}", error);
+        }
+        std::process::exit(1);
+    }
+
+    let ast = match ast {
+        Some(a) => a,
+        None => {
+            eprintln!("Failed to parse file");
+            std::process::exit(1);
+        }
+    };
+
+    let mut listed = Vec::new();
+    for item in &ast.items {
+        if let TopLevelItem::Interface(iface) = item {
+            for iface_item in &iface.items {
+                if let InterfaceItem::Func(func) = iface_item {
+                    let is_test = func.gates.iter().any(|g| matches!(g, Gate::Test));
+                    if !is_test {
+                        continue;
+                    }
+
+                    let name = &func.name.name;
+                    if let Some(f) = filter {
+                        let matches = if exact { name == f } else { name.contains(f) };
+                        if !matches {
+                            continue;
+                        }
+                    }
+
+                    listed.push(ListedTest {
+                        file: file.clone(),
+                        name: name.clone(),
+                        line: offset_to_line(&content, func.span.start),
+                        end_line: offset_to_line(&content, func.span.end),
+                    });
+                }
+            }
+        }
+    }
+
+    listed
+}
+
 /// Run tests in a Kettu file, returns (passed, failed) counts
-fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
+fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -> (usize, usize) {
     use kettu_parser::{Gate, InterfaceItem, TopLevelItem};
     use std::time::Instant;
     use wasmtime::{Engine, Instance, Module, Store};
@@ -400,8 +616,8 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
         std::process::exit(1);
     }
 
-    // Discover test functions
-    let mut tests: Vec<(&str, &kettu_parser::Func)> = Vec::new();
+    // Discover test functions — collect name, func, and source line number
+    let mut tests: Vec<(&str, &kettu_parser::Func, usize)> = Vec::new();
 
     for item in &ast.items {
         if let TopLevelItem::Interface(iface) = item {
@@ -413,11 +629,13 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
                         let name = &func.name.name;
                         // Apply filter if specified
                         if let Some(f) = filter {
-                            if !name.contains(f) {
+                            let matches = if exact { name == f } else { name.contains(f) };
+                            if !matches {
                                 continue;
                             }
                         }
-                        tests.push((name, func));
+                        let line = offset_to_line(&content, func.span.start);
+                        tests.push((name, func, line));
                     }
                 }
             }
@@ -434,6 +652,12 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
         core_only: true,
         memory_pages: 1,
         wasip3: false,
+        threads,
+        emit_dwarf: false,
+        keep_names: false,
+        debug_source: Some(content.clone()),
+        debug_path: Some(file.display().to_string()),
+        emit_debug_hooks: false,
     };
 
     let wasm_bytes = match kettu_codegen::build_core_module(&ast, &compile_options) {
@@ -445,7 +669,14 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
     };
 
     // Create wasmtime engine and module
-    let engine = Engine::default();
+    let engine = if threads {
+        let mut config = wasmtime::Config::new();
+        config.wasm_threads(true);
+        config.shared_memory(true);
+        Engine::new(&config).expect("failed to create wasmtime engine")
+    } else {
+        Engine::default()
+    };
     let module = match Module::new(&engine, &wasm_bytes) {
         Ok(m) => m,
         Err(e) => {
@@ -459,7 +690,9 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
     let mut passed = 0;
     let mut failed = 0;
 
-    for (name, func) in &tests {
+    let file_display = file.display();
+
+    for (name, func, line) in &tests {
         let start = Instant::now();
 
         // Check if test function has a body and returns bool
@@ -476,13 +709,16 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
             .unwrap_or(false);
 
         if !has_body {
-            println!("  ✗ {} (no body)", name);
+            println!("  ✗ {} (no body) — {}:{}", name, file_display, line);
             failed += 1;
             continue;
         }
 
         if !returns_bool {
-            println!("  ✗ {} (must return bool)", name);
+            println!(
+                "  ✗ {} (must return bool) — {}:{}",
+                name, file_display, line
+            );
             failed += 1;
             continue;
         }
@@ -494,20 +730,59 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
         let instance = match Instance::new(&mut store, &module, &[]) {
             Ok(i) => i,
             Err(e) => {
-                println!("  ✗ {} (instantiation failed: {})", name, e);
+                println!(
+                    "  ✗ {} (instantiation failed: {}) — {}:{}",
+                    name, e, file_display, line
+                );
                 failed += 1;
                 continue;
             }
         };
 
-        // Get the test function (use original name - exports are kebab-case)
-        let test_func = match instance.get_typed_func::<(), i32>(&mut store, name) {
-            Ok(f) => f,
-            Err(_) => {
-                // Not found - might not be exported or wrong signature
+        // Get the test function — exports may use qualified names (ns:pkg/iface#func)
+        // so search for an export ending with #name, falling back to bare name
+        let export_name = {
+            let mut found = None;
+            for export in instance.exports(&mut store) {
+                let ename = export.name();
+                if ename == *name || ename.ends_with(&format!("#{}", name)) {
+                    found = Some(ename.to_string());
+                    break;
+                }
+            }
+            found
+        };
+
+        let export_name = match export_name {
+            Some(n) => n,
+            None => {
                 let elapsed = start.elapsed();
-                println!("  ⚠ {} (not exported, skipping) ({:.1?})", name, elapsed);
-                passed += 1; // Count as passed if it compiled
+                let func_exports: Vec<String> = instance
+                    .exports(&mut store)
+                    .map(|e| e.name().to_string())
+                    .filter(|n| n != "memory" && n != "cabi_realloc" && n != "cabi_arena_reset")
+                    .collect();
+                println!(
+                    "  ✗ {} (not found in exports) ({:.1?}) — {}:{}",
+                    name, elapsed, file_display, line
+                );
+                if !func_exports.is_empty() {
+                    println!("    available: {}", func_exports.join(", "));
+                }
+                failed += 1;
+                continue;
+            }
+        };
+
+        let test_func = match instance.get_typed_func::<(), i32>(&mut store, &export_name) {
+            Ok(f) => f,
+            Err(e) => {
+                let elapsed = start.elapsed();
+                println!(
+                    "  ✗ {} (signature mismatch: {}) ({:.1?}) — {}:{}",
+                    name, e, elapsed, file_display, line
+                );
+                failed += 1;
                 continue;
             }
         };
@@ -520,13 +795,19 @@ fn run_tests(file: &PathBuf, filter: Option<&str>) -> (usize, usize) {
                     println!("  ✓ {} ({:.1?})", name, elapsed);
                     passed += 1;
                 } else {
-                    println!("  ✗ {} (returned false) ({:.1?})", name, elapsed);
+                    println!(
+                        "  ✗ {} (returned false) ({:.1?}) — {}:{}",
+                        name, elapsed, file_display, line
+                    );
                     failed += 1;
                 }
             }
             Err(e) => {
                 let elapsed = start.elapsed();
-                println!("  ✗ {} (execution error: {}) ({:.1?})", name, e, elapsed);
+                println!(
+                    "  ✗ {} (execution error: {}) ({:.1?}) — {}:{}",
+                    name, e, elapsed, file_display, line
+                );
                 failed += 1;
             }
         }

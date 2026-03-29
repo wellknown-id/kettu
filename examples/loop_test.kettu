@@ -1,0 +1,52 @@
+package example:loop-tests;
+
+interface loop-tests {
+    @test
+    test-for-basic: func() -> bool {
+        let sum = 0;
+        for i in 0 to 4 {
+            sum = sum + i;
+        };
+        return sum == 10;
+    }
+
+    @test
+    test-for-step: func() -> bool {
+        let sum = 0;
+        for i in 0 to 10 step 2 {
+            sum = sum + i;
+        };
+        return sum == 30;
+    }
+
+    @test
+    test-for-step-three: func() -> bool {
+        let sum = 0;
+        for i in 0 to 9 step 3 {
+            sum = sum + i;
+        };
+        return sum == 18;
+    }
+
+    @test
+    test-for-downto: func() -> bool {
+        let sum = 0;
+        for i in 5 downto 1 {
+            sum = sum + i;
+        };
+        return sum == 15;
+    }
+
+    @test
+    test-for-downto-step: func() -> bool {
+        let sum = 0;
+        for i in 10 downto 0 step 2 {
+            sum = sum + i;
+        };
+        return sum == 30;
+    }
+}
+
+world tests {
+    export loop-tests;
+}

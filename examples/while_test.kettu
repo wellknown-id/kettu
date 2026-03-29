@@ -1,0 +1,53 @@
+// While Loop Tests
+package local:while-tests;
+
+interface while-tests {
+    @test
+    test-while-basic: func() -> bool {
+        let i = 0;
+        while i < 5 {
+            i += 1;
+        };
+        i == 5;
+    }
+
+    @test
+    test-while-sum: func() -> bool {
+        let sum = 0;
+        let n = 1;
+        while n <= 10 {
+            sum += n;
+            n += 1;
+        };
+        sum == 55;
+    }
+
+    @test
+    test-while-compound-subtract: func() -> bool {
+        let x = 100;
+        while x > 50 {
+            x -= 10;
+        };
+        x == 50;
+    }
+
+    @test
+    test-while-nested: func() -> bool {
+        let total = 0;
+        let i = 0;
+        let j = 0;
+        while i < 3 {
+            j = 0;
+            while j < 3 {
+                total += 1;
+                j += 1;
+            };
+            i += 1;
+        };
+        total == 9;
+    }
+}
+
+world tests {
+    export while-tests;
+}

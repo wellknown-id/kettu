@@ -4,6 +4,9 @@
   "scopeName": "source.kettu",
   "patterns": [
     {
+      "include": "#comments"
+    },
+    {
       "include": "#keywords"
     },
     {
@@ -39,69 +42,9 @@
       ]
     },
     {
-      "begin": "<",
-      "end": ">",
-      "name": "meta.block.angle.kettu",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "<",
-      "end": ">",
-      "name": "meta.block.angle.kettu",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "<",
-      "end": ">",
-      "name": "meta.block.angle.kettu",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "\\(",
-      "end": "\\)",
-      "name": "meta.block.paren.kettu",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
       "begin": "\\{",
       "end": "\\}",
       "name": "meta.block.brace.kettu",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "\\(",
-      "end": "\\)",
-      "name": "meta.block.paren.kettu",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
-    },
-    {
-      "begin": "\\(",
-      "end": "\\)",
-      "name": "meta.block.paren.kettu",
       "patterns": [
         {
           "include": "$self"
@@ -117,23 +60,26 @@
           "include": "$self"
         }
       ]
-    },
-    {
-      "begin": "\\{",
-      "end": "\\}",
-      "name": "meta.block.brace.kettu",
-      "patterns": [
-        {
-          "include": "$self"
-        }
-      ]
     }
   ],
   "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "match": "//.*$",
+          "name": "comment.line.double-slash.kettu"
+        },
+        {
+          "begin": "/\\*",
+          "end": "\\*/",
+          "name": "comment.block.kettu"
+        }
+      ]
+    },
     "keywords": {
       "patterns": [
         {
-          "match": "\\b(?:package|use|as|version|feature|interface|record|variant|enum|flags|type|resource|constructor|static|func|bool|char|string|list|option|result|tuple|future|stream|async|let|return|break|continue|true|false|assert|await|if|else|while|for|in|to|downto|step|match|_|map|filter|reduce|some|none|ok|err|world|import|export|include)\\b",
+          "match": "\\b(?:package|use|as|version|feature|interface|record|variant|enum|flags|type|resource|constructor|static|func|bool|char|string|list|option|result|tuple|future|stream|async|let|shared|return|break|continue|guard|else|true|false|assert|await|if|while|for|in|to|downto|step|simd|match|_|map|filter|reduce|some|none|ok|err|atomic|load|store|add|sub|cmpxchg|wait|notify|spawn|thread|join|world|import|export|include)\\b",
           "name": "keyword.control.kettu"
         }
       ]
@@ -141,7 +87,7 @@
     "operators": {
       "patterns": [
         {
-          "match": ";|:|@|/|@since|\\(|=|\\)|@unstable|@deprecated|@test|\\{|\\}|\\.|,|<|>|u8|u16|u32|u64|s8|s16|s32|s64|f32|f64|->|!|\\|\\||&&|==|!=|<=|>=|\\+|-|\\*|\\?|\\?\\.|\\[|\\]|\\.\\.|#|=>|str-len|str-eq|list-len|list-set|list-push|\\|",
+          "match": ";|:|@|/|@since|\\(|=|\\)|@unstable|@deprecated|@test|\\{|\\}|\\.|,|<|>|u8|u16|u32|u64|s8|s16|s32|s64|f32|f64|->|\\+=|-=|!|-|\\|\\||&&|==|!=|<=|>=|\\+|\\*|\\?|\\?\\.|\\[|\\]|\\.\\.|#|=>|str-len|str-eq|list-len|list-set|list-push|\\||v128|i8x16|i16x8|i32x4|i64x2|f32x4|f64x2",
           "name": "keyword.operator.kettu"
         }
       ]

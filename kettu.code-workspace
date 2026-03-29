@@ -1,0 +1,18 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"terminal.integrated.env.linux": {
+			"PATH": "/mnt/faststorage/repos/kettu/target/debug:${env:PATH}"
+		},
+		"terminal.integrated.env.osx": {
+			"PATH": "/mnt/faststorage/repos/kettu/target/debug:${env:PATH}"
+		},
+		"terminal.integrated.env.windows": {
+			"PATH": "/mnt/faststorage/repos/kettu/target/debug;${env:PATH}"
+		}
+	}
+}

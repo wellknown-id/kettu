@@ -1,0 +1,68 @@
+// Control Flow Tests
+// Tests for if/else, negation, break, continue
+package local:control-tests;
+
+interface control-tests {
+    @test
+    test-if-true-branch: func() -> bool {
+        if true {
+            return true;
+        } else {
+            return false;
+        };
+        return false;
+    }
+
+    @test
+    test-if-false-branch: func() -> bool {
+        if false {
+            return false;
+        } else {
+            return true;
+        };
+        return false;
+    }
+
+    @test
+    test-if-comparison: func() -> bool {
+        let a = 10;
+        let b = 20;
+        if a < b {
+            return true;
+        } else {
+            return false;
+        };
+        return false;
+    }
+
+    @test
+    test-negation: func() -> bool {
+        !false;
+    }
+
+    @test
+    test-negation-comparison: func() -> bool {
+        let x = 5;
+        !(x > 10);
+    }
+
+    @test
+    test-nested-if: func() -> bool {
+        let x = 15;
+        if x > 20 {
+            return false;
+        } else {
+            if x > 10 {
+                return true;
+            } else {
+                return false;
+            };
+        };
+        return false;
+    }
+
+}
+
+world tests {
+    export control-tests;
+}

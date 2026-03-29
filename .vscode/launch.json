@@ -6,7 +6,7 @@
             "type": "extensionHost",
             "request": "launch",
             "args": [
-                "--disable-extensions",
+                "${workspaceFolder}/kettu.code-workspace",
                 "--extensionDevelopmentPath=${workspaceFolder}/crates/kettu-cli/editors/vscode"
             ],
             "preLaunchTask": "Build Kettu"

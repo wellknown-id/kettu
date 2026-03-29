@@ -2,6 +2,16 @@
     "version": "2.0.0",
     "tasks": [
         {
+            "label": "Install Extension Dependencies",
+            "type": "shell",
+            "command": "npm",
+            "args": ["install"],
+            "options": {
+                "cwd": "${workspaceFolder}/crates/kettu-cli/editors/vscode"
+            },
+            "problemMatcher": []
+        },
+        {
             "label": "Build Kettu",
             "type": "shell",
             "command": "cargo",
@@ -9,6 +19,7 @@
             "options": {
                 "cwd": "${workspaceFolder}/crates/kettu-cli"
             },
+            "dependsOn": "Install Extension Dependencies",
             "problemMatcher": ["$rustc"],
             "group": {
                 "kind": "build",

@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 kettu-parser = { path = "../kettu-parser" }
 kettu-checker = { path = "../kettu-checker" }
+gimli = "0.33.0"
 wasm-encoder = { workspace = true }
 wit-component = { workspace = true }
 wit-parser = { workspace = true }
