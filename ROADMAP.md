@@ -152,12 +152,13 @@ Foundation (C): `shared<dtype>` with method syntax. Sugar (B): `shared let` + `a
 - [x] Tests for nested closure stepping — use a fixture with nested closures and back-to-back breakpoints, asserting frame names and monotonic line progression
 - [x] Control-flow stepping regression coverage — assert taken `if` branches are followed and unreachable breakpoints are skipped in the current DAP
 - [x] Test coverage for real DWARF output — validate with `gimli` that emitted debug builds contain real compile units, subprogram DIEs, and line rows
-- Current implementation note: `kettu build --debug` now emits DWARF-only debug metadata, and `kettu dap` reads symbol ranges from that DWARF while still using AST/trace-driven stepping rather than Wasmtime-backed execution.
+- Current implementation note: `kettu build --debug` now emits DWARF-only debug metadata, and `kettu dap` reads symbol ranges from that DWARF while driving step/breakpoint flow from Wasmtime-executed runtime traces. Locals and captures still rely on AST/env inference until DWARF variable locations exist.
 
 ### Phase 16c: Real DWARF Debugging
 
 - [ ] Extend DWARF emission with lexical scopes and variable locations for functions and lambdas
-- [ ] Drive `kettu dap` from executing Wasm/Wasmtime state using real DWARF instead of AST/trace simulation
+- [x] Drive `kettu dap` step/breakpoint flow from executing Wasm/Wasmtime state instead of AST line simulation
+- [ ] Replace AST-inferred locals/captures with DWARF-backed scopes and variable locations during debugging
 - [ ] Add validation that `kettu build --debug` output is consumable by external DWARF-aware tooling, not just Kettu's own parser/tests
 
 [^1]: Syntactic sugar for atomic operations:

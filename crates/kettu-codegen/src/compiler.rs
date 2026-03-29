@@ -67,6 +67,8 @@ pub struct CompileOptions {
     pub debug_source: Option<String>,
     /// Optional source path used for DWARF file metadata
     pub debug_path: Option<String>,
+    /// If true, emit debugger-only runtime hooks at executable line boundaries.
+    pub emit_debug_hooks: bool,
 }
 
 /// Compilation error
@@ -116,6 +118,75 @@ fn offset_to_line(source: &str, offset: usize) -> usize {
         .filter(|b| *b == b'\n')
         .count()
         + 1
+}
+
+fn expr_start_line(expr: &Expr, source: &str) -> i64 {
+    match expr {
+        Expr::Ident(id) => offset_to_line(source, id.span.start) as i64,
+        Expr::Integer(_, span)
+        | Expr::String(_, span)
+        | Expr::InterpolatedString(_, span)
+        | Expr::Bool(_, span)
+        | Expr::Call { span, .. }
+        | Expr::Field { span, .. }
+        | Expr::OptionalChain { span, .. }
+        | Expr::Try { span, .. }
+        | Expr::Binary { span, .. }
+        | Expr::If { span, .. }
+        | Expr::Assert(_, span)
+        | Expr::Not(_, span)
+        | Expr::Neg(_, span)
+        | Expr::StrLen(_, span)
+        | Expr::StrEq(_, _, span)
+        | Expr::ListLen(_, span)
+        | Expr::ListSet(_, _, _, span)
+        | Expr::ListPush(_, _, span)
+        | Expr::Lambda { span, .. }
+        | Expr::Map { span, .. }
+        | Expr::Filter { span, .. }
+        | Expr::Reduce { span, .. }
+        | Expr::RecordLiteral { span, .. }
+        | Expr::VariantLiteral { span, .. }
+        | Expr::Match { span, .. }
+        | Expr::While { span, .. }
+        | Expr::Range { span, .. }
+        | Expr::For { span, .. }
+        | Expr::ListLiteral { span, .. }
+        | Expr::Index { span, .. }
+        | Expr::Slice { span, .. }
+        | Expr::ForEach { span, .. }
+        | Expr::Await { span, .. }
+        | Expr::AtomicLoad { span, .. }
+        | Expr::AtomicStore { span, .. }
+        | Expr::AtomicAdd { span, .. }
+        | Expr::AtomicSub { span, .. }
+        | Expr::AtomicCmpxchg { span, .. }
+        | Expr::AtomicWait { span, .. }
+        | Expr::AtomicNotify { span, .. }
+        | Expr::Spawn { span, .. }
+        | Expr::ThreadJoin { span, .. }
+        | Expr::AtomicBlock { span, .. }
+        | Expr::SimdOp { span, .. }
+        | Expr::SimdForEach { span, .. } => offset_to_line(source, span.start) as i64,
+    }
+}
+
+fn statement_start_line(stmt: &Statement, source: &str) -> i64 {
+    match stmt {
+        Statement::Expr(expr) => expr_start_line(expr, source),
+        Statement::Let { name, .. }
+        | Statement::Assign { name, .. }
+        | Statement::CompoundAssign { name, .. }
+        | Statement::SharedLet { name, .. }
+        | Statement::GuardLet { name, .. } => offset_to_line(source, name.span.start) as i64,
+        Statement::Return(Some(expr)) => expr_start_line(expr, source),
+        Statement::Return(None) => 0,
+        Statement::Break { condition } | Statement::Continue { condition } => condition
+            .as_deref()
+            .map(|expr| expr_start_line(expr, source))
+            .unwrap_or(0),
+        Statement::Guard { condition, .. } => expr_start_line(condition, source),
+    }
 }
 
 fn collect_code_section_ranges(
@@ -301,6 +372,8 @@ struct ModuleCompiler<'a> {
     imported_interfaces: HashMap<String, (String, HashMap<String, u32>)>,
     /// Index of the task.return canonical built-in (for async exports)
     task_return_func_idx: Option<u32>,
+    /// Index of the debugger line hook import
+    debug_hook_idx: Option<u32>,
     /// Type index for task.return for each result type
     task_return_types: HashMap<Vec<ValType>, u32>,
     /// Callback function bodies for async functions: (entry_func_name, func, state_local_count)
@@ -327,7 +400,7 @@ struct ModuleCompiler<'a> {
 
 impl<'a> ModuleCompiler<'a> {
     fn new(options: &'a CompileOptions) -> Self {
-        Self {
+        let mut compiler = Self {
             options,
             types: Vec::new(),
             functions: HashMap::new(),
@@ -348,6 +421,7 @@ impl<'a> ModuleCompiler<'a> {
             closure_info: HashMap::new(),
             imported_interfaces: HashMap::new(),
             task_return_func_idx: None,
+            debug_hook_idx: None,
             task_return_types: HashMap::new(),
             callback_bodies: Vec::new(),
             waitable_set_new_idx: None,
@@ -360,7 +434,52 @@ impl<'a> ModuleCompiler<'a> {
             shared_locals: std::collections::HashSet::new(),
             loop_break_depth: None,
             loop_continue_depth: None,
+        };
+        if options.emit_debug_hooks {
+            compiler.ensure_debug_hook_import();
         }
+        compiler
+    }
+
+    fn ensure_debug_hook_import(&mut self) -> u32 {
+        if let Some(idx) = self.debug_hook_idx {
+            return idx;
+        }
+
+        let type_idx = self.get_or_create_type(&[ValType::I32], &[]);
+        let func_idx = self.import_count;
+        self.import_count += 1;
+        self.functions
+            .insert("$debug_line".to_string(), (type_idx, func_idx, true));
+        self.debug_hook_idx = Some(func_idx);
+        func_idx
+    }
+
+    fn emit_debug_line_hook(&mut self, function: &mut Function, line: i64) {
+        if !self.options.emit_debug_hooks || line <= 0 {
+            return;
+        }
+
+        let Some(debug_hook_idx) = self.debug_hook_idx else {
+            return;
+        };
+
+        function.instruction(&Instruction::I32Const(line as i32));
+        function.instruction(&Instruction::Call(debug_hook_idx));
+    }
+
+    fn emit_debug_line_hook_for_expr(&mut self, function: &mut Function, expr: &Expr) {
+        let Some(source) = self.options.debug_source.as_deref() else {
+            return;
+        };
+        self.emit_debug_line_hook(function, expr_start_line(expr, source));
+    }
+
+    fn emit_debug_line_hook_for_statement(&mut self, function: &mut Function, stmt: &Statement) {
+        let Some(source) = self.options.debug_source.as_deref() else {
+            return;
+        };
+        self.emit_debug_line_hook(function, statement_start_line(stmt, source));
     }
 
     fn emit_name_section(&self, module: &mut Module) {
@@ -662,7 +781,8 @@ impl<'a> ModuleCompiler<'a> {
                     locals.insert(param.name.clone(), (capture_count + i) as u32);
                 }
                 let locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();
-                let mut func = Function::new(vec![]);
+                let mut func = Function::new(vec![(16, ValType::I32)]);
+                self.emit_debug_line_hook_for_expr(&mut func, body);
                 self.compile_expr_with_locals(&mut func, body, &locals, &locals_types)?;
                 func.instruction(&Instruction::End);
                 compiled_lambdas.push(func);
@@ -706,8 +826,9 @@ impl<'a> ModuleCompiler<'a> {
         for (_, _, body_stmts) in &spawn_bodies_clone {
             let mut locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();
             let locals: HashMap<String, u32> = HashMap::new();
-            let mut func = Function::new(vec![]);
+            let mut func = Function::new(vec![(16, ValType::I32)]);
             for stmt in body_stmts {
+                self.emit_debug_line_hook_for_statement(&mut func, stmt);
                 match stmt {
                     Statement::Expr(e) => {
                         self.compile_expr_with_locals(&mut func, e, &locals, &locals_types)?;
@@ -758,6 +879,31 @@ impl<'a> ModuleCompiler<'a> {
         // 2. Import section
         let mut imports = ImportSection::new();
 
+        if self.debug_hook_idx.is_some() {
+            let type_idx = self.get_or_create_type(&[ValType::I32], &[]);
+            imports.import("kettu:debug", "line", EntityType::Function(type_idx));
+        }
+
+        // Add interface function imports
+        for item in &file.items {
+            if let TopLevelItem::Interface(iface) = item {
+                for iface_item in &iface.items {
+                    if let InterfaceItem::Func(func) = iface_item {
+                        if func.body.is_none() {
+                            if let Some(&(type_idx, _, true)) = self.functions.get(&func.name.name)
+                            {
+                                imports.import(
+                                    &iface.name.name,
+                                    &func.name.name,
+                                    EntityType::Function(type_idx),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Add task.return imports for async functions when --wasip3 is enabled
         if self.options.wasip3 {
             // Get package path for fully qualified interface names
@@ -786,7 +932,6 @@ impl<'a> ModuleCompiler<'a> {
             let task_return_entries: Vec<_> = self.task_return_types.keys().cloned().collect();
             for result_types in task_return_entries {
                 let type_idx = self.get_or_create_type(&result_types, &[]);
-                // Import from fully-qualified canon-async interface
                 imports.import(
                     &async_interface_name,
                     "task-return",
@@ -794,7 +939,6 @@ impl<'a> ModuleCompiler<'a> {
                 );
             }
 
-            // Add waitable-set and subtask imports if they were used
             if self.waitable_set_new_idx.is_some() {
                 let type_idx = self.get_or_create_type(&[], &[ValType::I32]);
                 imports.import(
@@ -819,26 +963,6 @@ impl<'a> ModuleCompiler<'a> {
                     "subtask-drop",
                     EntityType::Function(type_idx),
                 );
-            }
-        }
-
-        // Add interface function imports
-        for item in &file.items {
-            if let TopLevelItem::Interface(iface) = item {
-                for iface_item in &iface.items {
-                    if let InterfaceItem::Func(func) = iface_item {
-                        if func.body.is_none() {
-                            if let Some(&(type_idx, _, true)) = self.functions.get(&func.name.name)
-                            {
-                                imports.import(
-                                    &iface.name.name,
-                                    &func.name.name,
-                                    EntityType::Function(type_idx),
-                                );
-                            }
-                        }
-                    }
-                }
             }
         }
 
@@ -2442,6 +2566,7 @@ impl<'a> ModuleCompiler<'a> {
                 }
                 // Last statement: if it's an expression, leave value on stack for return
                 let last = &stmts[stmts.len() - 1];
+                self.emit_debug_line_hook_for_statement(&mut function, last);
                 match last {
                     Statement::CompoundAssign { name, op, value } => {
                         // Compile as: local.get + value + op + local.set
@@ -2812,6 +2937,7 @@ impl<'a> ModuleCompiler<'a> {
         locals: &HashMap<String, u32>,
         locals_types: &mut HashMap<String, RecordTypeInfo>,
     ) -> Result<(), CompileError> {
+        self.emit_debug_line_hook_for_statement(function, stmt);
         match stmt {
             Statement::Expr(expr) => {
                 self.compile_expr_with_locals(function, expr, locals, locals_types)?;
@@ -2954,6 +3080,7 @@ impl<'a> ModuleCompiler<'a> {
         function: &mut Function,
         stmt: &Statement,
     ) -> Result<(), CompileError> {
+        self.emit_debug_line_hook_for_statement(function, stmt);
         match stmt {
             Statement::CompoundAssign { .. } => {
                 function.instruction(&Instruction::I32Const(0));
@@ -3259,6 +3386,7 @@ impl<'a> ModuleCompiler<'a> {
                         compiler.compile_statement(function, stmt)?;
                     }
                     // Last statement: compile without dropping
+                    compiler.emit_debug_line_hook_for_statement(function, &stmts[stmts.len() - 1]);
                     match &stmts[stmts.len() - 1] {
                         Statement::Expr(expr) => {
                             compiler.compile_expr(function, expr)?;
@@ -3819,6 +3947,7 @@ impl<'a> ModuleCompiler<'a> {
 
                 // Compile lambda body with param bound to elem_local
                 if let Expr::Lambda { params, body, .. } = lambda.as_ref() {
+                    self.emit_debug_line_hook_for_expr(function, body);
                     if !params.is_empty() {
                         // Bind the lambda param to elem_local
                         let mut inner_locals = locals.clone();
@@ -3953,6 +4082,7 @@ impl<'a> ModuleCompiler<'a> {
 
                 // Evaluate predicate with param bound to elem_local
                 if let Expr::Lambda { params, body, .. } = lambda.as_ref() {
+                    self.emit_debug_line_hook_for_expr(function, body);
                     if !params.is_empty() {
                         let mut inner_locals = locals.clone();
                         inner_locals.insert(params[0].name.clone(), elem_local);
@@ -4084,6 +4214,7 @@ impl<'a> ModuleCompiler<'a> {
 
                 // Compile lambda body with acc and elem bound
                 if let Expr::Lambda { params, body, .. } = lambda.as_ref() {
+                    self.emit_debug_line_hook_for_expr(function, body);
                     let mut inner_locals = locals.clone();
                     // Bind first param to acc
                     if !params.is_empty() {
@@ -4498,6 +4629,7 @@ impl<'a> ModuleCompiler<'a> {
                         )?;
                     }
                     // Last statement: leave value on stack
+                    compiler.emit_debug_line_hook_for_statement(function, &stmts[stmts.len() - 1]);
                     match &stmts[stmts.len() - 1] {
                         Statement::Expr(expr) => {
                             compiler.compile_expr_with_locals(

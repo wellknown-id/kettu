@@ -287,6 +287,7 @@ async fn main() {
                 keep_names: keep_names || debug,
                 debug_source: Some(content.clone()),
                 debug_path: Some(file.display().to_string()),
+                emit_debug_hooks: false,
             };
 
             let wasm = if core {
@@ -656,6 +657,7 @@ fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -
         keep_names: false,
         debug_source: Some(content.clone()),
         debug_path: Some(file.display().to_string()),
+        emit_debug_hooks: false,
     };
 
     let wasm_bytes = match kettu_codegen::build_core_module(&ast, &compile_options) {

@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use wasmparser::{Parser, Payload};
+use wasmtime::{Engine, Linker, Module, Store};
 
 #[derive(Clone, Debug)]
 struct ListedTest {
@@ -85,6 +86,7 @@ impl Variable {
 struct ActiveClosure {
     closure_index: usize,
     resume_line_after_closure: Option<i64>,
+    resume_trace_index_after_closure: Option<usize>,
     param_bindings: HashMap<String, SimpleValue>,
     capture_bindings: HashMap<String, SimpleValue>,
 }
@@ -105,6 +107,11 @@ struct DebugSymbols {
 struct DwarfLineRow {
     address: u64,
     line: i64,
+}
+
+#[derive(Default)]
+struct RuntimeTraceState {
+    lines: Vec<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -238,30 +245,23 @@ impl DebugSession {
             .find(|closure| closure.closure_index == closure_index)
     }
 
+    fn sync_active_closures_with_current_line(&mut self) {
+        while let Some(active) = self.active_closures.last() {
+            let closure = &self.closures[active.closure_index];
+            if self.current_line < closure.start_line || self.current_line > closure.end_line {
+                self.active_closures.pop();
+            } else {
+                break;
+            }
+        }
+    }
+
     fn advance_one_line(&mut self) -> bool {
         if self.tests.is_empty() {
             return false;
         }
 
         loop {
-            // If we're stepping inside a callable closure body, stay within its range and then resume
-            if let Some(active) = self.active_closures.last() {
-                let closure = &self.closures[active.closure_index];
-                if self.current_line < closure.end_line {
-                    self.current_line += 1;
-                    return true;
-                } else {
-                    // Exiting closure: resume after the call site
-                    let resume = self
-                        .active_closures
-                        .pop()
-                        .and_then(|closure_state| closure_state.resume_line_after_closure)
-                        .unwrap_or(self.current_line + 1);
-                    self.set_test_position_before_line(resume);
-                    continue;
-                }
-            }
-
             if self.current_test >= self.tests.len() {
                 return false;
             }
@@ -272,6 +272,7 @@ impl DebugSession {
                 if let Some(entry) = test.trace.get(next_index) {
                     self.current_trace_index = Some(next_index);
                     self.current_line = entry.line;
+                    self.sync_active_closures_with_current_line();
                     return true;
                 }
 
@@ -325,14 +326,28 @@ impl DebugSession {
             if let Some((closure_index, resume_line, param_bindings, capture_bindings)) =
                 find_invoked_closure(self, self.current_line)
             {
+                let closure = &self.closures[closure_index];
+                let enter_in_place = self.current_line >= closure.start_line
+                    && self.current_line <= closure.end_line;
                 self.active_closures.push(ActiveClosure {
                     closure_index,
                     resume_line_after_closure: Some(resume_line),
+                    resume_trace_index_after_closure: enter_in_place
+                        .then(|| self.current_trace_index.map(|index| index + 1))
+                        .flatten(),
                     param_bindings,
                     capture_bindings,
                 });
-                self.current_line = self.closures[closure_index].start_line;
-                return StopOutcome::Stopped("step");
+                if enter_in_place {
+                    return StopOutcome::Stopped("step");
+                }
+                if self.advance_one_line() {
+                    if self.breakpoint_hit(self.current_line) {
+                        return StopOutcome::Stopped("breakpoint");
+                    }
+                    return StopOutcome::Stopped("step");
+                }
+                return StopOutcome::Terminated;
             }
         }
 
@@ -349,6 +364,16 @@ impl DebugSession {
 
     fn step_out_of_closure(&mut self) -> bool {
         if let Some(active) = self.active_closures.pop() {
+            if let Some(resume_index) = active.resume_trace_index_after_closure {
+                if let Some(test) = self.tests.get(self.current_test) {
+                    if let Some(entry) = test.trace.get(resume_index) {
+                        self.current_trace_index = Some(resume_index);
+                        self.current_line = entry.line;
+                        self.sync_active_closures_with_current_line();
+                        return true;
+                    }
+                }
+            }
             let resume = active
                 .resume_line_after_closure
                 .unwrap_or(self.current_line + 1);
@@ -357,32 +382,23 @@ impl DebugSession {
             } else {
                 self.current_line = resume;
             }
+            self.sync_active_closures_with_current_line();
             return true;
         }
 
         if let Some(closure_index) = self.active_closure_indices().last().copied() {
-            self.current_line = self.closures[closure_index].end_line + 1;
+            if let Some(line) =
+                self.first_trace_line_at_or_after(self.closures[closure_index].end_line + 1)
+            {
+                self.current_line = line;
+            } else {
+                self.current_line = self.closures[closure_index].end_line + 1;
+            }
+            self.sync_active_closures_with_current_line();
             return true;
         }
 
         false
-    }
-
-    fn set_test_position_before_line(&mut self, line: i64) {
-        let Some(test) = self.tests.get(self.current_test) else {
-            self.current_line = line.saturating_sub(1);
-            self.current_trace_index = None;
-            return;
-        };
-
-        if test.trace.is_empty() {
-            self.current_line = line.saturating_sub(1);
-            self.current_trace_index = None;
-            return;
-        }
-
-        self.current_trace_index = test.trace.iter().rposition(|entry| entry.line < line);
-        self.current_line = line.saturating_sub(1);
     }
 
     fn first_trace_line_at_or_after(&mut self, line: i64) -> Option<i64> {
@@ -765,6 +781,7 @@ fn load_program_state(program: Option<PathBuf>) -> Result<ProgramState, String> 
     let debug_symbols = build_debug_symbols(&program, &source, &ast)?;
     apply_debug_symbols(&mut tests, &mut closures, &debug_symbols);
     build_test_traces(&mut tests, &closures, &source);
+    build_runtime_test_traces(&program, &source, &ast, &mut tests)?;
 
     Ok(ProgramState {
         source_text: source.clone(),
@@ -773,6 +790,165 @@ fn load_program_state(program: Option<PathBuf>) -> Result<ProgramState, String> 
         closures,
         debug_symbols,
     })
+}
+
+fn build_runtime_test_traces(
+    program: &PathBuf,
+    source: &str,
+    ast: &kettu_parser::WitFile,
+    tests: &mut [ListedTest],
+) -> Result<(), String> {
+    let wasm = compile_debug_runtime_module(program, source, ast)?;
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm)
+        .map_err(|err| format!("Failed to load debug runtime wasm: {}", err))?;
+
+    for test in tests {
+        let simulated_trace = std::mem::take(&mut test.trace);
+        let actual_lines = run_test_with_runtime_trace(&engine, &module, &test.name)?;
+        if actual_lines.is_empty() {
+            test.trace = simulated_trace;
+            continue;
+        }
+
+        if let Some(first_line) = actual_lines.first().copied() {
+            test.line = first_line;
+        }
+        if let Some(max_line) = actual_lines.iter().max().copied() {
+            test.end_line = test.end_line.max(max_line);
+        }
+        test.trace = merge_runtime_trace(actual_lines, &simulated_trace);
+    }
+
+    Ok(())
+}
+
+fn compile_debug_runtime_module(
+    program: &PathBuf,
+    source: &str,
+    ast: &kettu_parser::WitFile,
+) -> Result<Vec<u8>, String> {
+    let imported_asts = crate::load_imported_asts(program, ast);
+    let imported_aliases: HashSet<String> = imported_asts
+        .iter()
+        .map(|(alias, _)| alias.clone())
+        .collect();
+
+    let diagnostics = kettu_checker::check(ast);
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| matches!(diagnostic.severity, kettu_checker::Severity::Error))
+        .filter(|diagnostic| {
+            if diagnostic.message.starts_with("Unknown variable: ") {
+                let variable = diagnostic.message.trim_start_matches("Unknown variable: ");
+                !imported_aliases.contains(variable)
+            } else {
+                true
+            }
+        })
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect();
+
+    if !errors.is_empty() {
+        return Err(format!(
+            "Failed to build runtime debug module: {}",
+            errors.join("; ")
+        ));
+    }
+
+    let compile_options = kettu_codegen::CompileOptions {
+        core_only: true,
+        memory_pages: 1,
+        wasip3: false,
+        threads: false,
+        emit_dwarf: false,
+        keep_names: true,
+        debug_source: Some(source.to_string()),
+        debug_path: Some(program.display().to_string()),
+        emit_debug_hooks: true,
+    };
+
+    if imported_asts.is_empty() {
+        kettu_codegen::build_core_module(ast, &compile_options)
+            .map_err(|err| format!("Failed to build runtime debug module: {}", err))
+    } else {
+        let imports_refs: Vec<_> = imported_asts
+            .iter()
+            .map(|(alias, ast)| (alias.clone(), ast))
+            .collect();
+        kettu_codegen::compile_module_with_imports(ast, &imports_refs, &compile_options)
+            .map_err(|err| format!("Failed to build runtime debug module: {}", err))
+    }
+}
+
+fn run_test_with_runtime_trace(
+    engine: &Engine,
+    module: &Module,
+    test_name: &str,
+) -> Result<Vec<i64>, String> {
+    let mut linker = Linker::new(engine);
+    linker
+        .func_wrap(
+            "kettu:debug",
+            "line",
+            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>, line: i32| {
+                if line > 0 {
+                    caller.data_mut().lines.push(line as i64);
+                }
+            },
+        )
+        .map_err(|err| format!("Failed to wire debug line hook: {}", err))?;
+
+    let mut store = Store::new(engine, RuntimeTraceState::default());
+    let instance = linker
+        .instantiate(&mut store, module)
+        .map_err(|err| format!("Failed to instantiate runtime debug module: {}", err))?;
+    let export_name = find_test_export_name(&mut store, &instance, test_name)
+        .ok_or_else(|| format!("Failed to find test export for '{}'", test_name))?;
+    let test_func = instance
+        .get_typed_func::<(), i32>(&mut store, &export_name)
+        .map_err(|err| format!("Failed to load test export '{}': {}", export_name, err))?;
+
+    let _ = test_func.call(&mut store, ());
+    Ok(store.data().lines.clone())
+}
+
+fn find_test_export_name(
+    store: &mut Store<RuntimeTraceState>,
+    instance: &wasmtime::Instance,
+    test_name: &str,
+) -> Option<String> {
+    instance
+        .exports(store)
+        .map(|export| export.name().to_string())
+        .find(|name| name == test_name || name.ends_with(&format!("#{}", test_name)))
+}
+
+fn merge_runtime_trace(lines: Vec<i64>, simulated_trace: &[TraceEvent]) -> Vec<TraceEvent> {
+    let mut search_start = 0usize;
+
+    lines
+        .into_iter()
+        .map(|line| {
+            let env_before = simulated_trace[search_start..]
+                .iter()
+                .position(|entry| entry.line == line)
+                .and_then(|offset| {
+                    let entry = simulated_trace.get(search_start + offset)?;
+                    search_start += offset + 1;
+                    Some(entry.env_before.clone())
+                })
+                .or_else(|| {
+                    simulated_trace
+                        .iter()
+                        .find(|entry| entry.line == line)
+                        .map(|entry| entry.env_before.clone())
+                })
+                .unwrap_or_default();
+
+            TraceEvent { line, env_before }
+        })
+        .collect()
 }
 
 fn build_stack_frames(session: &DebugSession) -> Vec<Value> {
@@ -1366,6 +1542,7 @@ fn build_debug_symbols(
         keep_names: true,
         debug_source: Some(source.to_string()),
         debug_path: Some(program.display().to_string()),
+        emit_debug_hooks: false,
     };
 
     let wasm = if imported_asts.is_empty() {
