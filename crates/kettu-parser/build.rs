@@ -1,9 +1,9 @@
 fn main() {
     println!("cargo:rerun-if-changed=src");
-    rust_sitter_tool::build_parser("src/grammar/mod.rs");
+    krust_sitter_tool::build_parser("src/grammar/mod.rs");
 
     // Generate TextMate grammars from the same grammar source
-    use rust_sitter_tool::TextMateBuilder;
+    use krust_sitter_tool::TextMateBuilder;
 
     // Kettu textmate grammar
     if let Some(json) = TextMateBuilder::default()
