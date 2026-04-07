@@ -51,6 +51,7 @@ kettu build --threads example.kettu   # with concurrency
 ## Documentation
 
 - [Language Overview](docs/language-overview.md) — types, control flow, functions
+- [Examples](docs/examples/index.md) — functional Kettu code examples
 - [Concurrency](docs/concurrency.md) — threads, atomics, shared memory
 
 ## Toolchain

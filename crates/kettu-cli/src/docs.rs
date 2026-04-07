@@ -186,7 +186,8 @@ fn load_docs() -> Vec<DocPage> {
             match s {
                 "Getting Started" => 0,
                 "Language Topics" => 1,
-                "Advanced Topics" => 2,
+                "Examples" => 2,
+                "Advanced Topics" => 3,
                 _ => 99,
             }
         };
