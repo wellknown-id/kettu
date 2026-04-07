@@ -1,6 +1,6 @@
 I want to add a code by contract features to kettu language. The first of these contracts I would like to explore is the function parameter constraint. The feature would allow a developer to write "where ..." expressions behind the type specifier in a function signature and kettu would use this information in two ways. At runtime it would inject assertions at the head of the function body to bail out if a constraint is not met, and secondly this feature would be embedded as metadata in built wasm modules (as well as being available in source of course) so that the kettu compiler can analyse code paths where constants would violate constraints. The comptime nature of the contraints would naturally allow static analyse to surface constraints in dependencies thereby implicitly constraining callees that pass constants through etc as seen in Example 3 and Example 4.
 
-Additionally in these examples we are introducing a new expected-error syntax that applies in tests only. In a test marked with @test, a comment that starts with three slashes /// followed by any whitespace and up caret ^ should be interpreted by the compiler as a "hush" signal for the error it marks. That error should be emitted at the "Information" level if the text corresponds with the comment text, otherwise it is an error as usual. This is to allow developers to test contracts correctly prevent compilation without yielded an error. This syntax should only work inside the body of a function marked with the test attribute @test.
+Additionally in these examples we are introducing a new expected-error syntax that applies in tests only. In a test marked with @test or test helper marked @test-helper a comment that starts with three slashes /// followed by any whitespace and up caret ^ should be interpreted by the compiler as a "hush" signal for the error it marks. That error should be emitted at the "Information" level if the text corresponds with the comment text, otherwise it is an error as usual. This is to allow developers to test contracts correctly prevent compilation without yielded an error. This syntax should only work inside the body of a function marked with the test or test-helper attribute @test or @test-helper.
 
 ```kettu
 package local:contract-tests;
@@ -30,6 +30,7 @@ interface contract-tests {
     }
 
     /// Example 4: Another implicit parameter constraint.
+    @test-helper
     call-test-bounds: func(somesmall: s32) -> bool {
         let big = 10;
         test-bounds(somesmall, big);

@@ -25,6 +25,7 @@ interface contract-tests {
     }
 
     /// Example 4: Another implicit parameter constraint.
+    @test-helper
     call-test-bounds: func(somesmall: s32) -> bool {
         let big = 10;
         test-bounds(somesmall, big);
