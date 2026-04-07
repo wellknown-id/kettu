@@ -1,0 +1,47 @@
+package local:contract-tests;
+
+interface contract-tests {
+
+    /// Example 1: A simple parameter constraint.
+    @test
+    test-bounds: func(small: s32, big: s32 where big > small)-> bool {
+        true
+    }
+
+    /// Example 2: Another simple parameter constraint.
+    @test
+    test-ten-items-or-less: func(count: s32 where count < 10, items: list<s32>)-> bool {
+        let x = 10;
+        true
+    }
+
+    /// Example 3: An implicit parameter constraint.
+    @test
+    test-bounds-called: func() -> bool {
+        let big = 10;
+        let small = 20;
+        test-bounds(small, big);
+        ///                ^ big does not satisfy the constraint "big (10) > small (20)" on test-bounds
+    }
+
+    /// Example 4: Another implicit parameter constraint.
+    call-test-bounds: func(somesmall: s32) -> bool {
+        let big = 10;
+        test-bounds(somesmall, big);
+        ///                    ^ big may not satisfy the constraint "big (10) > small (somesmall)" because somesmall is an unconstrained parameter, test-bounds must be called with a guard
+        guard let mustbetrue = test-bounds(somesmall, big) else {
+            return false;
+        };
+        mustbetrue;
+    }
+    @test
+    test-bounds-called-again: func() -> bool {
+        let small = 10;
+        call-test-bounds(small);
+        ///              ^ small does not satisfy the constraint "big (10) > small (10)" on test-bounds (via call-test-bounds)
+    }
+}
+
+world tests {
+    export contract-tests;
+}
