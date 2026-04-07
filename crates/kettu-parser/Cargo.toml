@@ -6,12 +6,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-rust-sitter.workspace = true
+krust-sitter.workspace = true
 ariadne.workspace = true
 serde = { workspace = true, optional = true }
 
 [build-dependencies]
-rust-sitter-tool.workspace = true
+krust-sitter-tool.workspace = true
 serde_json.workspace = true
 
 [features]
