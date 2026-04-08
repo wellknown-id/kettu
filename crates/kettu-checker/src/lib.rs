@@ -2753,6 +2753,7 @@ impl Checker {
                                             &constraint.constraint,
                                             &constraint.param_name,
                                             arg_value.unwrap_or(0),
+                                            &param_to_arg,
                                         );
                                         // Try to get caller arg name for better error message
                                         let arg_name = self.get_arg_name(arg_expr);
@@ -2801,6 +2802,7 @@ impl Checker {
                                                 &constraint.constraint,
                                                 &constraint.param_name,
                                                 arg_value.unwrap_or(0),
+                                                &param_to_arg,
                                             );
                                             format!(
                                                 "{} may not satisfy the constraint \"{}\" because {} is an unconstrained parameter, {} must be called with a guard",
@@ -3021,23 +3023,39 @@ impl Checker {
         constraint: &Expr,
         param_name: &str,
         arg_val: i64,
+        param_to_arg: &HashMap<String, &Expr>,
     ) -> String {
         match constraint {
             Expr::Binary { lhs, op, rhs, .. } => {
-                let lhs_str = self.fmt_expr_with_value(lhs, param_name, arg_val);
-                let rhs_str = self.fmt_expr_with_value(rhs, param_name, arg_val);
+                let lhs_str = self.fmt_expr_with_value(lhs, param_name, arg_val, param_to_arg);
+                let rhs_str = self.fmt_expr_with_value(rhs, param_name, arg_val, param_to_arg);
                 format!("{} {} {}", lhs_str, self.fmt_op(*op), rhs_str)
             }
             _ => "constraint evaluation failed".to_string(),
         }
     }
 
-    fn fmt_expr_with_value(&self, expr: &Expr, param_name: &str, arg_val: i64) -> String {
+    fn fmt_expr_with_value(
+        &self,
+        expr: &Expr,
+        param_name: &str,
+        arg_val: i64,
+        param_to_arg: &HashMap<String, &Expr>,
+    ) -> String {
         match expr {
             Expr::Integer(n, _) => n.to_string(),
             Expr::Ident(id) => {
                 if id.name == param_name {
                     format!("{} ({})", param_name, arg_val)
+                } else if let Some(arg_expr) = param_to_arg.get(&id.name) {
+                    let val = self.const_value(arg_expr);
+                    match val {
+                        Some(v) => format!("{} ({})", id.name, v),
+                        None => {
+                            let arg_name = self.get_arg_name(arg_expr);
+                            format!("{} ({})", id.name, arg_name)
+                        }
+                    }
                 } else {
                     self.constants
                         .get(&id.name)
@@ -5279,7 +5297,7 @@ mod tests {
                 helper: func(x: s32) -> result<bool, string> {
                     let big = 10;
                     bounded(x, big);
-                    ///    ^ big may not satisfy the constraint "big (10) > small" because x is an unconstrained parameter, bounded must be called with a guard
+                    ///    ^ big may not satisfy the constraint "big (10) > small (x)" because x is an unconstrained parameter, bounded must be called with a guard
                     guard let r = bounded(x, big) else {
                         return result#err("fail");
                     };
