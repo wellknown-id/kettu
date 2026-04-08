@@ -267,6 +267,8 @@ struct Checker {
     in_test_function: bool,
     /// Declared return type of the current function being validated
     current_return_type: Option<CheckedType>,
+    /// Whether the current expression is the value of a guard-let (skip constraint checks)
+    in_guard_let: bool,
 }
 
 /// Checked type representation for expression type checking
@@ -320,6 +322,7 @@ impl Checker {
             hush_comments: Vec::new(),
             in_test_function: false,
             current_return_type: None,
+            in_guard_let: false,
         }
     }
 
@@ -1021,7 +1024,9 @@ impl Checker {
                 value,
                 else_body,
             } => {
+                self.in_guard_let = true;
                 let value_ty = self.check_expr(value);
+                self.in_guard_let = false;
                 let binding_ty = self.guard_binding_type(value_ty, Self::expr_span(value));
                 self.validate_guard_else_body(
                     else_body,
@@ -2709,6 +2714,9 @@ fn package_path_to_string(path: &PackagePath) -> String {
 
 impl Checker {
     fn check_call_constraints(&mut self, func: &Id, args: &[Expr], span: &Span) {
+        if self.in_guard_let {
+            return;
+        }
         if let Some(iface_name) = &self.current_interface {
             if let Some(iface) = self.interfaces.get(iface_name) {
                 if let Some(constraints) = iface.function_constraints.get(&func.name) {
