@@ -2797,12 +2797,15 @@ impl Checker {
                                                 .get(&constraint.param_name)
                                                 .map(|e| self.get_arg_name(e))
                                                 .unwrap_or_else(|| constraint.param_name.clone());
-                                            format!(
-                                                "{} may not satisfy the constraint \"{} ({}) > {}\" because {} is an unconstrained parameter, {} must be called with a guard",
-                                                arg_name,
-                                                constraint.param_name,
+                                            let constraint_msg = self.fmt_constraint_with_values(
+                                                &constraint.constraint,
+                                                &constraint.param_name,
                                                 arg_value.unwrap_or(0),
-                                                var_names.join(", "),
+                                            );
+                                            format!(
+                                                "{} may not satisfy the constraint \"{}\" because {} is an unconstrained parameter, {} must be called with a guard",
+                                                arg_name,
+                                                constraint_msg,
                                                 var_names_plain.join(" and "),
                                                 func.name
                                             )
@@ -2865,10 +2868,45 @@ impl Checker {
         }
     }
 
+    fn eval_binary_bool(&self, op: kettu_parser::BinOp, l: i64, r: i64) -> bool {
+        match op {
+            kettu_parser::BinOp::Eq => l == r,
+            kettu_parser::BinOp::Ne => l != r,
+            kettu_parser::BinOp::Lt => l < r,
+            kettu_parser::BinOp::Le => l <= r,
+            kettu_parser::BinOp::Gt => l > r,
+            kettu_parser::BinOp::Ge => l >= r,
+            _ => false,
+        }
+    }
+
+    fn eval_binary_constraint(&self, op: kettu_parser::BinOp, l: i64, r: i64) -> Option<i64> {
+        match op {
+            kettu_parser::BinOp::Add => Some(l + r),
+            kettu_parser::BinOp::Sub => Some(l - r),
+            kettu_parser::BinOp::Mul => Some(l * r),
+            kettu_parser::BinOp::Div => {
+                if r == 0 {
+                    None
+                } else {
+                    Some(l / r)
+                }
+            }
+            kettu_parser::BinOp::Eq => Some(if l == r { 1 } else { 0 }),
+            kettu_parser::BinOp::Ne => Some(if l != r { 1 } else { 0 }),
+            kettu_parser::BinOp::Lt => Some(if l < r { 1 } else { 0 }),
+            kettu_parser::BinOp::Le => Some(if l <= r { 1 } else { 0 }),
+            kettu_parser::BinOp::Gt => Some(if l > r { 1 } else { 0 }),
+            kettu_parser::BinOp::Ge => Some(if l >= r { 1 } else { 0 }),
+            _ => None,
+        }
+    }
+
     fn const_value(&self, expr: &Expr) -> Option<i64> {
         match expr {
             Expr::Integer(n, _) => Some(*n),
             Expr::Ident(id) => self.constants.get(&id.name).copied(),
+            Expr::Neg(inner, _) => self.const_value(inner).map(|v| -v),
             Expr::Binary { lhs, op, rhs, .. } => {
                 let lhs_val = self.const_value(lhs)?;
                 let rhs_val = self.const_value(rhs)?;
@@ -2892,11 +2930,13 @@ impl Checker {
                 let all_vars: Vec<String> =
                     lhs_vars.iter().chain(rhs_vars.iter()).cloned().collect();
 
-                let lhs_val = self.const_value(lhs);
-                let rhs_val = self.const_value(rhs);
+                let lhs_val =
+                    self.resolve_constraint_value(lhs, param_name, arg_value, param_to_arg);
+                let rhs_val =
+                    self.resolve_constraint_value(rhs, param_name, arg_value, param_to_arg);
 
-                match (lhs_val, rhs_val, arg_value) {
-                    (Some(l), Some(r), _) => {
+                match (lhs_val, rhs_val) {
+                    (Some(l), Some(r)) => {
                         if self.eval_binary_bool(*op, l, r) {
                             ConstraintEvalResult::Satisfied
                         } else {
@@ -2908,99 +2948,40 @@ impl Checker {
                             ))
                         }
                     }
-                    (Some(_v), None, Some(arg))
-                        if all_vars.iter().all(|v| {
-                            // Check if it's in constants OR if it's another parameter in the mapping
-                            self.constants.contains_key(v) || param_to_arg.contains_key(v)
-                        }) =>
-                    {
-                        let result = self.const_value_with_mapping(
-                            constraint,
-                            param_name,
-                            arg,
-                            param_to_arg,
-                        );
-                        if result == Some(true) {
-                            ConstraintEvalResult::Satisfied
-                        } else if result == Some(false) {
-                            let msg = self.fmt_constraint_with_values(constraint, param_name, arg);
-                            ConstraintEvalResult::Violated(msg)
-                        } else {
-                            ConstraintEvalResult::NeedsPropagation(all_vars)
-                        }
-                    }
-                    (None, _, _) | (_, None, _) if !all_vars.is_empty() => {
-                        ConstraintEvalResult::NeedsPropagation(all_vars)
-                    }
-                    _ => ConstraintEvalResult::NeedsPropagation(all_vars),
+                    _ if !all_vars.is_empty() => ConstraintEvalResult::NeedsPropagation(all_vars),
+                    _ => ConstraintEvalResult::NeedsPropagation(vec![]),
                 }
             }
             _ => ConstraintEvalResult::NeedsPropagation(vec![]),
         }
     }
 
-    fn const_value_with_mapping(
+    fn resolve_constraint_value(
         &self,
         expr: &Expr,
         param_name: &str,
-        arg_val: i64,
+        arg_value: Option<i64>,
         param_to_arg: &HashMap<String, &Expr>,
-    ) -> Option<bool> {
+    ) -> Option<i64> {
         match expr {
-            Expr::Binary { lhs, op, rhs, .. } => {
-                let lhs_val = match lhs.as_ref() {
-                    Expr::Ident(id) => {
-                        if id.name == param_name {
-                            Some(arg_val)
-                        } else if let Some(arg_expr) = param_to_arg.get(&id.name) {
-                            self.const_value(arg_expr)
-                        } else {
-                            self.constants.get(&id.name).copied()
-                        }
-                    }
-                    _ => self.const_value(lhs),
-                };
-                let rhs_val = match rhs.as_ref() {
-                    Expr::Ident(id) => {
-                        if id.name == param_name {
-                            Some(arg_val)
-                        } else if let Some(arg_expr) = param_to_arg.get(&id.name) {
-                            self.const_value(arg_expr)
-                        } else {
-                            self.constants.get(&id.name).copied()
-                        }
-                    }
-                    _ => self.const_value(rhs),
-                };
-
-                match (lhs_val, rhs_val) {
-                    (Some(l), Some(r)) => Some(self.eval_binary_bool(*op, l, r)),
-                    _ => None,
+            Expr::Integer(n, _) => Some(*n),
+            Expr::Ident(id) => {
+                if id.name == param_name {
+                    arg_value
+                } else if let Some(arg_expr) = param_to_arg.get(&id.name) {
+                    self.const_value(arg_expr)
+                } else {
+                    self.constants.get(&id.name).copied()
                 }
             }
+            Expr::Binary { lhs, op, rhs, .. } => {
+                let lhs_val =
+                    self.resolve_constraint_value(lhs, param_name, arg_value, param_to_arg)?;
+                let rhs_val =
+                    self.resolve_constraint_value(rhs, param_name, arg_value, param_to_arg)?;
+                self.eval_binary_constraint(*op, lhs_val, rhs_val)
+            }
             _ => None,
-        }
-    }
-
-    fn eval_binary_constraint(&self, op: kettu_parser::BinOp, lhs: i64, rhs: i64) -> Option<i64> {
-        match op {
-            kettu_parser::BinOp::Add => Some(lhs + rhs),
-            kettu_parser::BinOp::Sub => Some(lhs - rhs),
-            kettu_parser::BinOp::Mul => Some(lhs * rhs),
-            kettu_parser::BinOp::Div if rhs != 0 => Some(lhs / rhs),
-            _ => None,
-        }
-    }
-
-    fn eval_binary_bool(&self, op: kettu_parser::BinOp, lhs: i64, rhs: i64) -> bool {
-        match op {
-            kettu_parser::BinOp::Eq => lhs == rhs,
-            kettu_parser::BinOp::Ne => lhs != rhs,
-            kettu_parser::BinOp::Lt => lhs < rhs,
-            kettu_parser::BinOp::Le => lhs <= rhs,
-            kettu_parser::BinOp::Gt => lhs > rhs,
-            kettu_parser::BinOp::Ge => lhs >= rhs,
-            _ => false,
         }
     }
 
@@ -4703,6 +4684,621 @@ mod tests {
                 .contains("`guard let` else block must exit the current scope")),
             "expected guard let scope-exit error, got: {:?}",
             errors
+        );
+    }
+
+    // ========================================================================
+    // Contract constraint tests
+    // ========================================================================
+
+    #[test]
+    fn test_constraint_violation_detected() {
+        let source = r#"
+            package local:test;
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func() -> bool {
+                    let big = 10;
+                    let small = 20;
+                    bounded(small, big);
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|d| d.message.contains("does not satisfy the constraint")),
+            "expected constraint violation error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_constraint_satisfied_no_error() {
+        let source = r#"
+            package local:test;
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func() -> bool {
+                    let big = 20;
+                    let small = 10;
+                    bounded(small, big);
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let constraint_errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::ConstraintViolation)
+            .collect();
+        assert!(
+            constraint_errors.is_empty(),
+            "expected no constraint errors, got: {:?}",
+            constraint_errors
+        );
+    }
+
+    #[test]
+    fn test_constraint_less_than_operator() {
+        let source = r#"
+            package local:test;
+            interface test {
+                limited: func(count: s32 where count < 10) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func() -> bool {
+                    limited(15);
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.code == DiagnosticCode::ConstraintViolation
+            })
+            .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|d| d.message.contains("does not satisfy the constraint")),
+            "expected constraint violation with < operator, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_constraint_less_than_satisfied() {
+        let source = r#"
+            package local:test;
+            interface test {
+                limited: func(count: s32 where count < 10) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func() -> bool {
+                    limited(5);
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let constraint_errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::ConstraintViolation)
+            .collect();
+        assert!(
+            constraint_errors.is_empty(),
+            "expected no constraint errors for satisfied < constraint, got: {:?}",
+            constraint_errors
+        );
+    }
+
+    #[test]
+    fn test_constraint_with_integer_literal_one_side() {
+        let source = r#"
+            package local:test;
+            interface test {
+                positive: func(x: s32 where x > 0) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func() -> bool {
+                    positive(0);
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.code == DiagnosticCode::ConstraintViolation
+            })
+            .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|d| d.message.contains("does not satisfy the constraint")),
+            "expected constraint violation with literal, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_constraint_propagation_with_non_const_arg() {
+        let source = r#"
+            package local:test;
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func(x: s32) -> bool {
+                    let big = 10;
+                    bounded(x, big);
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Warning && d.code == DiagnosticCode::ConstraintPropagation
+            })
+            .collect();
+        assert!(
+            warnings
+                .iter()
+                .any(|d| d.message.contains("may not satisfy")),
+            "expected constraint propagation warning, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_constraint_propagation_guard_let_suppresses() {
+        let source = r#"
+            package local:test;
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func(x: s32) -> result<bool, string> {
+                    let big = 10;
+                    guard let result = bounded(x, big) else {
+                        return result#err("fail");
+                    };
+                    result
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let constraint_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code == DiagnosticCode::ConstraintViolation
+                    || d.code == DiagnosticCode::ConstraintPropagation
+            })
+            .collect();
+        assert!(
+            constraint_diags.is_empty(),
+            "expected no constraint diagnostics inside guard-let, got: {:?}",
+            constraint_diags
+        );
+    }
+
+    #[test]
+    fn test_constraint_propagation_non_test_function() {
+        let source = r#"
+            package local:test;
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func(x: s32) -> bool {
+                    let big = 10;
+                    bounded(x, big);
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let constraint_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code == DiagnosticCode::ConstraintViolation
+                    || d.code == DiagnosticCode::ConstraintPropagation
+            })
+            .collect();
+        assert!(
+            constraint_diags
+                .iter()
+                .all(|d| d.severity == Severity::Warning),
+            "expected warnings (not errors) for propagation in non-test function, got: {:?}",
+            constraint_diags
+        );
+    }
+
+    #[test]
+    fn test_hush_comment_matching_exact_text() {
+        let source = r#"
+            package local:test;
+            interface test {
+                @test
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                @test
+                caller: func() -> bool {
+                    let big = 10;
+                    let small = 20;
+                    bounded(small, big);
+                    ///    ^ big does not satisfy the constraint "big (10) > small (20)" on bounded
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check_with_source(&ast, source);
+        let infos: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Info)
+            .collect();
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.code == DiagnosticCode::ConstraintViolation
+            })
+            .collect();
+        assert!(
+            !infos.is_empty(),
+            "expected info diagnostic for hushed error, got diags: {:?}",
+            diags
+        );
+        assert!(
+            errors.is_empty(),
+            "expected no error diagnostics for hushed error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_hush_comment_mismatch_still_error() {
+        let source = r#"
+            package local:test;
+            interface test {
+                @test
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                @test
+                caller: func() -> bool {
+                    let big = 10;
+                    let small = 20;
+                    bounded(small, big);
+                    ///    ^ wrong text that does not match
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check_with_source(&ast, source);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.code == DiagnosticCode::ConstraintViolation
+            })
+            .collect();
+        assert!(
+            !errors.is_empty(),
+            "expected error diagnostic when hush text doesn't match, got diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_hush_comment_only_in_test_function() {
+        let source = r#"
+            package local:test;
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func() -> bool {
+                    let big = 10;
+                    let small = 20;
+                    bounded(small, big);
+                    ///    ^ big does not satisfy the constraint "big (10) > small (20)" on bounded
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check_with_source(&ast, source);
+        let infos: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Info)
+            .collect();
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.code == DiagnosticCode::ConstraintViolation
+            })
+            .collect();
+        assert!(
+            infos.is_empty(),
+            "expected no info diagnostics in non-test function, got: {:?}",
+            infos
+        );
+        assert!(
+            !errors.is_empty(),
+            "expected error diagnostic in non-test function even with hush comment, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_multiple_hush_comments_in_same_function() {
+        let source = r#"
+            package local:test;
+            interface test {
+                @test
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                @test
+                caller: func() -> bool {
+                    let big = 10;
+                    let small = 20;
+                    bounded(small, big);
+                    ///    ^ big does not satisfy the constraint "big (10) > small (20)" on bounded
+                    bounded(small, big);
+                    ///    ^ big does not satisfy the constraint "big (10) > small (20)" on bounded
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check_with_source(&ast, source);
+        let infos: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Info && d.code == DiagnosticCode::ConstraintViolation
+            })
+            .collect();
+        assert_eq!(
+            infos.len(),
+            2,
+            "expected 2 info diagnostics for 2 hushed errors, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_constrained_func_must_return_result() {
+        let source = r#"
+            package local:test;
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> bool {
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("must return result")
+                    && d.code == DiagnosticCode::ConstraintViolation),
+            "expected error about constrained function needing Result return type, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_constrained_func_returns_result_ok() {
+        let source = r#"
+            package local:test;
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let constraint_errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::ConstraintViolation)
+            .collect();
+        assert!(
+            constraint_errors.is_empty(),
+            "expected no errors for constrained func returning result, got: {:?}",
+            constraint_errors
+        );
+    }
+
+    #[test]
+    fn test_result_ok_infers_function_return_type() {
+        let source = r#"
+            package local:test;
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    return result#ok(true);
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let type_errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::TypeMismatch)
+            .collect();
+        assert!(
+            type_errors.is_empty(),
+            "expected no type mismatch for result#ok in result-returning func, got: {:?}",
+            type_errors
+        );
+    }
+
+    #[test]
+    fn test_constraint_violation_with_swapped_args() {
+        let source = r#"
+            package local:test;
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func() -> bool {
+                    let a = 10;
+                    let b = 20;
+                    bounded(b, a);
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.code == DiagnosticCode::ConstraintViolation
+            })
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly one constraint violation for swapped args, got: {:?}",
+            errors
+        );
+        assert!(
+            errors[0]
+                .message
+                .contains("does not satisfy the constraint"),
+            "error message should mention constraint violation: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn test_constraint_with_local_constant_chain() {
+        let source = r#"
+            package local:test;
+            interface test {
+                positive: func(x: s32 where x > 0) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func() -> bool {
+                    let val = -5;
+                    let copy = val;
+                    positive(copy);
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.code == DiagnosticCode::ConstraintViolation
+            })
+            .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|d| d.message.contains("does not satisfy the constraint")),
+            "expected constraint violation through local constant chain, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_hush_comment_in_test_helper() {
+        let source = r#"
+            package local:test;
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                @test-helper
+                helper: func(x: s32) -> result<bool, string> {
+                    let big = 10;
+                    bounded(x, big);
+                    ///    ^ big may not satisfy the constraint "big (10) > small" because x is an unconstrained parameter, bounded must be called with a guard
+                    guard let r = bounded(x, big) else {
+                        return result#err("fail");
+                    };
+                    r
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check_with_source(&ast, source);
+        let infos: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Info)
+            .collect();
+        assert!(
+            !infos.is_empty(),
+            "expected info diagnostic for hushed error in @test-helper, got diags: {:?}",
+            diags
         );
     }
 }
