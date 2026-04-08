@@ -54,16 +54,6 @@ fn extract_hush_comments(source: &str) -> Vec<HushComment> {
     comments
 }
 
-/// Get source line at given line number (1-indexed)
-fn source_line_at(source: &str, line: usize) -> Option<&str> {
-    source.lines().nth(line - 1)
-}
-
-/// Get source column at given column number (1-indexed)
-fn source_col_at(line: &str, col: usize) -> Option<&str> {
-    line.get(col - 1..col)
-}
-
 /// Check multiple WIT files as a package
 pub fn check_package(files: &[WitFile]) -> Vec<Diagnostic> {
     let mut checker = Checker::new();
@@ -275,6 +265,8 @@ struct Checker {
     hush_comments: Vec<HushComment>,
     /// Whether currently checking inside a @test or @test-helper function
     in_test_function: bool,
+    /// Declared return type of the current function being validated
+    current_return_type: Option<CheckedType>,
 }
 
 /// Checked type representation for expression type checking
@@ -327,6 +319,7 @@ impl Checker {
             constants: HashMap::new(),
             hush_comments: Vec::new(),
             in_test_function: false,
+            current_return_type: None,
         }
     }
 
@@ -347,6 +340,47 @@ impl Checker {
                 TopLevelItem::Use(_) => {} // Handled in validation
                 TopLevelItem::NestedPackage(_) => {} // Nested packages are validated separately
             }
+        }
+
+        let builtin_types = [
+            "bool", "s8", "s16", "s32", "s64", "u8", "u16", "u32", "u64", "f32", "f64", "char",
+            "string", "list", "option",
+        ];
+        for name in builtin_types {
+            let key = TypeKey {
+                interface: None,
+                name: name.to_string(),
+            };
+            if !self.types.contains_key(&key) {
+                self.types.insert(
+                    key,
+                    TypeInfo {
+                        name: name.to_string(),
+                        kind: TypeKind::Primitive,
+                        span: 0..0,
+                        interface: None,
+                    },
+                );
+            }
+        }
+
+        let result_key = TypeKey {
+            interface: None,
+            name: "result".to_string(),
+        };
+        if !self.types.contains_key(&result_key) {
+            let mut cases = HashMap::new();
+            cases.insert("ok".to_string(), true);
+            cases.insert("err".to_string(), true);
+            self.types.insert(
+                result_key,
+                TypeInfo {
+                    name: "result".to_string(),
+                    kind: TypeKind::Variant { cases },
+                    span: 0..0,
+                    interface: None,
+                },
+            );
         }
     }
 
@@ -661,6 +695,24 @@ impl Checker {
             self.validate_type(&param.ty);
         }
 
+        let has_constraints = func.params.iter().any(|p| p.constraint.is_some());
+        if has_constraints {
+            let is_result = match &func.result {
+                Some(ty) => matches!(ty, Ty::Result { .. }),
+                None => false,
+            };
+            if !is_result {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "Function '{}' with parameter constraints must return result",
+                        func.name.name
+                    ),
+                    func.name.span.clone(),
+                    DiagnosticCode::ConstraintViolation,
+                ));
+            }
+        }
+
         // Validate result type
         let declared_return = if let Some(ty) = &func.result {
             self.validate_type(ty);
@@ -677,6 +729,9 @@ impl Checker {
                 .gates
                 .iter()
                 .any(|g| matches!(g, Gate::Test | Gate::TestHelper));
+
+            let was_return_type = self.current_return_type.clone();
+            self.current_return_type = declared_return.clone();
 
             // Clear locals and add parameters
             self.locals.clear();
@@ -771,6 +826,7 @@ impl Checker {
 
             // Restore previous test function state after body processing
             self.in_test_function = was_in_test;
+            self.current_return_type = was_return_type;
         }
 
         // Check feature gates
@@ -802,6 +858,9 @@ impl Checker {
                 .gates
                 .iter()
                 .any(|g| matches!(g, Gate::Test | Gate::TestHelper));
+
+            let was_return_type = self.current_return_type.clone();
+            self.current_return_type = declared_return.clone();
 
             // Clear locals and add implicit self + explicit parameters
             self.locals.clear();
@@ -844,6 +903,7 @@ impl Checker {
 
             // Restore previous test function state after body processing
             self.in_test_function = was_in_test;
+            self.current_return_type = was_return_type;
         }
 
         // Check feature gates
@@ -1799,7 +1859,19 @@ impl Checker {
                                     }
                                 }
                             }
-                            CheckedType::Named(name)
+                            if name == "result" {
+                                if let Some(ref ret) = self.current_return_type {
+                                    if let CheckedType::Result { .. } = ret {
+                                        ret.clone()
+                                    } else {
+                                        CheckedType::Named(name)
+                                    }
+                                } else {
+                                    CheckedType::Named(name)
+                                }
+                            } else {
+                                CheckedType::Named(name)
+                            }
                         }
                         Some(_) => {
                             self.diagnostics.push(Diagnostic::error(
@@ -2358,7 +2430,6 @@ impl Checker {
                     .join(", ");
                 format!("{}<{}>", name.name, inner)
             }
-            _ => "unknown".to_string(),
         }
     }
 
@@ -2422,8 +2493,15 @@ impl Checker {
 
     /// Resolve a type name in the current scope
     fn resolve_type(&self, name: &str) -> bool {
-        // Check if it's a type parameter (e.g., T in `record pair<T>`)
         if self.type_params.contains(name) {
+            return true;
+        }
+        if [
+            "bool", "s8", "s16", "s32", "s64", "u8", "u16", "u32", "u64", "f32", "f64", "char",
+            "string", "list", "option", "result",
+        ]
+        .contains(&name)
+        {
             return true;
         }
         self.resolve_type_info(name).is_some()
@@ -2754,7 +2832,7 @@ impl Checker {
                                                 DiagnosticCode::ConstraintViolation,
                                             ));
                                         }
-                                        ConstraintEvalResult::NeedsPropagation(vars) => {
+                                        ConstraintEvalResult::NeedsPropagation(_vars) => {
                                             self.diagnostics.push(Diagnostic::warning(
                                                 error_msg,
                                                 span.clone(),
@@ -2789,58 +2867,6 @@ impl Checker {
                 self.eval_binary_constraint(*op, lhs_val, rhs_val)
             }
             _ => None,
-        }
-    }
-
-    fn eval_constraint(
-        &self,
-        constraint: &Expr,
-        param_name: &str,
-        arg_value: Option<i64>,
-    ) -> ConstraintEvalResult {
-        match constraint {
-            Expr::Binary { lhs, op, rhs, .. } => {
-                let lhs_vars = self.collect_free_vars(lhs);
-                let rhs_vars = self.collect_free_vars(rhs);
-                let all_vars: Vec<String> =
-                    lhs_vars.iter().chain(rhs_vars.iter()).cloned().collect();
-
-                let lhs_val = self.const_value(lhs);
-                let rhs_val = self.const_value(rhs);
-
-                match (lhs_val, rhs_val, arg_value) {
-                    (Some(l), Some(r), _) => {
-                        if self.eval_binary_bool(*op, l, r) {
-                            ConstraintEvalResult::Satisfied
-                        } else {
-                            ConstraintEvalResult::Violated(format!(
-                                "{} {} {} is false",
-                                l,
-                                self.fmt_op(*op),
-                                r
-                            ))
-                        }
-                    }
-                    (Some(_v), None, Some(arg))
-                        if all_vars.iter().all(|v| self.constants.contains_key(v)) =>
-                    {
-                        let result = self.const_value_with(constraint, param_name, arg);
-                        if result == Some(true) {
-                            ConstraintEvalResult::Satisfied
-                        } else if result == Some(false) {
-                            let msg = self.fmt_constraint_with_values(constraint, param_name, arg);
-                            ConstraintEvalResult::Violated(msg)
-                        } else {
-                            ConstraintEvalResult::NeedsPropagation(all_vars)
-                        }
-                    }
-                    (None, _, _) | (_, None, _) if !all_vars.is_empty() => {
-                        ConstraintEvalResult::NeedsPropagation(all_vars)
-                    }
-                    _ => ConstraintEvalResult::NeedsPropagation(all_vars),
-                }
-            }
-            _ => ConstraintEvalResult::NeedsPropagation(vec![]),
         }
     }
 
@@ -2970,39 +2996,6 @@ impl Checker {
         }
     }
 
-    fn const_value_with(&self, expr: &Expr, param_name: &str, arg_val: i64) -> Option<bool> {
-        match expr {
-            Expr::Binary { lhs, op, rhs, .. } => {
-                let lhs_val = match lhs.as_ref() {
-                    Expr::Ident(id) => {
-                        if id.name == param_name {
-                            Some(arg_val)
-                        } else {
-                            self.constants.get(&id.name).copied()
-                        }
-                    }
-                    _ => self.const_value(lhs),
-                };
-                let rhs_val = match rhs.as_ref() {
-                    Expr::Ident(id) => {
-                        if id.name == param_name {
-                            Some(arg_val)
-                        } else {
-                            self.constants.get(&id.name).copied()
-                        }
-                    }
-                    _ => self.const_value(rhs),
-                };
-
-                match (lhs_val, rhs_val) {
-                    (Some(l), Some(r)) => Some(self.eval_binary_bool(*op, l, r)),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
     fn collect_free_vars(&self, expr: &Expr) -> Vec<String> {
         let mut vars = Vec::new();
         self.collect_free_vars_rec(expr, &mut vars);
@@ -3031,20 +3024,6 @@ impl Checker {
                 }
             }
             _ => {}
-        }
-    }
-
-    fn fmt_constraint(&self, constraint: &Expr) -> String {
-        match constraint {
-            Expr::Binary { lhs, op, rhs, .. } => {
-                format!(
-                    "{} {} {}",
-                    self.fmt_expr(lhs),
-                    self.fmt_op(*op),
-                    self.fmt_expr(rhs)
-                )
-            }
-            _ => "unknown".to_string(),
         }
     }
 
@@ -3081,14 +3060,6 @@ impl Checker {
         }
     }
 
-    fn fmt_expr(&self, expr: &Expr) -> String {
-        match expr {
-            Expr::Integer(n, _) => n.to_string(),
-            Expr::Ident(id) => id.name.clone(),
-            _ => "expr".to_string(),
-        }
-    }
-
     fn fmt_op(&self, op: kettu_parser::BinOp) -> String {
         match op {
             kettu_parser::BinOp::Add => "+".to_string(),
@@ -3110,7 +3081,7 @@ impl Checker {
         self.in_test_function
     }
 
-    fn check_hush_comment(&self, span: &Span, error_msg: &str) -> bool {
+    fn check_hush_comment(&self, _span: &Span, error_msg: &str) -> bool {
         // Need to find line number from character offset - use source if available
         // For now, just check all comments and match by exact text
         for comment in &self.hush_comments {
@@ -3122,10 +3093,6 @@ impl Checker {
         }
         false
     }
-}
-
-fn constraint_param_name() -> &'static str {
-    "x"
 }
 
 // ============================================================================
