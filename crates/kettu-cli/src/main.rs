@@ -192,7 +192,7 @@ async fn main() {
 
                 files_to_check.push(ast);
                 let diagnostics = if files_to_check.len() == 1 {
-                    kettu_checker::check(&files_to_check[0])
+                    kettu_checker::check_with_source(&files_to_check[0], &content)
                 } else {
                     kettu_checker::check_package(&files_to_check)
                 };
@@ -200,6 +200,9 @@ async fn main() {
                 if diagnostics.is_empty() {
                     println!("✓ No errors found");
                 } else {
+                    let has_errors = diagnostics.iter().any(|d| 
+                        matches!(d.severity, kettu_checker::Severity::Error | kettu_checker::Severity::Warning)
+                    );
                     for diag in &diagnostics {
                         let prefix = match diag.severity {
                             kettu_checker::Severity::Error => "error",
@@ -208,7 +211,9 @@ async fn main() {
                         };
                         eprintln!("{}: {}", prefix, diag.message);
                     }
-                    std::process::exit(1);
+                    if has_errors {
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -255,7 +260,7 @@ async fn main() {
                 .collect();
 
             // Type check (filtering out errors for imported interface references)
-            let diagnostics = kettu_checker::check(&ast);
+            let diagnostics = kettu_checker::check_with_source(&ast, &content);
             let errors: Vec<_> = diagnostics
                 .iter()
                 .filter(|d| matches!(d.severity, kettu_checker::Severity::Error))
@@ -603,7 +608,7 @@ fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -
     };
 
     // Type check
-    let diagnostics = kettu_checker::check(&ast);
+    let diagnostics = kettu_checker::check_with_source(&ast, &content);
     let errors: Vec<_> = diagnostics
         .iter()
         .filter(|d| matches!(d.severity, kettu_checker::Severity::Error))

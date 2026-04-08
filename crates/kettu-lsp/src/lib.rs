@@ -3,7 +3,7 @@
 //! Language Server Protocol implementation for Kettu/WIT.
 //! Provides diagnostics, hover, go-to-definition, document symbols, and completion.
 
-use kettu_checker::{Severity, check};
+use kettu_checker::{Severity, check, check_with_source};
 use kettu_codegen::resolve_imports;
 use kettu_parser::{
     BinOp, Expr, ImportExportKind, InterfaceItem, Pattern, PrimitiveTy, Statement, TopLevelItem,
@@ -663,7 +663,7 @@ impl Backend {
 
         // Type checking
         if let Some(ast) = ast_for_check {
-            let check_errors = check(ast);
+            let check_errors = check_with_source(ast, content);
             for err in check_errors {
                 let range = span_to_range(content, err.span.clone());
                 diagnostics.push(tower_lsp::lsp_types::Diagnostic {

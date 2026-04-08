@@ -874,6 +874,9 @@ impl<'a> WitEmitter<'a> {
             Gate::Test => {
                 // @test is a Kettu-only attribute, not emitted to WIT
             }
+            Gate::TestHelper => {
+                // @test-helper is a Kettu-only attribute, not emitted to WIT
+            }
         }
     }
 
@@ -1103,6 +1106,7 @@ mod tests {
                     params: vec![Param {
                         name: Id::new("msg", 0..0),
                         ty: Ty::Primitive(PrimitiveTy::String, 0..0),
+                        constraint: None,
                     }],
                     result: None,
                     body: None,

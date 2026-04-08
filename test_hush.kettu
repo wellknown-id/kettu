@@ -1,0 +1,15 @@
+package local:contract-tests;
+
+interface contract-tests {
+    test-bounds: func(small: s32, big: s32 where big > small) -> bool {
+        true
+    }
+    
+    @test
+    test-bounds-called: func() -> bool {
+        let big = 10;
+        let small = 20;
+        test-bounds(small, big);
+        ///^ big does not satisfy the constraint "big (10) > small (20)" on test-bounds
+    }
+}

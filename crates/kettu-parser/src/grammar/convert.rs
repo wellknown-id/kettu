@@ -1,16 +1,16 @@
 //! Conversion from grammar CST nodes to semantic AST nodes.
 //!
 //! The grammar module defines a concrete syntax tree (CST) that maps 1:1
-//! to source text via rust-sitter annotations. This module converts those
+//! to source text via krust-sitter annotations. This module converts those
 //! CST nodes into the semantic AST defined in `crate::ast`, which downstream
 //! crates consume.
 //!
-//! Span information is extracted from `Spanned<T>` wrappers that rust-sitter
+//! Span information is extracted from `Spanned<T>` wrappers that krust-sitter
 //! populates with Tree-sitter byte ranges during parsing.
 
 use crate::ast;
 use crate::grammar;
-use rust_sitter::Spanned;
+use krust_sitter::Spanned;
 use std::ops::Range;
 
 // ============================================================================
@@ -222,6 +222,7 @@ fn gate(cst: &grammar::Gate) -> ast::Gate {
             version: version(&g.version),
         },
         grammar::Gate::Test(_) => ast::Gate::Test,
+        grammar::Gate::TestHelper(_) => ast::Gate::TestHelper,
     }
 }
 
@@ -488,6 +489,7 @@ fn param_list(cst: &grammar::ParamList) -> Vec<ast::Param> {
         .map(|p| ast::Param {
             name: spanned_id(&p.name),
             ty: sty_flat(&p.ty),
+            constraint: p.where_clause.as_ref().map(|wc| sexpr_flat(&wc.expr)),
         })
         .collect()
 }

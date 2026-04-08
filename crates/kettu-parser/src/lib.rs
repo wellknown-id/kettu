@@ -1,6 +1,6 @@
 //! Kettu Parser
 //!
-//! A rust-sitter/Tree Sitter–based parser for the Kettu language, which is fully
+//! A krust-sitter/Tree Sitter–based parser for the Kettu language, which is fully
 //! compatible with WIT (WebAssembly Interface Types) and extends it with function bodies.
 
 pub mod ast;
@@ -13,7 +13,7 @@ pub use ast::*;
 pub use emitter::emit_wit;
 
 /// Error type for parse results
-pub type ParseError = rust_sitter::error::ParseError;
+pub type ParseError = krust_sitter::error::ParseError;
 
 fn find_comment_ranges(source: &str) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
@@ -77,12 +77,12 @@ fn strip_comments_preserve_layout(source: &str) -> String {
     String::from_utf8(bytes).unwrap_or_else(|_| source.to_string())
 }
 
-/// Parse Kettu/WIT source code using the rust-sitter grammar.
+/// Parse Kettu/WIT source code using the krust-sitter grammar.
 ///
 /// Returns an optional AST (present even on partial parse with error recovery)
 /// and a vector of parse errors.
 pub fn parse(source: &str) -> (Option<ast::WitFile>, Vec<ParseError>) {
-    use rust_sitter::Language;
+    use krust_sitter::Language;
 
     let normalized = strip_comments_preserve_layout(source);
     let result = grammar::WitFile::parse(&normalized);

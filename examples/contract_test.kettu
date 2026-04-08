@@ -33,7 +33,7 @@ interface contract-tests {
         guard let mustbetrue = test-bounds(somesmall, big) else {
             return false;
         };
-        mustbetrue;
+        mustbetrue
     }
     @test
     test-bounds-called-again: func() -> bool {

@@ -1,4 +1,4 @@
-//! Tests for the rust-sitter grammar, CST-to-AST conversion, span
+//! Tests for the krust-sitter grammar, CST-to-AST conversion, span
 //! information, and error recovery behaviour.
 
 #[cfg(test)]
@@ -613,7 +613,10 @@ mod tests {
         assert_eq!(iface.gates.len(), 4);
         assert!(matches!(iface.gates[0], crate::ast::Gate::Since { .. }));
         assert!(matches!(iface.gates[1], crate::ast::Gate::Unstable { .. }));
-        assert!(matches!(iface.gates[2], crate::ast::Gate::Deprecated { .. }));
+        assert!(matches!(
+            iface.gates[2],
+            crate::ast::Gate::Deprecated { .. }
+        ));
         assert!(matches!(iface.gates[3], crate::ast::Gate::Test));
     }
 
@@ -711,7 +714,10 @@ mod tests {
             crate::ast::InterfaceItem::TypeDef(td) => match &td.kind {
                 crate::ast::TypeDefKind::Resource { methods, .. } => {
                     assert_eq!(methods.len(), 3);
-                    assert!(matches!(methods[0], crate::ast::ResourceMethod::Constructor { .. }));
+                    assert!(matches!(
+                        methods[0],
+                        crate::ast::ResourceMethod::Constructor { .. }
+                    ));
                     assert!(matches!(methods[1], crate::ast::ResourceMethod::Static(_)));
                     assert!(matches!(methods[2], crate::ast::ResourceMethod::Method(_)));
                 }
@@ -782,7 +788,7 @@ mod tests {
     fn test_comment_tree_sitter_sexp() {
         // Parse directly with tree-sitter to see the raw S-expression
         let src = "package local:test;\n\n// Regular comment\n/// Doc comment\ninterface my-iface {\n    greet: func(name: string) -> string;\n}\n";
-        let mut parser = rust_sitter::tree_sitter::Parser::new();
+        let mut parser = krust_sitter::tree_sitter::Parser::new();
         parser
             .set_language(&crate::grammar::WitFile::language())
             .unwrap();
@@ -792,7 +798,7 @@ mod tests {
         eprintln!("has_error: {}", root.has_error());
 
         // Walk the tree and print any ERROR or MISSING nodes
-        fn walk_errors(node: rust_sitter::tree_sitter::Node, src: &str, depth: usize) {
+        fn walk_errors(node: krust_sitter::tree_sitter::Node, src: &str, depth: usize) {
             if node.is_error() {
                 let text = &src[node.byte_range()];
                 eprintln!(
@@ -827,8 +833,8 @@ mod tests {
         }
         walk_errors(root, src, 0);
 
-        // Also test with rust-sitter parse
-        use rust_sitter::Language;
+        // Also test with krust-sitter parse
+        use krust_sitter::Language;
         let result = crate::grammar::WitFile::parse(src);
         eprintln!("Parse errors: {:?}", result.errors);
         eprintln!("Parse result is_some: {}", result.result.is_some());

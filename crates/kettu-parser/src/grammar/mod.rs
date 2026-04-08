@@ -1,4 +1,4 @@
-//! Grammar module for Kettu/WIT using rust-sitter (Tree Sitter).
+//! Grammar module for Kettu/WIT using krust-sitter (Tree Sitter).
 //!
 //! The grammar is defined by annotating AST types with `#[derive(Rule)]`.
 //! Tree Sitter generates the actual parser from these annotations at build time.
@@ -12,7 +12,7 @@
 //! The CST nodes are converted to semantic AST nodes (in `crate::ast`) by the
 //! `convert` module.
 
-use rust_sitter::{Rule, Spanned};
+use krust_sitter::{Rule, Spanned};
 
 pub mod convert;
 mod tests;
@@ -180,6 +180,7 @@ pub enum Gate {
     Unstable(UnstableGate),
     Deprecated(DeprecatedGate),
     Test(TestGate),
+    TestHelper(TestHelperGate),
 }
 
 #[derive(Debug, Clone, PartialEq, Rule)]
@@ -231,6 +232,10 @@ pub struct DeprecatedGate {
 #[derive(Debug, Clone, PartialEq, Rule)]
 #[leaf("@test")]
 pub struct TestGate;
+
+#[derive(Debug, Clone, PartialEq, Rule)]
+#[leaf("@test-helper")]
+pub struct TestHelperGate;
 
 // ============================================================================
 // Interface
@@ -723,7 +728,15 @@ pub struct ParamList {
     _rp: (),
 }
 
-/// Function parameter: `name: ty`
+/// `where expr` constraint on a parameter
+#[derive(Debug, Clone, PartialEq, Rule)]
+pub struct WhereClause {
+    #[leaf("where")]
+    _where: (),
+    pub expr: Spanned<Expr>,
+}
+
+/// Function parameter: `name: ty` or `name: ty where expr`
 #[derive(Debug, Clone, PartialEq, Rule)]
 pub struct Param {
     #[leaf(KIdent)]
@@ -731,6 +744,7 @@ pub struct Param {
     #[leaf(":")]
     _colon: (),
     pub ty: Spanned<TyNode>,
+    pub where_clause: Option<WhereClause>,
 }
 
 /// Function body: `{ statements }`

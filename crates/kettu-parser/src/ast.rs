@@ -114,6 +114,8 @@ pub enum Gate {
     },
     /// Test function marker
     Test,
+    /// Test helper function marker
+    TestHelper,
 }
 
 /// Interface definition
@@ -241,6 +243,7 @@ pub struct Func {
 pub struct Param {
     pub name: Id,
     pub ty: Ty,
+    pub constraint: Option<Expr>,
 }
 
 /// Function body (Kettu extension)

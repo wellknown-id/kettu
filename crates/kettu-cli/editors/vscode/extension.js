@@ -67,11 +67,15 @@ function findServerPath(extensionPath) {
             const debugPath = path.join(folder.uri.fsPath, 'target', 'debug', 'kettu');
 
             if (fs.existsSync(releasePath)) {
-                console.log('Kettu LSP: found release binary in workspace');
+                console.log('Kettu LSP: found release binary in workspace', releasePath);
+                const stats = fs.statSync(releasePath);
+                console.log('Kettu LSP: binary mtime', stats.mtime);
                 return releasePath;
             }
             if (fs.existsSync(debugPath)) {
-                console.log('Kettu LSP: found debug binary in workspace');
+                console.log('Kettu LSP: found debug binary in workspace', debugPath);
+                const stats = fs.statSync(debugPath);
+                console.log('Kettu LSP: binary mtime', stats.mtime);
                 return debugPath;
             }
         }

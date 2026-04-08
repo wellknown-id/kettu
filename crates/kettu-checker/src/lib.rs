@@ -22,6 +22,48 @@ pub fn check(file: &WitFile) -> Vec<Diagnostic> {
     checker.diagnostics
 }
 
+/// Check a WIT file for errors with source content (for hush comments/constraints)
+pub fn check_with_source(file: &WitFile, source: &str) -> Vec<Diagnostic> {
+    let mut checker = Checker::new();
+    checker.hush_comments = extract_hush_comments(source);
+    checker.check_file(file);
+    checker.diagnostics
+}
+
+/// Extract hush comments (constraint annotations) from source code
+fn extract_hush_comments(source: &str) -> Vec<HushComment> {
+    let mut comments = Vec::new();
+    for (line_num, line) in source.lines().enumerate() {
+        // Look for /// followed by whitespace and ^
+        if let Some(caret_pos) = line.find("///") {
+            let after_comment = &line[caret_pos + 3..];
+            if let Some(ws_end) = after_comment.find(|c: char| !c.is_whitespace()) {
+                let after_ws = &after_comment[ws_end..];
+                if after_ws.starts_with('^') {
+                    let text = &after_ws[1..].trim();
+                    comments.push(HushComment {
+                        line: line_num,     // 0-indexed
+                        col: caret_pos + 4, // Position after /// and any whitespace
+                        constraint: Expr::String(text.to_string(), Span::default()),
+                        span: Span::default(),
+                    });
+                }
+            }
+        }
+    }
+    comments
+}
+
+/// Get source line at given line number (1-indexed)
+fn source_line_at(source: &str, line: usize) -> Option<&str> {
+    source.lines().nth(line - 1)
+}
+
+/// Get source column at given column number (1-indexed)
+fn source_col_at(line: &str, col: usize) -> Option<&str> {
+    line.get(col - 1..col)
+}
+
 /// Check multiple WIT files as a package
 pub fn check_package(files: &[WitFile]) -> Vec<Diagnostic> {
     let mut checker = Checker::new();
@@ -70,6 +112,15 @@ impl Diagnostic {
             code,
         }
     }
+
+    pub fn info(message: impl Into<String>, span: Span, code: DiagnosticCode) -> Self {
+        Self {
+            message: message.into(),
+            span,
+            severity: Severity::Info,
+            code,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +147,9 @@ pub enum DiagnosticCode {
     InvalidOperator,
     DeprecatedFeature,
     UnstableFeature,
+    // Constraint errors
+    ConstraintViolation,
+    ConstraintPropagation,
 }
 
 // ============================================================================
@@ -146,6 +200,19 @@ pub struct InterfaceInfo {
     pub functions: Vec<String>,
     /// Return types by function name
     function_returns: HashMap<String, CheckedType>,
+    /// Parameter names by function
+    pub function_params: HashMap<String, Vec<String>>,
+    /// Parameter constraints by function
+    pub function_constraints: HashMap<String, Vec<ParamConstraint>>,
+    /// Parameter types by function
+    pub function_param_types: HashMap<String, Vec<String>>,
+}
+
+/// A parameter constraint from a `where` clause
+#[derive(Debug, Clone)]
+pub struct ParamConstraint {
+    pub param_name: String,
+    pub constraint: Expr,
 }
 
 /// Information about a world
@@ -155,6 +222,26 @@ pub struct WorldInfo {
     pub span: Span,
     pub imports: Vec<String>,
     pub exports: Vec<String>,
+}
+
+/// Result of evaluating a constraint
+#[derive(Debug, Clone)]
+enum ConstraintEvalResult {
+    /// Constraint is satisfied
+    Satisfied,
+    /// Constraint is violated with error message
+    Violated(String),
+    /// Constraint needs propagation (has free variables)
+    NeedsPropagation(Vec<String>),
+}
+
+/// Hush comment extracted from source for constraint checking
+#[derive(Debug, Clone)]
+struct HushComment {
+    line: usize,
+    col: usize,
+    constraint: Expr,
+    span: Span,
 }
 
 // ============================================================================
@@ -182,6 +269,12 @@ struct Checker {
     type_params: HashSet<String>,
     /// Nesting depth of loop bodies currently being validated
     loop_depth: usize,
+    /// Tracked constant values for constraint evaluation
+    constants: HashMap<String, i64>,
+    /// Hush comments (constraint annotations) collected during parsing
+    hush_comments: Vec<HushComment>,
+    /// Whether currently checking inside a @test or @test-helper function
+    in_test_function: bool,
 }
 
 /// Checked type representation for expression type checking
@@ -231,6 +324,9 @@ impl Checker {
             imported_interface_bindings: HashSet::new(),
             type_params: HashSet::new(),
             loop_depth: 0,
+            constants: HashMap::new(),
+            hush_comments: Vec::new(),
+            in_test_function: false,
         }
     }
 
@@ -270,6 +366,9 @@ impl Checker {
         let mut types = Vec::new();
         let mut functions = Vec::new();
         let mut function_returns = HashMap::new();
+        let mut function_params = HashMap::new();
+        let mut function_param_types = HashMap::new();
+        let mut function_constraints = HashMap::new();
 
         for item in &iface.items {
             match item {
@@ -278,9 +377,36 @@ impl Checker {
                     types.push(name);
                 }
                 InterfaceItem::Func(func) => {
-                    functions.push(func.name.name.clone());
+                    let func_name = func.name.name.clone();
+                    functions.push(func_name.clone());
                     if let Some(result) = &func.result {
-                        function_returns.insert(func.name.name.clone(), self.ty_to_checked(result));
+                        function_returns.insert(func_name.clone(), self.ty_to_checked(result));
+                    }
+                    let param_names: Vec<String> =
+                        func.params.iter().map(|p| p.name.name.clone()).collect();
+                    if !param_names.is_empty() {
+                        function_params.insert(func_name.clone(), param_names.clone());
+                    }
+                    let param_types: Vec<String> = func
+                        .params
+                        .iter()
+                        .map(|p| format!("{}: {}", p.name.name, self.fmt_ty(&p.ty)))
+                        .collect();
+                    if !param_types.is_empty() {
+                        function_param_types.insert(func_name.clone(), param_types);
+                    }
+                    let constraints: Vec<ParamConstraint> = func
+                        .params
+                        .iter()
+                        .filter_map(|p| {
+                            p.constraint.as_ref().map(|c| ParamConstraint {
+                                param_name: p.name.name.clone(),
+                                constraint: c.clone(),
+                            })
+                        })
+                        .collect();
+                    if !constraints.is_empty() {
+                        function_constraints.insert(func_name, constraints);
                     }
                 }
                 InterfaceItem::Use(_) => {} // Handled in validation
@@ -295,6 +421,9 @@ impl Checker {
                 types,
                 functions,
                 function_returns,
+                function_params,
+                function_constraints,
+                function_param_types,
             },
         );
     }
@@ -542,8 +671,16 @@ impl Checker {
 
         // Validate function body (Kettu extension)
         if let Some(body) = &func.body {
+            // Check if this is a test or test-helper function
+            let was_in_test = self.in_test_function;
+            self.in_test_function = func
+                .gates
+                .iter()
+                .any(|g| matches!(g, Gate::Test | Gate::TestHelper));
+
             // Clear locals and add parameters
             self.locals.clear();
+            self.constants.clear();
             for interface_name in &self.imported_interface_bindings {
                 self.locals.insert(
                     interface_name.clone(),
@@ -631,6 +768,9 @@ impl Checker {
                     ));
                 }
             }
+
+            // Restore previous test function state after body processing
+            self.in_test_function = was_in_test;
         }
 
         // Check feature gates
@@ -656,6 +796,13 @@ impl Checker {
 
         // Validate function body (Kettu extension)
         if let Some(body) = &func.body {
+            // Check if this is a test or test-helper function
+            let was_in_test = self.in_test_function;
+            self.in_test_function = func
+                .gates
+                .iter()
+                .any(|g| matches!(g, Gate::Test | Gate::TestHelper));
+
             // Clear locals and add implicit self + explicit parameters
             self.locals.clear();
             for interface_name in &self.imported_interface_bindings {
@@ -694,6 +841,9 @@ impl Checker {
                     }
                 }
             }
+
+            // Restore previous test function state after body processing
+            self.in_test_function = was_in_test;
         }
 
         // Check feature gates
@@ -728,6 +878,9 @@ impl Checker {
             Gate::Test => {
                 // Test functions are validated separately
             }
+            Gate::TestHelper => {
+                // Test helper functions are validated separately
+            }
         }
     }
 
@@ -738,6 +891,10 @@ impl Checker {
                 let value_ty = self.check_expr(value);
                 // Add to local scope (infer type from value)
                 self.locals.insert(name.name.clone(), value_ty);
+                // Track constant values for constraint evaluation
+                if let Some(val) = self.const_value(value) {
+                    self.constants.insert(name.name.clone(), val);
+                }
             }
             Statement::Return(value) => {
                 if let Some(expr) = value {
@@ -1118,7 +1275,7 @@ impl Checker {
                     _ => CheckedType::Unknown,
                 }
             }
-            Expr::Call { func, args, .. } => {
+            Expr::Call { func, args, span } => {
                 let callee_return = match func.as_ref() {
                     Expr::Ident(id) => {
                         if let Some(local) = self.locals.get(&id.name) {
@@ -1166,6 +1323,12 @@ impl Checker {
                 for arg in args {
                     self.check_expr(arg);
                 }
+
+                // Check call constraints after checking args
+                if let Expr::Ident(id) = func.as_ref() {
+                    self.check_call_constraints(id, args, span);
+                }
+
                 callee_return
             }
             Expr::Field { expr, field, span } => {
@@ -2146,6 +2309,59 @@ impl Checker {
         }
     }
 
+    fn fmt_ty(&self, ty: &Ty) -> String {
+        match ty {
+            Ty::Primitive(p, _) => format!("{:?}", p).to_lowercase(),
+            Ty::Named(id) => id.name.clone(),
+            Ty::List { element, .. } => format!("list<{}>", self.fmt_ty(element)),
+            Ty::Option { inner, .. } => format!("option<{}>", self.fmt_ty(inner)),
+            Ty::Result { ok, err, .. } => {
+                let ok_str = ok
+                    .as_ref()
+                    .map(|t| self.fmt_ty(t))
+                    .unwrap_or_else(|| "()".to_string());
+                let err_str = err
+                    .as_ref()
+                    .map(|t| self.fmt_ty(t))
+                    .unwrap_or_else(|| "()".to_string());
+                format!("result<{}, {}>", ok_str, err_str)
+            }
+            Ty::Future { inner, .. } => {
+                if let Some(t) = inner {
+                    format!("future<{}>", self.fmt_ty(t))
+                } else {
+                    "future".to_string()
+                }
+            }
+            Ty::Stream { inner, .. } => {
+                if let Some(t) = inner {
+                    format!("stream<{}>", self.fmt_ty(t))
+                } else {
+                    "stream".to_string()
+                }
+            }
+            Ty::Tuple { elements, .. } => {
+                let inner = elements
+                    .iter()
+                    .map(|t| self.fmt_ty(t))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({})", inner)
+            }
+            Ty::Borrow { resource, .. } => format!("borrow<{}>", resource.name),
+            Ty::Own { resource, .. } => format!("own<{}>", resource.name),
+            Ty::Generic { name, args, .. } => {
+                let inner = args
+                    .iter()
+                    .map(|t| self.fmt_ty(t))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{}<{}>", name.name, inner)
+            }
+            _ => "unknown".to_string(),
+        }
+    }
+
     fn validate_type(&mut self, ty: &Ty) {
         match ty {
             Ty::Named(id) => {
@@ -2407,6 +2623,509 @@ fn package_path_to_string(path: &PackagePath) -> String {
     }
 
     result
+}
+
+// ============================================================================
+// Constraint Checking Methods
+// ============================================================================
+
+impl Checker {
+    fn check_call_constraints(&mut self, func: &Id, args: &[Expr], span: &Span) {
+        if let Some(iface_name) = &self.current_interface {
+            if let Some(iface) = self.interfaces.get(iface_name) {
+                if let Some(constraints) = iface.function_constraints.get(&func.name) {
+                    // Build param name -> argument mapping
+                    let mut param_to_arg: HashMap<String, &Expr> = HashMap::new();
+                    if let Some(param_names) = iface.function_params.get(&func.name) {
+                        for (i, param_name) in param_names.iter().enumerate() {
+                            if i < args.len() {
+                                param_to_arg.insert(param_name.clone(), &args[i]);
+                            }
+                        }
+                    }
+
+                    for constraint in constraints {
+                        let param_index =
+                            iface.function_params.get(&func.name).and_then(|params| {
+                                params.iter().position(|p| p == &constraint.param_name)
+                            });
+
+                        if let Some(idx) = param_index {
+                            if idx < args.len() {
+                                let arg_expr = &args[idx];
+                                let arg_value = self.const_value(arg_expr);
+                                let eval_result = self.eval_constraint_with_mapping(
+                                    &constraint.constraint,
+                                    &constraint.param_name,
+                                    arg_value,
+                                    &param_to_arg,
+                                );
+                                let is_test = self.is_in_test_function();
+                                let error_msg = match &eval_result {
+                                    ConstraintEvalResult::Violated(_) => {
+                                        let msg = self.fmt_constraint_with_values(
+                                            &constraint.constraint,
+                                            &constraint.param_name,
+                                            arg_value.unwrap_or(0),
+                                        );
+                                        // Try to get caller arg name for better error message
+                                        let arg_name = self.get_arg_name(arg_expr);
+                                        if arg_name != constraint.param_name {
+                                            format!(
+                                                "{} does not satisfy the constraint \"{}\" on {}",
+                                                arg_name, msg, func.name
+                                            )
+                                        } else {
+                                            format!(
+                                                "{} does not satisfy the constraint \"{}\" on {}",
+                                                constraint.param_name, msg, func.name
+                                            )
+                                        }
+                                    }
+                                    ConstraintEvalResult::NeedsPropagation(vars) => {
+                                        // Build message with caller argument names
+                                        // Format: "small (somesmall)" - callee param (caller arg)
+                                        let var_names: Vec<String> = vars
+                                            .iter()
+                                            .map(|v| {
+                                                let caller_arg = param_to_arg
+                                                    .get(v)
+                                                    .map(|e| self.get_arg_name(e))
+                                                    .unwrap_or_else(|| v.clone());
+                                                format!("{} ({})", v, caller_arg)
+                                            })
+                                            .collect();
+                                        // Just the caller arg names for the "because" clause
+                                        let var_names_plain: Vec<String> = vars
+                                            .iter()
+                                            .map(|v| {
+                                                param_to_arg
+                                                    .get(v)
+                                                    .map(|e| self.get_arg_name(e))
+                                                    .unwrap_or_else(|| v.clone())
+                                            })
+                                            .collect();
+                                        // Check if all variables are in our param mapping
+                                        if vars.iter().all(|v| param_to_arg.contains_key(v)) {
+                                            let arg_name = param_to_arg
+                                                .get(&constraint.param_name)
+                                                .map(|e| self.get_arg_name(e))
+                                                .unwrap_or_else(|| constraint.param_name.clone());
+                                            format!(
+                                                "{} may not satisfy the constraint \"{} ({}) > {}\" because {} is an unconstrained parameter, {} must be called with a guard",
+                                                arg_name,
+                                                constraint.param_name,
+                                                arg_value.unwrap_or(0),
+                                                var_names.join(", "),
+                                                var_names_plain.join(" and "),
+                                                func.name
+                                            )
+                                        } else {
+                                            format!(
+                                                "Cannot verify constraint on '{}': unresolved variables {:?}",
+                                                constraint.param_name, vars
+                                            )
+                                        }
+                                    }
+                                    _ => String::new(),
+                                };
+
+                                if is_test && !error_msg.is_empty() {
+                                    let is_hushed = self.check_hush_comment(span, &error_msg);
+                                    if is_hushed {
+                                        self.diagnostics.push(Diagnostic::info(
+                                            error_msg,
+                                            span.clone(),
+                                            DiagnosticCode::ConstraintViolation,
+                                        ));
+                                    } else {
+                                        self.diagnostics.push(Diagnostic::error(
+                                            error_msg,
+                                            span.clone(),
+                                            DiagnosticCode::ConstraintViolation,
+                                        ));
+                                    }
+                                } else {
+                                    match eval_result {
+                                        ConstraintEvalResult::Violated(_) => {
+                                            self.diagnostics.push(Diagnostic::error(
+                                                error_msg,
+                                                span.clone(),
+                                                DiagnosticCode::ConstraintViolation,
+                                            ));
+                                        }
+                                        ConstraintEvalResult::NeedsPropagation(vars) => {
+                                            self.diagnostics.push(Diagnostic::warning(
+                                                error_msg,
+                                                span.clone(),
+                                                DiagnosticCode::ConstraintPropagation,
+                                            ));
+                                        }
+                                        ConstraintEvalResult::Satisfied => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_arg_name(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::Ident(id) => id.name.clone(),
+            _ => "value".to_string(),
+        }
+    }
+
+    fn const_value(&self, expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Integer(n, _) => Some(*n),
+            Expr::Ident(id) => self.constants.get(&id.name).copied(),
+            Expr::Binary { lhs, op, rhs, .. } => {
+                let lhs_val = self.const_value(lhs)?;
+                let rhs_val = self.const_value(rhs)?;
+                self.eval_binary_constraint(*op, lhs_val, rhs_val)
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_constraint(
+        &self,
+        constraint: &Expr,
+        param_name: &str,
+        arg_value: Option<i64>,
+    ) -> ConstraintEvalResult {
+        match constraint {
+            Expr::Binary { lhs, op, rhs, .. } => {
+                let lhs_vars = self.collect_free_vars(lhs);
+                let rhs_vars = self.collect_free_vars(rhs);
+                let all_vars: Vec<String> =
+                    lhs_vars.iter().chain(rhs_vars.iter()).cloned().collect();
+
+                let lhs_val = self.const_value(lhs);
+                let rhs_val = self.const_value(rhs);
+
+                match (lhs_val, rhs_val, arg_value) {
+                    (Some(l), Some(r), _) => {
+                        if self.eval_binary_bool(*op, l, r) {
+                            ConstraintEvalResult::Satisfied
+                        } else {
+                            ConstraintEvalResult::Violated(format!(
+                                "{} {} {} is false",
+                                l,
+                                self.fmt_op(*op),
+                                r
+                            ))
+                        }
+                    }
+                    (Some(_v), None, Some(arg))
+                        if all_vars.iter().all(|v| self.constants.contains_key(v)) =>
+                    {
+                        let result = self.const_value_with(constraint, param_name, arg);
+                        if result == Some(true) {
+                            ConstraintEvalResult::Satisfied
+                        } else if result == Some(false) {
+                            let msg = self.fmt_constraint_with_values(constraint, param_name, arg);
+                            ConstraintEvalResult::Violated(msg)
+                        } else {
+                            ConstraintEvalResult::NeedsPropagation(all_vars)
+                        }
+                    }
+                    (None, _, _) | (_, None, _) if !all_vars.is_empty() => {
+                        ConstraintEvalResult::NeedsPropagation(all_vars)
+                    }
+                    _ => ConstraintEvalResult::NeedsPropagation(all_vars),
+                }
+            }
+            _ => ConstraintEvalResult::NeedsPropagation(vec![]),
+        }
+    }
+
+    fn eval_constraint_with_mapping(
+        &self,
+        constraint: &Expr,
+        param_name: &str,
+        arg_value: Option<i64>,
+        param_to_arg: &HashMap<String, &Expr>,
+    ) -> ConstraintEvalResult {
+        match constraint {
+            Expr::Binary { lhs, op, rhs, .. } => {
+                let lhs_vars = self.collect_free_vars(lhs);
+                let rhs_vars = self.collect_free_vars(rhs);
+                let all_vars: Vec<String> =
+                    lhs_vars.iter().chain(rhs_vars.iter()).cloned().collect();
+
+                let lhs_val = self.const_value(lhs);
+                let rhs_val = self.const_value(rhs);
+
+                match (lhs_val, rhs_val, arg_value) {
+                    (Some(l), Some(r), _) => {
+                        if self.eval_binary_bool(*op, l, r) {
+                            ConstraintEvalResult::Satisfied
+                        } else {
+                            ConstraintEvalResult::Violated(format!(
+                                "{} {} {} is false",
+                                l,
+                                self.fmt_op(*op),
+                                r
+                            ))
+                        }
+                    }
+                    (Some(_v), None, Some(arg))
+                        if all_vars.iter().all(|v| {
+                            // Check if it's in constants OR if it's another parameter in the mapping
+                            self.constants.contains_key(v) || param_to_arg.contains_key(v)
+                        }) =>
+                    {
+                        let result = self.const_value_with_mapping(
+                            constraint,
+                            param_name,
+                            arg,
+                            param_to_arg,
+                        );
+                        if result == Some(true) {
+                            ConstraintEvalResult::Satisfied
+                        } else if result == Some(false) {
+                            let msg = self.fmt_constraint_with_values(constraint, param_name, arg);
+                            ConstraintEvalResult::Violated(msg)
+                        } else {
+                            ConstraintEvalResult::NeedsPropagation(all_vars)
+                        }
+                    }
+                    (None, _, _) | (_, None, _) if !all_vars.is_empty() => {
+                        ConstraintEvalResult::NeedsPropagation(all_vars)
+                    }
+                    _ => ConstraintEvalResult::NeedsPropagation(all_vars),
+                }
+            }
+            _ => ConstraintEvalResult::NeedsPropagation(vec![]),
+        }
+    }
+
+    fn const_value_with_mapping(
+        &self,
+        expr: &Expr,
+        param_name: &str,
+        arg_val: i64,
+        param_to_arg: &HashMap<String, &Expr>,
+    ) -> Option<bool> {
+        match expr {
+            Expr::Binary { lhs, op, rhs, .. } => {
+                let lhs_val = match lhs.as_ref() {
+                    Expr::Ident(id) => {
+                        if id.name == param_name {
+                            Some(arg_val)
+                        } else if let Some(arg_expr) = param_to_arg.get(&id.name) {
+                            self.const_value(arg_expr)
+                        } else {
+                            self.constants.get(&id.name).copied()
+                        }
+                    }
+                    _ => self.const_value(lhs),
+                };
+                let rhs_val = match rhs.as_ref() {
+                    Expr::Ident(id) => {
+                        if id.name == param_name {
+                            Some(arg_val)
+                        } else if let Some(arg_expr) = param_to_arg.get(&id.name) {
+                            self.const_value(arg_expr)
+                        } else {
+                            self.constants.get(&id.name).copied()
+                        }
+                    }
+                    _ => self.const_value(rhs),
+                };
+
+                match (lhs_val, rhs_val) {
+                    (Some(l), Some(r)) => Some(self.eval_binary_bool(*op, l, r)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_binary_constraint(&self, op: kettu_parser::BinOp, lhs: i64, rhs: i64) -> Option<i64> {
+        match op {
+            kettu_parser::BinOp::Add => Some(lhs + rhs),
+            kettu_parser::BinOp::Sub => Some(lhs - rhs),
+            kettu_parser::BinOp::Mul => Some(lhs * rhs),
+            kettu_parser::BinOp::Div if rhs != 0 => Some(lhs / rhs),
+            _ => None,
+        }
+    }
+
+    fn eval_binary_bool(&self, op: kettu_parser::BinOp, lhs: i64, rhs: i64) -> bool {
+        match op {
+            kettu_parser::BinOp::Eq => lhs == rhs,
+            kettu_parser::BinOp::Ne => lhs != rhs,
+            kettu_parser::BinOp::Lt => lhs < rhs,
+            kettu_parser::BinOp::Le => lhs <= rhs,
+            kettu_parser::BinOp::Gt => lhs > rhs,
+            kettu_parser::BinOp::Ge => lhs >= rhs,
+            _ => false,
+        }
+    }
+
+    fn const_value_with(&self, expr: &Expr, param_name: &str, arg_val: i64) -> Option<bool> {
+        match expr {
+            Expr::Binary { lhs, op, rhs, .. } => {
+                let lhs_val = match lhs.as_ref() {
+                    Expr::Ident(id) => {
+                        if id.name == param_name {
+                            Some(arg_val)
+                        } else {
+                            self.constants.get(&id.name).copied()
+                        }
+                    }
+                    _ => self.const_value(lhs),
+                };
+                let rhs_val = match rhs.as_ref() {
+                    Expr::Ident(id) => {
+                        if id.name == param_name {
+                            Some(arg_val)
+                        } else {
+                            self.constants.get(&id.name).copied()
+                        }
+                    }
+                    _ => self.const_value(rhs),
+                };
+
+                match (lhs_val, rhs_val) {
+                    (Some(l), Some(r)) => Some(self.eval_binary_bool(*op, l, r)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn collect_free_vars(&self, expr: &Expr) -> Vec<String> {
+        let mut vars = Vec::new();
+        self.collect_free_vars_rec(expr, &mut vars);
+        vars
+    }
+
+    fn collect_free_vars_rec(&self, expr: &Expr, vars: &mut Vec<String>) {
+        match expr {
+            Expr::Ident(id) => {
+                // Check both constants AND locals (function parameters)
+                if !self.constants.contains_key(&id.name)
+                    && !self.locals.contains_key(&id.name)
+                    && !vars.contains(&id.name)
+                {
+                    vars.push(id.name.clone());
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.collect_free_vars_rec(lhs, vars);
+                self.collect_free_vars_rec(rhs, vars);
+            }
+            Expr::Call { func, args, .. } => {
+                self.collect_free_vars_rec(func, vars);
+                for arg in args {
+                    self.collect_free_vars_rec(arg, vars);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn fmt_constraint(&self, constraint: &Expr) -> String {
+        match constraint {
+            Expr::Binary { lhs, op, rhs, .. } => {
+                format!(
+                    "{} {} {}",
+                    self.fmt_expr(lhs),
+                    self.fmt_op(*op),
+                    self.fmt_expr(rhs)
+                )
+            }
+            _ => "unknown".to_string(),
+        }
+    }
+
+    fn fmt_constraint_with_values(
+        &self,
+        constraint: &Expr,
+        param_name: &str,
+        arg_val: i64,
+    ) -> String {
+        match constraint {
+            Expr::Binary { lhs, op, rhs, .. } => {
+                let lhs_str = self.fmt_expr_with_value(lhs, param_name, arg_val);
+                let rhs_str = self.fmt_expr_with_value(rhs, param_name, arg_val);
+                format!("{} {} {}", lhs_str, self.fmt_op(*op), rhs_str)
+            }
+            _ => "constraint evaluation failed".to_string(),
+        }
+    }
+
+    fn fmt_expr_with_value(&self, expr: &Expr, param_name: &str, arg_val: i64) -> String {
+        match expr {
+            Expr::Integer(n, _) => n.to_string(),
+            Expr::Ident(id) => {
+                if id.name == param_name {
+                    format!("{} ({})", param_name, arg_val)
+                } else {
+                    self.constants
+                        .get(&id.name)
+                        .map(|v| format!("{} ({})", id.name, v))
+                        .unwrap_or_else(|| id.name.clone())
+                }
+            }
+            _ => "expr".to_string(),
+        }
+    }
+
+    fn fmt_expr(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::Integer(n, _) => n.to_string(),
+            Expr::Ident(id) => id.name.clone(),
+            _ => "expr".to_string(),
+        }
+    }
+
+    fn fmt_op(&self, op: kettu_parser::BinOp) -> String {
+        match op {
+            kettu_parser::BinOp::Add => "+".to_string(),
+            kettu_parser::BinOp::Sub => "-".to_string(),
+            kettu_parser::BinOp::Mul => "*".to_string(),
+            kettu_parser::BinOp::Div => "/".to_string(),
+            kettu_parser::BinOp::Eq => "==".to_string(),
+            kettu_parser::BinOp::Ne => "!=".to_string(),
+            kettu_parser::BinOp::Lt => "<".to_string(),
+            kettu_parser::BinOp::Le => "<=".to_string(),
+            kettu_parser::BinOp::Gt => ">".to_string(),
+            kettu_parser::BinOp::Ge => ">=".to_string(),
+            kettu_parser::BinOp::And => "&&".to_string(),
+            kettu_parser::BinOp::Or => "||".to_string(),
+        }
+    }
+
+    fn is_in_test_function(&self) -> bool {
+        self.in_test_function
+    }
+
+    fn check_hush_comment(&self, span: &Span, error_msg: &str) -> bool {
+        // Need to find line number from character offset - use source if available
+        // For now, just check all comments and match by exact text
+        for comment in &self.hush_comments {
+            if let Expr::String(expected_text, _) = &comment.constraint {
+                if expected_text == error_msg {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+fn constraint_param_name() -> &'static str {
+    "x"
 }
 
 // ============================================================================

@@ -7,8 +7,8 @@ use gimli::write::{
     LineString, Sections,
 };
 use gimli::{
-    Encoding as DwarfEncoding, Format as DwarfFormat, LineEncoding, LittleEndian, SectionId,
-    constants,
+    constants, Encoding as DwarfEncoding, Format as DwarfFormat, LineEncoding, LittleEndian,
+    SectionId,
 };
 use kettu_parser::{
     BinOp, Expr, Func, FuncBody, Id, InterfaceItem, Param, Pattern, PrimitiveTy, ResourceMethod,
@@ -745,6 +745,8 @@ struct ModuleCompiler<'a> {
     loop_break_depth: Option<u32>,
     /// Continue target depth: how many wasm blocks to `br` past to reach the continue target.
     loop_continue_depth: Option<u32>,
+    /// Index of the contract fail import (ptr: i32, len: i32) -> ()
+    contract_fail_idx: Option<u32>,
 }
 
 impl<'a> ModuleCompiler<'a> {
@@ -788,6 +790,7 @@ impl<'a> ModuleCompiler<'a> {
             shared_locals: std::collections::HashSet::new(),
             loop_break_depth: None,
             loop_continue_depth: None,
+            contract_fail_idx: None,
         };
         if options.emit_debug_hooks {
             compiler.ensure_debug_hook_import();
@@ -851,6 +854,20 @@ impl<'a> ModuleCompiler<'a> {
         self.functions
             .insert("$debug_exit".to_string(), (type_idx, func_idx, true));
         self.debug_exit_hook_idx = Some(func_idx);
+        func_idx
+    }
+
+    fn ensure_contract_fail_import(&mut self) -> u32 {
+        if let Some(idx) = self.contract_fail_idx {
+            return idx;
+        }
+
+        let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
+        let func_idx = self.import_count;
+        self.import_count += 1;
+        self.functions
+            .insert("$contract_fail".to_string(), (type_idx, func_idx, true));
+        self.contract_fail_idx = Some(func_idx);
         func_idx
     }
 
@@ -992,6 +1009,93 @@ impl<'a> ModuleCompiler<'a> {
                 .map(|binding| binding.local_index)
                 .collect(),
         })
+    }
+
+    fn emit_contracts_section(&self, module: &mut Module, file: &WitFile) {
+        let mut json = String::from("{\"version\":1,\"functions\":{");
+
+        let mut first_func = true;
+        for item in &file.items {
+            if let TopLevelItem::Interface(iface) = item {
+                for iface_item in &iface.items {
+                    if let InterfaceItem::Func(func) = iface_item {
+                        let constrained_params: Vec<&Param> = func
+                            .params
+                            .iter()
+                            .filter(|p| p.constraint.is_some())
+                            .collect();
+                        if constrained_params.is_empty() {
+                            continue;
+                        }
+
+                        if !first_func {
+                            json.push(',');
+                        }
+                        first_func = false;
+
+                        json.push_str(&format!("\"{}\":[", func.name.name));
+                        let mut first_param = true;
+                        for param in &constrained_params {
+                            if !first_param {
+                                json.push(',');
+                            }
+                            first_param = false;
+                            let constraint_str =
+                                self.fmt_constraint_expr(param.constraint.as_ref().unwrap());
+                            json.push_str(&format!(
+                                "{{\"name\":\"{}\",\"type\":\"{}\",\"constraint\":\"{}\"}}",
+                                param.name.name,
+                                self.fmt_ty(&param.ty),
+                                constraint_str.replace('\\', "\\\\").replace('"', "\\\"")
+                            ));
+                        }
+                        json.push(']');
+                    }
+                }
+            }
+        }
+
+        json.push_str("}}");
+
+        if !first_func {
+            let section = CustomSection {
+                name: "kettu-contracts".into(),
+                data: std::borrow::Cow::Owned(json.into_bytes()),
+            };
+            module.section(&section);
+        }
+    }
+
+    fn fmt_ty(&self, ty: &Ty) -> String {
+        match ty {
+            Ty::Primitive(p, _) => match p {
+                PrimitiveTy::U8 => "u8",
+                PrimitiveTy::U16 => "u16",
+                PrimitiveTy::U32 => "u32",
+                PrimitiveTy::U64 => "u64",
+                PrimitiveTy::S8 => "s8",
+                PrimitiveTy::S16 => "s16",
+                PrimitiveTy::S32 => "s32",
+                PrimitiveTy::S64 => "s64",
+                PrimitiveTy::F32 => "f32",
+                PrimitiveTy::F64 => "f64",
+                PrimitiveTy::Bool => "bool",
+                PrimitiveTy::Char => "char",
+                PrimitiveTy::String => "string",
+                PrimitiveTy::V128 => "v128",
+            }
+            .to_string(),
+            Ty::Named(id) => id.name.clone(),
+            Ty::List { .. } => "list".to_string(),
+            Ty::Option { .. } => "option".to_string(),
+            Ty::Result { .. } => "result".to_string(),
+            Ty::Tuple { .. } => "tuple".to_string(),
+            Ty::Future { .. } => "future".to_string(),
+            Ty::Stream { .. } => "stream".to_string(),
+            Ty::Generic { name, .. } => name.name.clone(),
+            Ty::Own { resource, .. } => format!("own<{}>", resource.name),
+            Ty::Borrow { resource, .. } => format!("borrow<{}>", resource.name),
+        }
     }
 
     fn emit_name_section(&self, module: &mut Module) {
@@ -1489,6 +1593,10 @@ impl<'a> ModuleCompiler<'a> {
             let type_idx = self.get_or_create_type(&[ValType::I32], &[]);
             imports.import("kettu:debug", "exit", EntityType::Function(type_idx));
         }
+        if self.contract_fail_idx.is_some() {
+            let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
+            imports.import("kettu:contract", "fail", EntityType::Function(type_idx));
+        }
 
         // Add interface function imports
         for item in &file.items {
@@ -1749,6 +1857,10 @@ impl<'a> ModuleCompiler<'a> {
         if self.options.keep_names || self.options.emit_dwarf {
             self.emit_name_section(&mut module);
         }
+
+        // 12. Contract metadata custom section
+        self.emit_contracts_section(&mut module, file);
+
         if self.options.emit_dwarf {
             let mut wasm = module.finish();
             self.emit_debug_sections(&mut wasm)?;
@@ -1877,6 +1989,7 @@ impl<'a> ModuleCompiler<'a> {
                                             span: func.name.span.clone(),
                                         },
                                         ty: Ty::Primitive(PrimitiveTy::S32, func.name.span.clone()),
+                                        constraint: None,
                                     }];
                                     params_with_self.extend(func.params.clone());
 
@@ -3171,6 +3284,9 @@ impl<'a> ModuleCompiler<'a> {
             function.instruction(&Instruction::LocalSet(synth_idx));
         }
 
+        // Emit constraint checks for parameters with where clauses
+        self.emit_constraint_checks(&mut function, func, &locals);
+
         // Track type info for record variables
         let mut locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();
 
@@ -3553,6 +3669,149 @@ impl<'a> ModuleCompiler<'a> {
         self.exit_nested_control_block();
         function.instruction(&Instruction::End);
         Ok(())
+    }
+
+    fn emit_constraint_checks(
+        &mut self,
+        function: &mut Function,
+        func: &Func,
+        locals: &HashMap<String, u32>,
+    ) {
+        let has_constraints = func.params.iter().any(|p| p.constraint.is_some());
+        if !has_constraints {
+            return;
+        }
+
+        let contract_fail_idx = self.ensure_contract_fail_import();
+
+        for param in &func.params {
+            if let Some(constraint) = &param.constraint {
+                let msg = format!(
+                    "{} does not satisfy the constraint \"{}\"",
+                    param.name.name,
+                    self.fmt_constraint_expr(constraint)
+                );
+                let (msg_ptr, msg_len) = self.register_string(&msg);
+
+                self.compile_constraint_expr(function, constraint, locals);
+
+                // If constraint is false (== 0), trap
+                function.instruction(&Instruction::I32Eqz);
+                function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                function.instruction(&Instruction::I32Const(msg_ptr as i32));
+                function.instruction(&Instruction::I32Const(msg_len as i32));
+                function.instruction(&Instruction::Call(contract_fail_idx));
+                function.instruction(&Instruction::Unreachable);
+                function.instruction(&Instruction::End);
+            }
+        }
+    }
+
+    fn compile_constraint_expr(
+        &mut self,
+        function: &mut Function,
+        expr: &Expr,
+        locals: &HashMap<String, u32>,
+    ) {
+        match expr {
+            Expr::Ident(id) => {
+                if let Some(&idx) = locals.get(&id.name) {
+                    function.instruction(&Instruction::LocalGet(idx));
+                } else {
+                    function.instruction(&Instruction::I32Const(0));
+                }
+            }
+            Expr::Integer(n, _) => {
+                function.instruction(&Instruction::I32Const(*n as i32));
+            }
+            Expr::Binary { lhs, op, rhs, .. } => {
+                self.compile_constraint_expr(function, lhs, locals);
+                self.compile_constraint_expr(function, rhs, locals);
+                match op {
+                    BinOp::Gt => {
+                        function.instruction(&Instruction::I32GtS);
+                    }
+                    BinOp::Ge => {
+                        function.instruction(&Instruction::I32GeS);
+                    }
+                    BinOp::Lt => {
+                        function.instruction(&Instruction::I32LtS);
+                    }
+                    BinOp::Le => {
+                        function.instruction(&Instruction::I32LeS);
+                    }
+                    BinOp::Eq => {
+                        function.instruction(&Instruction::I32Eq);
+                    }
+                    BinOp::Ne => {
+                        function.instruction(&Instruction::I32Ne);
+                    }
+                    BinOp::And => {
+                        function.instruction(&Instruction::I32And);
+                    }
+                    BinOp::Or => {
+                        function.instruction(&Instruction::I32Or);
+                    }
+                    BinOp::Add => {
+                        function.instruction(&Instruction::I32Add);
+                    }
+                    BinOp::Sub => {
+                        function.instruction(&Instruction::I32Sub);
+                    }
+                    BinOp::Mul => {
+                        function.instruction(&Instruction::I32Mul);
+                    }
+                    BinOp::Div => {
+                        function.instruction(&Instruction::I32DivS);
+                    }
+                }
+            }
+            Expr::Not(inner, _) => {
+                self.compile_constraint_expr(function, inner, locals);
+                function.instruction(&Instruction::I32Eqz);
+            }
+            Expr::Neg(inner, _) => {
+                function.instruction(&Instruction::I32Const(0));
+                self.compile_constraint_expr(function, inner, locals);
+                function.instruction(&Instruction::I32Sub);
+            }
+            Expr::Bool(b, _) => {
+                function.instruction(&Instruction::I32Const(if *b { 1 } else { 0 }));
+            }
+            _ => {
+                function.instruction(&Instruction::I32Const(1));
+            }
+        }
+    }
+
+    fn fmt_constraint_expr(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::Binary { lhs, op, rhs, .. } => {
+                format!(
+                    "{} {} {}",
+                    self.fmt_constraint_expr(lhs),
+                    match op {
+                        BinOp::Eq => "==",
+                        BinOp::Ne => "!=",
+                        BinOp::Lt => "<",
+                        BinOp::Le => "<=",
+                        BinOp::Gt => ">",
+                        BinOp::Ge => ">=",
+                        BinOp::And => "&&",
+                        BinOp::Or => "||",
+                        BinOp::Add => "+",
+                        BinOp::Sub => "-",
+                        BinOp::Mul => "*",
+                        BinOp::Div => "/",
+                    },
+                    self.fmt_constraint_expr(rhs)
+                )
+            }
+            Expr::Ident(id) => id.name.clone(),
+            Expr::Integer(n, _) => n.to_string(),
+            Expr::Not(inner, _) => format!("!{}", self.fmt_constraint_expr(inner)),
+            _ => "?".to_string(),
+        }
     }
 
     fn compile_statement_with_locals(
@@ -4173,7 +4432,7 @@ impl<'a> ModuleCompiler<'a> {
                 for (i, (_, expr)) in fields.iter().enumerate() {
                     // Duplicate pointer
                     function.instruction(&Instruction::LocalTee(0)); // Assume local 0 for temp
-                    // Compile field value
+                                                                     // Compile field value
                     self.compile_expr(function, expr)?;
                     // Store at offset
                     function.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
