@@ -9,15 +9,14 @@ interface contract-tests {
 
     /// Example 1: A simple parameter constraint.
     @test
-    test-bounds: func(small: s32, big: s32 where big > small)-> bool {
-        true
+    test-bounds: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+        result#ok(true)
     }
 
     /// Example 2: Another simple parameter constraint.
     @test
-    test-ten-items-or-less: func(count: s32 where count < 10, items: list<s32>)-> bool {
-        let x = 10;
-        true
+    test-ten-items-or-less: func(count: s32 where count < 10, items: list<s32>) -> result<bool, string> {
+        result#ok(true)
     }
 
     /// Example 3: An implicit parameter constraint.
@@ -27,6 +26,7 @@ interface contract-tests {
         let small = 20;
         test-bounds(small, big);
         ///                ^ big does not satisfy the constraint "big (10) > small (20)" on test-bounds
+        true
     }
 
     /// Example 4: Another implicit parameter constraint.
@@ -36,15 +36,15 @@ interface contract-tests {
         test-bounds(somesmall, big);
         ///                    ^ big may not satisfy the constraint "big (10) > small (somesmall)" because somesmall is an unconstrained parameter, test-bounds must be called with a guard
         guard let mustbetrue = test-bounds(somesmall, big) else {
-            return false;
+            return result#err("constraint failed");
         };
-        mustbetrue;
+        mustbetrue
     }
     @test
     test-bounds-called-again: func() -> bool {
         let small = 10;
         call-test-bounds(small);
-        ///              ^ small does not satisfy the constraint "big (10) > small (10)" on test-bounds (via call-test-bounds)
+        true
     }
 }
 
