@@ -3,7 +3,10 @@
 //! Language Server Protocol implementation for Kettu/WIT.
 //! Provides diagnostics, hover, go-to-definition, document symbols, and completion.
 
-use kettu_checker::{Severity, check, check_with_source};
+use kettu_checker::{Severity, check_with_source};
+
+#[cfg(test)]
+use kettu_checker::check as check_only;
 use kettu_codegen::resolve_imports;
 use kettu_parser::{
     BinOp, Expr, ImportExportKind, InterfaceItem, Pattern, PrimitiveTy, Statement, TopLevelItem,
@@ -2236,7 +2239,7 @@ interface http-handler {
         let ast_for_check = parse_clean_without_comments(source)
             .or(ast)
             .expect("Should obtain an AST for checker validation");
-        let check_errors = check(&ast_for_check);
+        let check_errors = check_only(&ast_for_check);
         assert!(
             !check_errors
                 .iter()

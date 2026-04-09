@@ -255,7 +255,7 @@ enum ConstraintEvalResult {
     /// Constraint is satisfied
     Satisfied,
     /// Constraint is violated with error message
-    Violated(String),
+    Violated(#[allow(dead_code)] String),
     /// Constraint needs propagation (has free variables)
     NeedsPropagation(Vec<String>),
 }
@@ -266,6 +266,7 @@ struct HushComment {
     line: usize,
     col: usize,
     constraint: Expr,
+    #[allow(dead_code)]
     span: Span,
 }
 
