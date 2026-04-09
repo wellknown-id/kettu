@@ -1415,10 +1415,8 @@ impl<'a> ModuleCompiler<'a> {
         // Phase 0: Pre-register async imports (must be before collect_definitions)
         self.preregister_async_imports(file)?;
 
-        // Phase 1: Collect definitions (function signatures, imports)
-        self.collect_definitions(file)?;
-
-        // Phase 1b: Pre-register contract fail import if any function has constraints
+        // Phase 0b: Pre-register contract fail import if any function has constraints
+        // Must be before collect_definitions so import_count is correct for function indices
         let has_constraints = file.items.iter().any(|item| {
             if let TopLevelItem::Interface(iface) = item {
                 let has_alias_constraints = iface.items.iter().any(|ii| {
@@ -1455,6 +1453,9 @@ impl<'a> ModuleCompiler<'a> {
         if has_constraints {
             self.ensure_contract_fail_import();
         }
+
+        // Phase 1: Collect definitions (function signatures, imports)
+        self.collect_definitions(file)?;
 
         // Phase 2: Ensure builtin functions exist
         self.ensure_alloc_func();

@@ -1,5 +1,5 @@
-use gimli::{self, DwarfSections, EndianSlice, LittleEndian, Reader, constants};
-use serde_json::{Value, json};
+use gimli::{self, constants, DwarfSections, EndianSlice, LittleEndian, Reader};
+use serde_json::{json, Value};
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -895,7 +895,7 @@ fn compile_debug_runtime_module(
         .map(|(alias, _)| alias.clone())
         .collect();
 
-    let diagnostics = kettu_checker::check(ast);
+    let diagnostics = kettu_checker::check_with_source(ast, source);
     let errors: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| matches!(diagnostic.severity, kettu_checker::Severity::Error))
@@ -1633,7 +1633,7 @@ fn build_debug_symbols(
         .map(|(alias, _)| alias.clone())
         .collect();
 
-    let diagnostics = kettu_checker::check(ast);
+    let diagnostics = kettu_checker::check_with_source(ast, source);
     let errors: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| matches!(diagnostic.severity, kettu_checker::Severity::Error))
@@ -3678,8 +3678,8 @@ fn read_dap_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DebugSession, DwarfBindingKind, ListedTest, infer_locals, parse_closures,
-        parse_debug_symbols,
+        infer_locals, parse_closures, parse_debug_symbols, DebugSession, DwarfBindingKind,
+        ListedTest,
     };
     use kettu_codegen::CompileOptions;
     use serde_json::json;

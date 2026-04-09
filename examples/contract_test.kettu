@@ -39,6 +39,7 @@ interface contract-tests {
     test-bounds-called-again: func() -> bool {
         let small = 10;
         call-test-bounds(small);
+        ///              ^ small does not satisfy the constraint "big (10) > small (10)" on test-bounds (via call-test-bounds)
         true
     }
 }
