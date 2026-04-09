@@ -1365,4 +1365,62 @@ mod tests {
             other => panic!("expected SimdForEach, got {:?}", other),
         }
     }
+
+    #[test]
+    fn test_type_alias_with_constraint() {
+        let src = r#"
+            package local:test;
+            interface i {
+                type length = s32 where it > 0;
+            }
+        "#;
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected interface"),
+        };
+        match &iface.items[0] {
+            crate::ast::InterfaceItem::TypeDef(td) => match &td.kind {
+                crate::ast::TypeDefKind::Alias {
+                    name,
+                    ty,
+                    constraint,
+                    ..
+                } => {
+                    assert_eq!(name.name, "length");
+                    assert!(constraint.is_some(), "expected a constraint");
+                }
+                _ => panic!("expected alias"),
+            },
+            _ => panic!("expected typedef"),
+        }
+    }
+
+    #[test]
+    fn test_type_alias_without_constraint() {
+        let src = r#"
+            package local:test;
+            interface i {
+                type length = s32;
+            }
+        "#;
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let ast = ast.expect("should parse");
+        let iface = match &ast.items[0] {
+            crate::ast::TopLevelItem::Interface(i) => i,
+            _ => panic!("expected interface"),
+        };
+        match &iface.items[0] {
+            crate::ast::InterfaceItem::TypeDef(td) => match &td.kind {
+                crate::ast::TypeDefKind::Alias { constraint, .. } => {
+                    assert!(constraint.is_none(), "expected no constraint");
+                }
+                _ => panic!("expected alias"),
+            },
+            _ => panic!("expected typedef"),
+        }
+    }
 }

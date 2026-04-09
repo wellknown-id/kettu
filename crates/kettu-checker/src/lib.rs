@@ -187,6 +187,7 @@ pub enum TypeKind {
     Resource,
     Alias {
         target: Box<Ty>,
+        constraint: Option<Expr>,
     },
 }
 
@@ -209,6 +210,8 @@ pub struct InterfaceInfo {
     pub function_param_types: HashMap<String, Vec<String>>,
     /// Constraints inherited transitively from callees
     inherited_constraints: HashMap<String, Vec<InheritedConstraint>>,
+    /// Return type constraints (from constrained type aliases on return types)
+    pub return_constraints: HashMap<String, ParamConstraint>,
 }
 
 /// A parameter constraint from a `where` clause
@@ -429,7 +432,6 @@ impl Checker {
     fn collect_interface(&mut self, iface: &Interface) {
         let iface_name = iface.name.name.clone();
 
-        // Check for duplicate interface
         if self.interfaces.contains_key(&iface_name) {
             self.diagnostics.push(Diagnostic::error(
                 format!("Duplicate interface definition: {}", iface_name),
@@ -438,6 +440,8 @@ impl Checker {
             ));
             return;
         }
+
+        self.current_interface = Some(iface_name.clone());
 
         let mut types = Vec::new();
         let mut functions = Vec::new();
@@ -471,7 +475,7 @@ impl Checker {
                     if !param_types.is_empty() {
                         function_param_types.insert(func_name.clone(), param_types);
                     }
-                    let constraints: Vec<ParamConstraint> = func
+                    let mut constraints: Vec<ParamConstraint> = func
                         .params
                         .iter()
                         .filter_map(|p| {
@@ -481,11 +485,41 @@ impl Checker {
                             })
                         })
                         .collect();
+
+                    for p in &func.params {
+                        if let Some(type_constraint) = self.resolve_type_alias_constraint(&p.ty) {
+                            let substituted =
+                                substitute_expr_ident(&type_constraint, "it", &p.name.name);
+                            constraints.push(ParamConstraint {
+                                param_name: p.name.name.clone(),
+                                constraint: substituted,
+                            });
+                        }
+                    }
+
                     if !constraints.is_empty() {
                         function_constraints.insert(func_name, constraints);
                     }
                 }
                 InterfaceItem::Use(_) => {} // Handled in validation
+            }
+        }
+
+        let mut return_constraints: HashMap<String, ParamConstraint> = HashMap::new();
+        for item in &iface.items {
+            if let InterfaceItem::Func(func) = item {
+                if let Some(result) = &func.result {
+                    if let Some(type_constraint) = self.resolve_type_alias_constraint(result) {
+                        let func_name = func.name.name.clone();
+                        return_constraints.insert(
+                            func_name,
+                            ParamConstraint {
+                                param_name: "result".to_string(),
+                                constraint: type_constraint,
+                            },
+                        );
+                    }
+                }
             }
         }
 
@@ -504,8 +538,11 @@ impl Checker {
                 function_constraints,
                 function_param_types,
                 inherited_constraints,
+                return_constraints,
             },
         );
+
+        self.current_interface = None;
     }
 
     fn collect_world(&mut self, world: &World) {
@@ -2576,6 +2613,26 @@ impl Checker {
         self.types.get(&key)
     }
 
+    fn resolve_type_alias_constraint(&self, ty: &Ty) -> Option<Expr> {
+        match ty {
+            Ty::Named(id) => {
+                let info = self.resolve_type_info(&id.name)?;
+                match &info.kind {
+                    TypeKind::Alias { constraint, .. } => constraint.clone(),
+                    _ => None,
+                }
+            }
+            Ty::Generic { name, .. } => {
+                let info = self.resolve_type_info(&name.name)?;
+                match &info.kind {
+                    TypeKind::Alias { constraint, .. } => constraint.clone(),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn validate_import_export(&mut self, ie: &ImportExport) {
         match &ie.kind {
             ImportExportKind::Path(path) => {
@@ -2683,8 +2740,9 @@ fn typedef_name(kind: &TypeDefKind) -> String {
 
 fn typedef_to_kind(kind: &TypeDefKind) -> TypeKind {
     match kind {
-        TypeDefKind::Alias { ty, .. } => TypeKind::Alias {
+        TypeDefKind::Alias { ty, constraint, .. } => TypeKind::Alias {
             target: Box::new(ty.clone()),
+            constraint: constraint.clone(),
         },
         TypeDefKind::Record { fields, .. } => TypeKind::Record {
             fields: fields
@@ -2708,7 +2766,29 @@ fn typedef_to_kind(kind: &TypeDefKind) -> TypeKind {
     }
 }
 
-/// Convert a package path into a human-readable string for diagnostics.
+fn substitute_expr_ident(expr: &Expr, from: &str, to: &str) -> Expr {
+    match expr {
+        Expr::Ident(id) if id.name == from => Expr::Ident(Id {
+            name: to.to_string(),
+            span: id.span.clone(),
+        }),
+        Expr::Binary { lhs, op, rhs, span } => Expr::Binary {
+            lhs: Box::new(substitute_expr_ident(lhs, from, to)),
+            op: *op,
+            rhs: Box::new(substitute_expr_ident(rhs, from, to)),
+            span: span.clone(),
+        },
+        Expr::Not(inner, span) => Expr::Not(
+            Box::new(substitute_expr_ident(inner, from, to)),
+            span.clone(),
+        ),
+        Expr::Neg(inner, span) => Expr::Neg(
+            Box::new(substitute_expr_ident(inner, from, to)),
+            span.clone(),
+        ),
+        other => other.clone(),
+    }
+}
 fn package_path_to_string(path: &PackagePath) -> String {
     let namespace = path
         .namespace
@@ -6175,6 +6255,107 @@ mod tests {
         assert!(
             !errors.is_empty(),
             "expected error when hush comment is on wrong line, got diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_type_alias_constraint_on_param() {
+        let source = r#"
+            package local:test;
+            interface test {
+                type length = s32 where it > 0;
+                use-length: func(l: length) -> result<bool, string> {
+                    result#ok(true)
+                }
+                @test
+                caller: func() -> bool {
+                    use-length(-5);
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check_with_source(&ast, source);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.code == DiagnosticCode::ConstraintViolation
+            })
+            .collect();
+        assert!(
+            !errors.is_empty(),
+            "expected constraint violation from type alias on param, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_type_alias_constraint_satisfied_on_param() {
+        let source = r#"
+            package local:test;
+            interface test {
+                type length = s32 where it > 0;
+                use-length: func(l: length) -> result<bool, string> {
+                    result#ok(true)
+                }
+                @test
+                caller: func() -> bool {
+                    use-length(10);
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check_with_source(&ast, source);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::ConstraintViolation)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "expected no errors for satisfied type alias constraint, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_type_alias_constraint_propagation() {
+        let source = r#"
+            package local:test;
+            interface test {
+                type length = s32 where it > 0;
+                use-length: func(l: length) -> result<bool, string> {
+                    result#ok(true)
+                }
+                intermediate: func(x: s32) -> result<bool, string> {
+                    use-length(x);
+                    result#ok(true)
+                }
+                @test
+                outer: func() -> bool {
+                    intermediate(-1);
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check_with_source(&ast, source);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.code == DiagnosticCode::ConstraintViolation
+            })
+            .collect();
+        assert!(
+            !errors.is_empty(),
+            "expected transitive type alias constraint violation, got: {:?}",
             diags
         );
     }

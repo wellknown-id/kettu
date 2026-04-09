@@ -434,7 +434,7 @@ pub struct FlagsDef {
     _rb: (),
 }
 
-/// `type name = ty;` or `type name<T> = ty;`
+/// `type name = ty;` or `type name = ty where expr;` or `type name<T> = ty;`
 #[derive(Debug, Clone, PartialEq, Rule)]
 pub struct TypeAliasDef {
     #[leaf("type")]
@@ -445,6 +445,7 @@ pub struct TypeAliasDef {
     #[leaf("=")]
     _eq: (),
     pub ty: Spanned<TyNode>,
+    pub where_clause: Option<WhereClause>,
     #[leaf(";")]
     _semi: (),
 }

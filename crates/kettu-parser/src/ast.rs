@@ -154,6 +154,7 @@ pub enum TypeDefKind {
         name: Id,
         type_params: Vec<Id>,
         ty: Ty,
+        constraint: Option<Expr>,
     },
     /// `record name { fields }` or `record name<T> { fields }`
     Record {

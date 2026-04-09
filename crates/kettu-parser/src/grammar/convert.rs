@@ -327,6 +327,7 @@ fn type_def(cst: &Spanned<grammar::TypeDef>) -> ast::TypeDef {
                 name: spanned_id(&a.name),
                 type_params: type_params_list(&a.type_params),
                 ty: sty_flat(&a.ty),
+                constraint: a.where_clause.as_ref().map(|wc| sexpr_flat(&wc.expr)),
             },
             span: s,
         },

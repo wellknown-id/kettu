@@ -396,6 +396,7 @@ impl<'a> WitEmitter<'a> {
                 name,
                 ty,
                 type_params,
+                ..
             } if !type_params.is_empty() => {
                 // Store the generic definition for later monomorphization
                 self.generic_defs.insert(
@@ -451,11 +452,20 @@ impl<'a> WitEmitter<'a> {
         }
 
         match &typedef.kind {
-            TypeDefKind::Alias { name, ty, .. } => {
+            TypeDefKind::Alias {
+                name,
+                ty,
+                constraint,
+                ..
+            } => {
                 self.write("type ");
                 self.write(&name.name);
                 self.write(" = ");
                 self.emit_type(ty);
+                if let Some(constraint) = constraint {
+                    self.write(" where ");
+                    self.write(&fmt_expr_simple(constraint));
+                }
                 self.write(";");
             }
             TypeDefKind::Record { name, fields, .. } => {
@@ -904,6 +914,40 @@ impl<'a> WitEmitter<'a> {
 
     fn newline(&mut self) {
         self.output.push('\n');
+    }
+}
+
+fn fmt_expr_simple(expr: &crate::ast::Expr) -> String {
+    use crate::ast::{BinOp, Expr};
+    match expr {
+        Expr::Binary { lhs, op, rhs, .. } => {
+            let op_str = match op {
+                BinOp::Eq => "==",
+                BinOp::Ne => "!=",
+                BinOp::Lt => "<",
+                BinOp::Le => "<=",
+                BinOp::Gt => ">",
+                BinOp::Ge => ">=",
+                BinOp::And => "&&",
+                BinOp::Or => "||",
+                BinOp::Add => "+",
+                BinOp::Sub => "-",
+                BinOp::Mul => "*",
+                BinOp::Div => "/",
+            };
+            format!(
+                "{} {} {}",
+                fmt_expr_simple(lhs),
+                op_str,
+                fmt_expr_simple(rhs)
+            )
+        }
+        Expr::Ident(id) => id.name.clone(),
+        Expr::Integer(n, _) => n.to_string(),
+        Expr::Bool(b, _) => b.to_string(),
+        Expr::Not(inner, _) => format!("!{}", fmt_expr_simple(inner)),
+        Expr::Neg(inner, _) => format!("-{}", fmt_expr_simple(inner)),
+        _ => "?".to_string(),
     }
 }
 
