@@ -580,7 +580,7 @@ fn list_tests_single_file(file: &PathBuf, filter: Option<&str>, exact: bool) -> 
 fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -> (usize, usize) {
     use kettu_parser::{Gate, InterfaceItem, TopLevelItem};
     use std::time::Instant;
-    use wasmtime::{Engine, Instance, Linker, Module, Store};
+    use wasmtime::{Engine, Linker, Module, Store};
 
     let content = match fs::read_to_string(file) {
         Ok(c) => c,
@@ -706,16 +706,29 @@ fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -
             .result
             .as_ref()
             .map(|ty| {
-                matches!(
-                    ty,
-                    kettu_parser::Ty::Primitive(kettu_parser::PrimitiveTy::Bool, _)
-                )
+                match ty {
+                    kettu_parser::Ty::Primitive(kettu_parser::PrimitiveTy::Bool, _) => true,
+                    kettu_parser::Ty::Result { ok: Some(inner), .. }
+                        if matches!(inner.as_ref(), kettu_parser::Ty::Primitive(kettu_parser::PrimitiveTy::Bool, _)) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                }
             })
             .unwrap_or(false);
 
         if !has_body {
             println!("  ✗ {} (no body) — {}:{}", name, file_display, line);
             failed += 1;
+            continue;
+        }
+
+        if !func.params.is_empty() {
+            println!(
+                "  ◌ {} (skipped: parameterized) — {}:{}",
+                name, file_display, line
+            );
             continue;
         }
 
@@ -735,7 +748,7 @@ fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -
         let mut linker = Linker::new(&engine);
         linker
             .func_wrap("kettu:contract", "fail", |_ptr: i32, _len: i32| -> () {
-                panic!("contract violation");
+                // No-op: the WASM unreachable instruction after the call traps anyway
             })
             .expect("failed to define kettu:contract/fail stub");
 
@@ -787,24 +800,36 @@ fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -
             }
         };
 
-        let test_func = match instance.get_typed_func::<(), i32>(&mut store, &export_name) {
-            Ok(f) => f,
-            Err(e) => {
+        let test_func = match instance.get_func(&mut store, &export_name) {
+            Some(f) => f,
+            None => {
                 let elapsed = start.elapsed();
                 println!(
-                    "  ✗ {} (signature mismatch: {}) ({:.1?}) — {}:{}",
-                    name, e, elapsed, file_display, line
+                    "  ✗ {} (function not found) ({:.1?}) — {}:{}",
+                    name, elapsed, file_display, line
                 );
                 failed += 1;
                 continue;
             }
         };
 
+        let ty = test_func.ty(&store);
+        let results_len = ty.results().len();
+
         // Execute the test
-        match test_func.call(&mut store, ()) {
-            Ok(result) => {
+        let mut results = vec![wasmtime::Val::I32(0); results_len];
+        match test_func.call(&mut store, &[], &mut results) {
+            Ok(_) => {
                 let elapsed = start.elapsed();
-                if result != 0 {
+                let passed_test = if results_len > 0 {
+                    match &results[0] {
+                        wasmtime::Val::I32(n) => *n != 0,
+                        _ => false,
+                    }
+                } else {
+                    true
+                };
+                if passed_test {
                     println!("  ✓ {} ({:.1?})", name, elapsed);
                     passed += 1;
                 } else {

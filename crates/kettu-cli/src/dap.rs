@@ -1011,9 +1011,7 @@ fn run_test_with_runtime_trace(
         .map_err(|err| format!("Failed to wire debug exit hook: {}", err))?;
 
     linker
-        .func_wrap("kettu:contract", "fail", |_ptr: i32, _len: i32| -> () {
-            panic!("contract violation");
-        })
+        .func_wrap("kettu:contract", "fail", |_ptr: i32, _len: i32| -> () {})
         .map_err(|err| format!("Failed to wire kettu:contract/fail: {}", err))?;
 
     let mut store = Store::new(engine, RuntimeTraceState::default());
@@ -1023,10 +1021,12 @@ fn run_test_with_runtime_trace(
     let export_name = find_test_export_name(&mut store, &instance, test_name)
         .ok_or_else(|| format!("Failed to find test export for '{}'", test_name))?;
     let test_func = instance
-        .get_typed_func::<(), i32>(&mut store, &export_name)
-        .map_err(|err| format!("Failed to load test export '{}': {}", export_name, err))?;
+        .get_func(&mut store, &export_name)
+        .ok_or_else(|| format!("Failed to load test export '{}'", export_name))?;
 
-    let _ = test_func.call(&mut store, ());
+    let ty = test_func.ty(&store);
+    let mut results = vec![wasmtime::Val::I32(0); ty.results().len()];
+    let _ = test_func.call(&mut store, &[], &mut results);
     Ok(store.data().events.clone())
 }
 
