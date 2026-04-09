@@ -1010,6 +1010,12 @@ fn run_test_with_runtime_trace(
         )
         .map_err(|err| format!("Failed to wire debug exit hook: {}", err))?;
 
+    linker
+        .func_wrap("kettu:contract", "fail", |_ptr: i32, _len: i32| -> () {
+            panic!("contract violation");
+        })
+        .map_err(|err| format!("Failed to wire kettu:contract/fail: {}", err))?;
+
     let mut store = Store::new(engine, RuntimeTraceState::default());
     let instance = linker
         .instantiate(&mut store, module)

@@ -580,7 +580,7 @@ fn list_tests_single_file(file: &PathBuf, filter: Option<&str>, exact: bool) -> 
 fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -> (usize, usize) {
     use kettu_parser::{Gate, InterfaceItem, TopLevelItem};
     use std::time::Instant;
-    use wasmtime::{Engine, Instance, Module, Store};
+    use wasmtime::{Engine, Instance, Linker, Module, Store};
 
     let content = match fs::read_to_string(file) {
         Ok(c) => c,
@@ -731,8 +731,16 @@ fn run_tests(file: &PathBuf, filter: Option<&str>, exact: bool, threads: bool) -
         // Create a fresh store for each test
         let mut store = Store::new(&engine, ());
 
+        // Provide stub for kettu:contract/fail (traps at runtime)
+        let mut linker = Linker::new(&engine);
+        linker
+            .func_wrap("kettu:contract", "fail", |_ptr: i32, _len: i32| -> () {
+                panic!("contract violation");
+            })
+            .expect("failed to define kettu:contract/fail stub");
+
         // Instantiate module
-        let instance = match Instance::new(&mut store, &module, &[]) {
+        let instance = match linker.instantiate(&mut store, &module) {
             Ok(i) => i,
             Err(e) => {
                 println!(
