@@ -747,6 +747,12 @@ struct ModuleCompiler<'a> {
     loop_continue_depth: Option<u32>,
     /// Index of the contract fail import (ptr: i32, len: i32) -> ()
     contract_fail_idx: Option<u32>,
+    /// Constrained type aliases: name -> (target_type, constraint)
+    type_aliases: HashMap<String, TypeAliasInfo>,
+}
+
+struct TypeAliasInfo {
+    constraint: Expr,
 }
 
 impl<'a> ModuleCompiler<'a> {
@@ -791,6 +797,7 @@ impl<'a> ModuleCompiler<'a> {
             loop_break_depth: None,
             loop_continue_depth: None,
             contract_fail_idx: None,
+            type_aliases: HashMap::new(),
         };
         if options.emit_debug_hooks {
             compiler.ensure_debug_hook_import();
@@ -1911,6 +1918,31 @@ impl<'a> ModuleCompiler<'a> {
                 format!("{}:{}", namespace, name)
             })
             .unwrap_or_else(|| "local:component".to_string());
+
+        // Collect constrained type aliases
+        for item in &file.items {
+            if let TopLevelItem::Interface(iface) = item {
+                for iface_item in &iface.items {
+                    if let InterfaceItem::TypeDef(TypeDef {
+                        kind:
+                            TypeDefKind::Alias {
+                                name,
+                                constraint: Some(constraint),
+                                ..
+                            },
+                        ..
+                    }) = iface_item
+                    {
+                        self.type_aliases.insert(
+                            name.name.clone(),
+                            TypeAliasInfo {
+                                constraint: constraint.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
 
         for item in &file.items {
             if let TopLevelItem::Interface(iface) = item {
@@ -3246,7 +3278,12 @@ impl<'a> ModuleCompiler<'a> {
         // Declare locals with correct types (v128 for SIMD, i32 for everything else)
         // +1 for temp record pointer
         // +3 for match expressions (scrutinee + binding + spare)
-        let extra_locals = 4;
+        let has_return_constraint = func
+            .result
+            .as_ref()
+            .map(|ty| self.resolve_type_constraint(ty).is_some())
+            .unwrap_or(false);
+        let extra_locals = 4 + if has_return_constraint { 1 } else { 0 };
         let total_declared = let_count + extra_locals + num_string_conversions;
         let local_types: Vec<_> = (0..total_declared)
             .map(|i| {
@@ -3490,6 +3527,20 @@ impl<'a> ModuleCompiler<'a> {
                 self.emit_async_callback(&func.name.name, func, _state_offset, num_locals)?;
             // The entry function compilation already handles await with blocking wait
             // The callback will be invoked for non-blocking resumption (future work)
+        }
+
+        // Return constraint check for tail expression returns
+        if let Some(ref result_ty) = func.result {
+            if self.resolve_type_constraint(result_ty).is_some() {
+                if let Some(ref body) = func.body {
+                    if !body.statements.is_empty() {
+                        let last = &body.statements[body.statements.len() - 1];
+                        if matches!(last, Statement::Expr(_)) {
+                            self.emit_return_constraint_check(&mut function, func, &locals);
+                        }
+                    }
+                }
+            }
         }
 
         // Ensure function ends properly
@@ -3829,6 +3880,124 @@ impl<'a> ModuleCompiler<'a> {
             Expr::Integer(n, _) => n.to_string(),
             Expr::Not(inner, _) => format!("!{}", self.fmt_constraint_expr(inner)),
             _ => "?".to_string(),
+        }
+    }
+
+    fn emit_return_constraint_check(
+        &mut self,
+        function: &mut Function,
+        func: &Func,
+        locals: &HashMap<String, u32>,
+    ) {
+        let constraint = match &func.result {
+            Some(ty) => self.resolve_type_constraint(ty),
+            None => return,
+        };
+        let Some(constraint) = constraint else { return };
+
+        let contract_fail_idx = self.ensure_contract_fail_import();
+
+        let msg = format!(
+            "return value does not satisfy the constraint \"{}\"",
+            self.fmt_constraint_expr(&constraint)
+        );
+        let (msg_ptr, msg_len) = self.register_string(&msg);
+
+        let result_local = locals.values().copied().max().unwrap_or(0) + 1;
+        function.instruction(&Instruction::LocalSet(result_local));
+
+        self.compile_return_constraint_expr(function, &constraint, result_local);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        function.instruction(&Instruction::I32Const(msg_ptr as i32));
+        function.instruction(&Instruction::I32Const(msg_len as i32));
+        function.instruction(&Instruction::Call(contract_fail_idx));
+        function.instruction(&Instruction::Unreachable);
+        function.instruction(&Instruction::End);
+
+        function.instruction(&Instruction::LocalGet(result_local));
+    }
+
+    fn resolve_type_constraint(&self, ty: &Ty) -> Option<Expr> {
+        match ty {
+            Ty::Named(id) => {
+                let type_info = self.type_aliases.get(&id.name)?;
+                Some(type_info.constraint.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn compile_return_constraint_expr(
+        &mut self,
+        function: &mut Function,
+        expr: &Expr,
+        result_local: u32,
+    ) {
+        match expr {
+            Expr::Ident(id) if id.name == "it" => {
+                function.instruction(&Instruction::LocalGet(result_local));
+            }
+            Expr::Binary { lhs, op, rhs, .. } => {
+                self.compile_return_constraint_expr(function, lhs, result_local);
+                self.compile_return_constraint_expr(function, rhs, result_local);
+                match op {
+                    BinOp::Gt => {
+                        function.instruction(&Instruction::I32GtS);
+                    }
+                    BinOp::Ge => {
+                        function.instruction(&Instruction::I32GeS);
+                    }
+                    BinOp::Lt => {
+                        function.instruction(&Instruction::I32LtS);
+                    }
+                    BinOp::Le => {
+                        function.instruction(&Instruction::I32LeS);
+                    }
+                    BinOp::Eq => {
+                        function.instruction(&Instruction::I32Eq);
+                    }
+                    BinOp::Ne => {
+                        function.instruction(&Instruction::I32Ne);
+                    }
+                    BinOp::And => {
+                        function.instruction(&Instruction::I32And);
+                    }
+                    BinOp::Or => {
+                        function.instruction(&Instruction::I32Or);
+                    }
+                    BinOp::Add => {
+                        function.instruction(&Instruction::I32Add);
+                    }
+                    BinOp::Sub => {
+                        function.instruction(&Instruction::I32Sub);
+                    }
+                    BinOp::Mul => {
+                        function.instruction(&Instruction::I32Mul);
+                    }
+                    BinOp::Div => {
+                        function.instruction(&Instruction::I32DivS);
+                    }
+                }
+            }
+            Expr::Integer(n, _) => {
+                function.instruction(&Instruction::I32Const(*n as i32));
+            }
+            Expr::Not(inner, _) => {
+                self.compile_return_constraint_expr(function, inner, result_local);
+                function.instruction(&Instruction::I32Eqz);
+            }
+            Expr::Neg(inner, _) => {
+                function.instruction(&Instruction::I32Const(0));
+                self.compile_return_constraint_expr(function, inner, result_local);
+                function.instruction(&Instruction::I32Sub);
+            }
+            Expr::Bool(b, _) => {
+                function.instruction(&Instruction::I32Const(if *b { 1 } else { 0 }));
+            }
+            _ => {
+                function.instruction(&Instruction::I32Const(1));
+            }
         }
     }
 
@@ -8917,6 +9086,33 @@ mod tests {
         let validation_result = wasmparser::validate(&wasm);
         if let Err(e) = validation_result {
             panic!("multi-constraint WASM should validate: {}", e);
+        }
+    }
+
+    #[test]
+    fn test_compile_type_alias_constraint_function() {
+        let source = r#"
+            package local:test;
+
+            interface test {
+                type positive = s32 where it > 0;
+                make-pos: func(x: s32) -> positive {
+                    return x;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("should compile");
+
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+
+        let validation_result = wasmparser::validate(&wasm);
+        if let Err(e) = validation_result {
+            panic!("type alias constraint WASM should validate: {}", e);
         }
     }
 }
