@@ -1411,6 +1411,24 @@ impl<'a> ModuleCompiler<'a> {
         // Phase 1: Collect definitions (function signatures, imports)
         self.collect_definitions(file)?;
 
+        // Phase 1b: Pre-register contract fail import if any function has constraints
+        let has_constraints = file.items.iter().any(|item| {
+            if let TopLevelItem::Interface(iface) = item {
+                iface.items.iter().any(|ii| {
+                    if let InterfaceItem::Func(func) = ii {
+                        func.params.iter().any(|p| p.constraint.is_some())
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
+        });
+        if has_constraints {
+            self.ensure_contract_fail_import();
+        }
+
         // Phase 2: Ensure builtin functions exist
         self.ensure_alloc_func();
         self.ensure_str_concat_func();
@@ -8617,5 +8635,288 @@ mod tests {
         let wasm = compile_module(&ast, &CompileOptions::default())
             .expect("zero-trip for loop should compile");
         assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+    }
+
+    #[test]
+    fn test_compile_constrained_function_emits_import() {
+        let source = r#"
+            package local:test;
+
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("constrained func should compile");
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+
+        let mut found_contract_import = false;
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            if let Ok(wasmparser::Payload::ImportSection(reads)) = payload {
+                for import_group in reads {
+                    let group = import_group.expect("import section");
+                    match group {
+                        wasmparser::Imports::Single(_, imp) => {
+                            if imp.module == "kettu:contract" && imp.name == "fail" {
+                                found_contract_import = true;
+                            }
+                        }
+                        wasmparser::Imports::Compact1 { module, .. } => {
+                            if module == "kettu:contract" {
+                                found_contract_import = true;
+                            }
+                        }
+                        wasmparser::Imports::Compact2 { module, .. } => {
+                            if module == "kettu:contract" {
+                                found_contract_import = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            found_contract_import,
+            "expected kettu:contract/fail import for constrained function"
+        );
+    }
+
+    #[test]
+    fn test_compile_no_contract_import_without_constraints() {
+        let source = r#"
+            package local:test;
+
+            interface test {
+                plain: func(x: s32, y: s32) -> bool {
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("should compile");
+
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            if let Ok(wasmparser::Payload::ImportSection(reads)) = payload {
+                for import_group in reads {
+                    let group = import_group.expect("import section");
+                    let module_name = match &group {
+                        wasmparser::Imports::Single(_, imp) => imp.module,
+                        wasmparser::Imports::Compact1 { module, .. } => *module,
+                        wasmparser::Imports::Compact2 { module, .. } => *module,
+                    };
+                    assert!(
+                        module_name != "kettu:contract",
+                        "plain function should not emit contract import"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_compile_contracts_custom_section() {
+        let source = r#"
+            package local:test;
+
+            interface test {
+                positive: func(x: s32 where x > 0) -> result<bool, string> {
+                    result#ok(true)
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("should compile");
+
+        let mut found_contracts_section = false;
+        let mut section_data = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            if let Ok(wasmparser::Payload::CustomSection(reader)) = payload {
+                if reader.name() == "kettu-contracts" {
+                    found_contracts_section = true;
+                    section_data = reader.data().to_vec();
+                }
+            }
+        }
+        assert!(
+            found_contracts_section,
+            "expected kettu-contracts custom section"
+        );
+
+        let json_str = String::from_utf8(section_data).expect("section should be valid UTF-8");
+        assert!(
+            json_str.contains("\"version\":1"),
+            "JSON should have version"
+        );
+        assert!(
+            json_str.contains("\"positive\""),
+            "JSON should reference function name"
+        );
+        assert!(
+            json_str.contains("\"x > 0\""),
+            "JSON should contain constraint expression"
+        );
+    }
+
+    #[test]
+    fn test_compile_no_contracts_section_without_constraints() {
+        let source = r#"
+            package local:test;
+
+            interface test {
+                plain: func(x: s32) -> s32 {
+                    x
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("should compile");
+
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            if let Ok(wasmparser::Payload::CustomSection(reader)) = payload {
+                assert!(
+                    reader.name() != "kettu-contracts",
+                    "plain functions should not emit contracts section"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_compile_contracts_section_multiple_constraints() {
+        let source = r#"
+            package local:test;
+
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                limited: func(count: s32 where count < 10) -> result<bool, string> {
+                    result#ok(true)
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("should compile");
+
+        let mut section_data = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            if let Ok(wasmparser::Payload::CustomSection(reader)) = payload {
+                if reader.name() == "kettu-contracts" {
+                    section_data = reader.data().to_vec();
+                }
+            }
+        }
+
+        let json_str = String::from_utf8(section_data).expect("section should be valid UTF-8");
+        assert!(
+            json_str.contains("\"bounded\""),
+            "JSON should contain bounded"
+        );
+        assert!(
+            json_str.contains("\"limited\""),
+            "JSON should contain limited"
+        );
+        assert!(
+            json_str.contains("\"big > small\""),
+            "JSON should contain big > small"
+        );
+        assert!(
+            json_str.contains("\"count < 10\""),
+            "JSON should contain count < 10"
+        );
+    }
+
+    #[test]
+    fn test_compile_result_tail_validates() {
+        let source = r#"
+            package local:test;
+
+            interface test {
+                check: func(x: s32) -> result<bool, string> {
+                    result#ok(true)
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("should compile");
+
+        let validation_result = wasmparser::validate(&wasm);
+        if let Err(e) = validation_result {
+            panic!("generated WASM should validate: {}", e);
+        }
+    }
+
+    #[test]
+    fn test_compile_constrained_function_valid_wasm() {
+        let source = r#"
+            package local:test;
+
+            interface test {
+                check: func(x: s32 where x > 0) -> result<bool, string> {
+                    return result#ok(true);
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("constrained func should compile");
+
+        let validation_result = wasmparser::validate(&wasm);
+        if let Err(e) = validation_result {
+            panic!("generated WASM should validate: {}", e);
+        }
+    }
+
+    #[test]
+    fn test_compile_multi_constraint_function_validates() {
+        let source = r#"
+            package local:test;
+
+            interface test {
+                check: func(x: s32 where x > 0, y: s32 where y < 100) -> result<bool, string> {
+                    return result#ok(true);
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("should compile");
+
+        let validation_result = wasmparser::validate(&wasm);
+        if let Err(e) = validation_result {
+            panic!("multi-constraint WASM should validate: {}", e);
+        }
     }
 }

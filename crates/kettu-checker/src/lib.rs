@@ -26,24 +26,35 @@ pub fn check(file: &WitFile) -> Vec<Diagnostic> {
 pub fn check_with_source(file: &WitFile, source: &str) -> Vec<Diagnostic> {
     let mut checker = Checker::new();
     checker.hush_comments = extract_hush_comments(source);
+    checker.source_line_offsets = compute_line_offsets(source);
     checker.check_file(file);
     checker.diagnostics
+}
+
+fn compute_line_offsets(source: &str) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut pos = 0;
+    for line in source.lines() {
+        offsets.push(pos);
+        pos += line.len() + 1;
+    }
+    offsets
 }
 
 /// Extract hush comments (constraint annotations) from source code
 fn extract_hush_comments(source: &str) -> Vec<HushComment> {
     let mut comments = Vec::new();
     for (line_num, line) in source.lines().enumerate() {
-        // Look for /// followed by whitespace and ^
         if let Some(caret_pos) = line.find("///") {
             let after_comment = &line[caret_pos + 3..];
             if let Some(ws_end) = after_comment.find(|c: char| !c.is_whitespace()) {
                 let after_ws = &after_comment[ws_end..];
                 if after_ws.starts_with('^') {
                     let text = &after_ws[1..].trim();
+                    let caret_col = caret_pos + 3 + ws_end;
                     comments.push(HushComment {
-                        line: line_num,     // 0-indexed
-                        col: caret_pos + 4, // Position after /// and any whitespace
+                        line: line_num,
+                        col: caret_col,
                         constraint: Expr::String(text.to_string(), Span::default()),
                         span: Span::default(),
                     });
@@ -196,6 +207,8 @@ pub struct InterfaceInfo {
     pub function_constraints: HashMap<String, Vec<ParamConstraint>>,
     /// Parameter types by function
     pub function_param_types: HashMap<String, Vec<String>>,
+    /// Constraints inherited transitively from callees
+    inherited_constraints: HashMap<String, Vec<InheritedConstraint>>,
 }
 
 /// A parameter constraint from a `where` clause
@@ -203,6 +216,28 @@ pub struct InterfaceInfo {
 pub struct ParamConstraint {
     pub param_name: String,
     pub constraint: Expr,
+}
+
+/// How a target function's parameter is mapped from the intermediate function's scope
+#[derive(Debug, Clone)]
+enum ParamSource {
+    /// References a parameter of the intermediate function
+    Param(String),
+    /// A constant value resolved during pre-computation
+    Constant(i64),
+}
+
+/// A constraint inherited transitively from a callee's callee
+#[derive(Debug, Clone)]
+struct InheritedConstraint {
+    /// The function that originally has the constraint
+    target_func: String,
+    /// The chain of intermediate function names
+    via: Vec<String>,
+    /// The constraint from the target function
+    constraint: ParamConstraint,
+    /// Maps target function param names to their source in the intermediate function
+    target_param_sources: HashMap<String, ParamSource>,
 }
 
 /// Information about a world
@@ -269,6 +304,8 @@ struct Checker {
     current_return_type: Option<CheckedType>,
     /// Whether the current expression is the value of a guard-let (skip constraint checks)
     in_guard_let: bool,
+    /// Byte offsets of the start of each line in the source (for span-to-line conversion)
+    source_line_offsets: Vec<usize>,
 }
 
 /// Checked type representation for expression type checking
@@ -323,6 +360,7 @@ impl Checker {
             in_test_function: false,
             current_return_type: None,
             in_guard_let: false,
+            source_line_offsets: Vec::new(),
         }
     }
 
@@ -450,6 +488,9 @@ impl Checker {
             }
         }
 
+        let inherited_constraints =
+            self.compute_inherited_constraints(iface, &function_constraints, &function_params);
+
         self.interfaces.insert(
             iface_name.clone(),
             InterfaceInfo {
@@ -461,6 +502,7 @@ impl Checker {
                 function_params,
                 function_constraints,
                 function_param_types,
+                inherited_constraints,
             },
         );
     }
@@ -2719,17 +2761,17 @@ impl Checker {
         }
         if let Some(iface_name) = &self.current_interface {
             if let Some(iface) = self.interfaces.get(iface_name) {
-                if let Some(constraints) = iface.function_constraints.get(&func.name) {
-                    // Build param name -> argument mapping
-                    let mut param_to_arg: HashMap<String, &Expr> = HashMap::new();
-                    if let Some(param_names) = iface.function_params.get(&func.name) {
-                        for (i, param_name) in param_names.iter().enumerate() {
-                            if i < args.len() {
-                                param_to_arg.insert(param_name.clone(), &args[i]);
-                            }
+                let mut param_to_arg: HashMap<String, &Expr> = HashMap::new();
+                if let Some(param_names) = iface.function_params.get(&func.name) {
+                    for (i, param_name) in param_names.iter().enumerate() {
+                        if i < args.len() {
+                            param_to_arg.insert(param_name.clone(), &args[i]);
                         }
                     }
+                }
 
+                // Direct constraints
+                if let Some(constraints) = iface.function_constraints.get(&func.name) {
                     for constraint in constraints {
                         let param_index =
                             iface.function_params.get(&func.name).and_then(|params| {
@@ -2755,7 +2797,6 @@ impl Checker {
                                             arg_value.unwrap_or(0),
                                             &param_to_arg,
                                         );
-                                        // Try to get caller arg name for better error message
                                         let arg_name = self.get_arg_name(arg_expr);
                                         if arg_name != constraint.param_name {
                                             format!(
@@ -2770,19 +2811,6 @@ impl Checker {
                                         }
                                     }
                                     ConstraintEvalResult::NeedsPropagation(vars) => {
-                                        // Build message with caller argument names
-                                        // Format: "small (somesmall)" - callee param (caller arg)
-                                        let var_names: Vec<String> = vars
-                                            .iter()
-                                            .map(|v| {
-                                                let caller_arg = param_to_arg
-                                                    .get(v)
-                                                    .map(|e| self.get_arg_name(e))
-                                                    .unwrap_or_else(|| v.clone());
-                                                format!("{} ({})", v, caller_arg)
-                                            })
-                                            .collect();
-                                        // Just the caller arg names for the "because" clause
                                         let var_names_plain: Vec<String> = vars
                                             .iter()
                                             .map(|v| {
@@ -2792,7 +2820,6 @@ impl Checker {
                                                     .unwrap_or_else(|| v.clone())
                                             })
                                             .collect();
-                                        // Check if all variables are in our param mapping
                                         if vars.iter().all(|v| param_to_arg.contains_key(v)) {
                                             let arg_name = param_to_arg
                                                 .get(&constraint.param_name)
@@ -2859,6 +2886,171 @@ impl Checker {
                         }
                     }
                 }
+
+                // Inherited (transitive) constraints
+                let inherited: Vec<InheritedConstraint> = iface
+                    .inherited_constraints
+                    .get(&func.name)
+                    .cloned()
+                    .unwrap_or_default();
+                for inh in &inherited {
+                    self.check_inherited_constraint(inh, &param_to_arg, span);
+                }
+            }
+        }
+    }
+
+    fn check_inherited_constraint(
+        &mut self,
+        inh: &InheritedConstraint,
+        param_to_arg: &HashMap<String, &Expr>,
+        span: &Span,
+    ) {
+        let mut target_values: HashMap<String, Option<i64>> = HashMap::new();
+        let mut target_param_to_caller_arg: HashMap<String, &Expr> = HashMap::new();
+        let mut all_resolved = true;
+        let mut unresolved_vars: Vec<String> = Vec::new();
+
+        for (target_param, source) in &inh.target_param_sources {
+            match source {
+                ParamSource::Constant(val) => {
+                    target_values.insert(target_param.clone(), Some(*val));
+                }
+                ParamSource::Param(intermediate_param) => {
+                    let lookup_key: &str = intermediate_param.as_str();
+                    if let Some(caller_arg) = param_to_arg.get(lookup_key) {
+                        let val = self.const_value(*caller_arg);
+                        target_values.insert(target_param.clone(), val);
+                        target_param_to_caller_arg.insert(target_param.clone(), *caller_arg);
+                    } else {
+                        all_resolved = false;
+                        unresolved_vars.push(intermediate_param.clone());
+                    }
+                }
+            }
+        }
+
+        let constraint = &inh.constraint;
+        let arg_value = target_values.get(&constraint.param_name).copied().flatten();
+
+        let eval_result = self.eval_constraint_with_value_map(
+            &constraint.constraint,
+            &constraint.param_name,
+            arg_value,
+            &target_values,
+        );
+
+        let via_suffix = format!(" (via {})", inh.via.join(" via "));
+        let is_test = self.is_in_test_function();
+
+        let error_msg = match &eval_result {
+            ConstraintEvalResult::Violated(_) => {
+                let msg = self.fmt_constraint_with_value_map(
+                    &constraint.constraint,
+                    &constraint.param_name,
+                    arg_value.unwrap_or(0),
+                    &target_values,
+                );
+                let arg_name =
+                    if let Some(e) = target_param_to_caller_arg.get(&constraint.param_name) {
+                        self.get_arg_name(*e)
+                    } else {
+                        let mut sorted_keys: Vec<_> = target_param_to_caller_arg.keys().collect();
+                        sorted_keys.sort();
+                        sorted_keys
+                            .into_iter()
+                            .filter_map(|k| {
+                                target_param_to_caller_arg
+                                    .get(k)
+                                    .map(|e| self.get_arg_name(*e))
+                            })
+                            .next()
+                            .unwrap_or_else(|| constraint.param_name.clone())
+                    };
+                format!(
+                    "{} does not satisfy the constraint \"{}\" on {}{}",
+                    arg_name, msg, inh.target_func, via_suffix
+                )
+            }
+            ConstraintEvalResult::NeedsPropagation(vars) => {
+                if all_resolved && vars.is_empty() {
+                    return;
+                }
+                let var_names_plain: Vec<String> = vars
+                    .iter()
+                    .map(|v| {
+                        target_param_to_caller_arg
+                            .get(v)
+                            .map(|e| self.get_arg_name(*e))
+                            .unwrap_or_else(|| v.clone())
+                    })
+                    .collect();
+                if !all_resolved {
+                    format!(
+                        "Cannot verify transitive constraint on '{}': unresolved variables {:?}",
+                        constraint.param_name, unresolved_vars
+                    )
+                } else if vars
+                    .iter()
+                    .all(|v| target_param_to_caller_arg.contains_key(v))
+                {
+                    let arg_name = target_param_to_caller_arg
+                        .get(&constraint.param_name)
+                        .map(|e| self.get_arg_name(*e))
+                        .unwrap_or_else(|| constraint.param_name.clone());
+                    let constraint_msg = self.fmt_constraint_with_value_map(
+                        &constraint.constraint,
+                        &constraint.param_name,
+                        arg_value.unwrap_or(0),
+                        &target_values,
+                    );
+                    format!(
+                        "{} may not satisfy the constraint \"{}\" because {} is an unconstrained parameter, {} must be called with a guard{}",
+                        arg_name,
+                        constraint_msg,
+                        var_names_plain.join(" and "),
+                        inh.target_func,
+                        via_suffix
+                    )
+                } else {
+                    return;
+                }
+            }
+            ConstraintEvalResult::Satisfied => return,
+        };
+
+        if is_test && !error_msg.is_empty() {
+            let is_hushed = self.check_hush_comment(span, &error_msg);
+            if is_hushed {
+                self.diagnostics.push(Diagnostic::info(
+                    error_msg,
+                    span.clone(),
+                    DiagnosticCode::ConstraintViolation,
+                ));
+            } else {
+                self.diagnostics.push(Diagnostic::error(
+                    error_msg,
+                    span.clone(),
+                    DiagnosticCode::ConstraintViolation,
+                ));
+            }
+        } else {
+            match eval_result {
+                ConstraintEvalResult::Violated(_) => {
+                    self.diagnostics.push(Diagnostic::error(
+                        error_msg,
+                        span.clone(),
+                        DiagnosticCode::ConstraintViolation,
+                    ));
+                }
+                ConstraintEvalResult::NeedsPropagation(_) => {
+                    self.diagnostics.push(Diagnostic::warning(
+                        error_msg,
+                        span.clone(),
+                        DiagnosticCode::ConstraintPropagation,
+                    ));
+                }
+                ConstraintEvalResult::Satisfied => {}
             }
         }
     }
@@ -2987,6 +3179,117 @@ impl Checker {
         }
     }
 
+    fn eval_constraint_with_value_map(
+        &self,
+        constraint: &Expr,
+        param_name: &str,
+        arg_value: Option<i64>,
+        value_map: &HashMap<String, Option<i64>>,
+    ) -> ConstraintEvalResult {
+        match constraint {
+            Expr::Binary { lhs, op, rhs, .. } => {
+                let lhs_vars = self.collect_free_vars(lhs);
+                let rhs_vars = self.collect_free_vars(rhs);
+                let all_vars: Vec<String> =
+                    lhs_vars.iter().chain(rhs_vars.iter()).cloned().collect();
+
+                let lhs_val = self.resolve_value_map(lhs, param_name, arg_value, value_map);
+                let rhs_val = self.resolve_value_map(rhs, param_name, arg_value, value_map);
+
+                match (lhs_val, rhs_val) {
+                    (Some(l), Some(r)) => {
+                        if self.eval_binary_bool(*op, l, r) {
+                            ConstraintEvalResult::Satisfied
+                        } else {
+                            ConstraintEvalResult::Violated(format!(
+                                "{} {} {} is false",
+                                l,
+                                self.fmt_op(*op),
+                                r
+                            ))
+                        }
+                    }
+                    _ if !all_vars.is_empty() => ConstraintEvalResult::NeedsPropagation(all_vars),
+                    _ => ConstraintEvalResult::NeedsPropagation(vec![]),
+                }
+            }
+            _ => ConstraintEvalResult::NeedsPropagation(vec![]),
+        }
+    }
+
+    fn resolve_value_map(
+        &self,
+        expr: &Expr,
+        param_name: &str,
+        arg_value: Option<i64>,
+        value_map: &HashMap<String, Option<i64>>,
+    ) -> Option<i64> {
+        match expr {
+            Expr::Integer(n, _) => Some(*n),
+            Expr::Ident(id) => {
+                if id.name == param_name {
+                    arg_value
+                } else if let Some(Some(val)) = value_map.get(&id.name) {
+                    Some(*val)
+                } else if let Some(None) = value_map.get(&id.name) {
+                    None
+                } else {
+                    self.constants.get(&id.name).copied()
+                }
+            }
+            Expr::Binary { lhs, op, rhs, .. } => {
+                let lhs_val = self.resolve_value_map(lhs, param_name, arg_value, value_map)?;
+                let rhs_val = self.resolve_value_map(rhs, param_name, arg_value, value_map)?;
+                self.eval_binary_constraint(*op, lhs_val, rhs_val)
+            }
+            _ => None,
+        }
+    }
+
+    fn fmt_constraint_with_value_map(
+        &self,
+        constraint: &Expr,
+        param_name: &str,
+        arg_val: i64,
+        value_map: &HashMap<String, Option<i64>>,
+    ) -> String {
+        match constraint {
+            Expr::Binary { lhs, op, rhs, .. } => {
+                let lhs_str = self.fmt_expr_with_value_map(lhs, param_name, arg_val, value_map);
+                let rhs_str = self.fmt_expr_with_value_map(rhs, param_name, arg_val, value_map);
+                format!("{} {} {}", lhs_str, self.fmt_op(*op), rhs_str)
+            }
+            _ => "constraint evaluation failed".to_string(),
+        }
+    }
+
+    fn fmt_expr_with_value_map(
+        &self,
+        expr: &Expr,
+        param_name: &str,
+        arg_val: i64,
+        value_map: &HashMap<String, Option<i64>>,
+    ) -> String {
+        match expr {
+            Expr::Integer(n, _) => n.to_string(),
+            Expr::Ident(id) => {
+                if id.name == param_name {
+                    format!("{} ({})", param_name, arg_val)
+                } else if let Some(Some(val)) = value_map.get(&id.name) {
+                    format!("{} ({})", id.name, val)
+                } else if let Some(None) = value_map.get(&id.name) {
+                    format!("{} (?)", id.name)
+                } else {
+                    self.constants
+                        .get(&id.name)
+                        .map(|v| format!("{} ({})", id.name, v))
+                        .unwrap_or_else(|| id.name.clone())
+                }
+            }
+            _ => "expr".to_string(),
+        }
+    }
+
     fn collect_free_vars(&self, expr: &Expr) -> Vec<String> {
         let mut vars = Vec::new();
         self.collect_free_vars_rec(expr, &mut vars);
@@ -3088,17 +3391,379 @@ impl Checker {
         self.in_test_function
     }
 
-    fn check_hush_comment(&self, _span: &Span, error_msg: &str) -> bool {
-        // Need to find line number from character offset - use source if available
-        // For now, just check all comments and match by exact text
+    fn check_hush_comment(&self, span: &Span, error_msg: &str) -> bool {
+        let span_line = self.byte_offset_to_line(span.start);
+        let span_col_start = self.byte_offset_to_col(span.start);
+        let span_col_end = self.byte_offset_to_col(span.end.saturating_sub(1));
+
         for comment in &self.hush_comments {
             if let Expr::String(expected_text, _) = &comment.constraint {
-                if expected_text == error_msg {
+                if expected_text != error_msg {
+                    continue;
+                }
+
+                // Hush comment must be on the line after the error's line
+                if comment.line != span_line + 1 {
+                    continue;
+                }
+
+                // The ^ column should point within the error span's column range
+                // Allow some tolerance for whitespace alignment
+                let caret = comment.col;
+                if caret >= span_col_start.saturating_sub(2) && caret <= span_col_end + 2 {
                     return true;
                 }
             }
         }
         false
+    }
+
+    fn byte_offset_to_line(&self, offset: usize) -> usize {
+        match self.source_line_offsets.binary_search(&offset) {
+            Ok(line) => line,
+            Err(insert_pos) => {
+                if insert_pos == 0 {
+                    0
+                } else {
+                    insert_pos - 1
+                }
+            }
+        }
+    }
+
+    fn byte_offset_to_col(&self, offset: usize) -> usize {
+        let line = self.byte_offset_to_line(offset);
+        if line < self.source_line_offsets.len() {
+            offset - self.source_line_offsets[line]
+        } else {
+            0
+        }
+    }
+
+    fn compute_inherited_constraints(
+        &self,
+        iface: &Interface,
+        function_constraints: &HashMap<String, Vec<ParamConstraint>>,
+        function_params: &HashMap<String, Vec<String>>,
+    ) -> HashMap<String, Vec<InheritedConstraint>> {
+        let mut result = HashMap::new();
+
+        for item in &iface.items {
+            if let InterfaceItem::Func(func) = item {
+                if let Some(body) = &func.body {
+                    let func_name = &func.name.name;
+                    let func_param_names: Vec<String> =
+                        func.params.iter().map(|p| p.name.name.clone()).collect();
+
+                    let local_constants = Self::collect_body_constants(&body.statements);
+
+                    let mut inherited = Vec::new();
+                    Self::find_inherited_in_stmts(
+                        &body.statements,
+                        &func_param_names,
+                        &local_constants,
+                        function_constraints,
+                        function_params,
+                        func_name,
+                        &mut inherited,
+                    );
+
+                    if !inherited.is_empty() {
+                        result.insert(func_name.clone(), inherited);
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    fn collect_body_constants(stmts: &[Statement]) -> HashMap<String, i64> {
+        let mut constants = HashMap::new();
+        for stmt in stmts {
+            if let Statement::Let { name, value } = stmt {
+                if let Some(val) = Self::const_value_static(value, &constants) {
+                    constants.insert(name.name.clone(), val);
+                }
+            }
+        }
+        constants
+    }
+
+    fn const_value_static(expr: &Expr, constants: &HashMap<String, i64>) -> Option<i64> {
+        match expr {
+            Expr::Integer(n, _) => Some(*n),
+            Expr::Ident(id) => constants.get(&id.name).copied(),
+            Expr::Neg(inner, _) => Self::const_value_static(inner, constants).map(|v| -v),
+            Expr::Binary { lhs, op, rhs, .. } => {
+                let l = Self::const_value_static(lhs, constants)?;
+                let r = Self::const_value_static(rhs, constants)?;
+                match op {
+                    BinOp::Add => Some(l + r),
+                    BinOp::Sub => Some(l - r),
+                    BinOp::Mul => Some(l * r),
+                    BinOp::Div if r != 0 => Some(l / r),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn find_inherited_in_stmts(
+        stmts: &[Statement],
+        func_param_names: &[String],
+        local_constants: &HashMap<String, i64>,
+        function_constraints: &HashMap<String, Vec<ParamConstraint>>,
+        function_params: &HashMap<String, Vec<String>>,
+        current_func: &str,
+        result: &mut Vec<InheritedConstraint>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Statement::Expr(expr) => {
+                    Self::find_inherited_in_expr(
+                        expr,
+                        func_param_names,
+                        local_constants,
+                        function_constraints,
+                        function_params,
+                        current_func,
+                        result,
+                    );
+                }
+                Statement::Let { value, .. } => {
+                    Self::find_inherited_in_expr(
+                        value,
+                        func_param_names,
+                        local_constants,
+                        function_constraints,
+                        function_params,
+                        current_func,
+                        result,
+                    );
+                }
+                Statement::Return(Some(expr)) => {
+                    Self::find_inherited_in_expr(
+                        expr,
+                        func_param_names,
+                        local_constants,
+                        function_constraints,
+                        function_params,
+                        current_func,
+                        result,
+                    );
+                }
+                Statement::Guard {
+                    condition,
+                    else_body,
+                } => {
+                    Self::find_inherited_in_expr(
+                        condition,
+                        func_param_names,
+                        local_constants,
+                        function_constraints,
+                        function_params,
+                        current_func,
+                        result,
+                    );
+                    Self::find_inherited_in_stmts(
+                        else_body,
+                        func_param_names,
+                        local_constants,
+                        function_constraints,
+                        function_params,
+                        current_func,
+                        result,
+                    );
+                }
+                Statement::GuardLet { else_body, .. } => {
+                    Self::find_inherited_in_stmts(
+                        else_body,
+                        func_param_names,
+                        local_constants,
+                        function_constraints,
+                        function_params,
+                        current_func,
+                        result,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn find_inherited_in_expr(
+        expr: &Expr,
+        func_param_names: &[String],
+        local_constants: &HashMap<String, i64>,
+        function_constraints: &HashMap<String, Vec<ParamConstraint>>,
+        function_params: &HashMap<String, Vec<String>>,
+        current_func: &str,
+        result: &mut Vec<InheritedConstraint>,
+    ) {
+        match expr {
+            Expr::Call {
+                func: callee, args, ..
+            } => {
+                if let Expr::Ident(id) = callee.as_ref() {
+                    let callee_name = &id.name;
+                    if callee_name != current_func {
+                        if let Some(constraints) = function_constraints.get(callee_name) {
+                            let callee_params = function_params
+                                .get(callee_name)
+                                .cloned()
+                                .unwrap_or_default();
+
+                            let mut target_param_sources = HashMap::new();
+                            for (i, param_name) in callee_params.iter().enumerate() {
+                                if i < args.len() {
+                                    let arg = &args[i];
+                                    let source =
+                                        Self::classify_arg(arg, func_param_names, local_constants);
+                                    target_param_sources.insert(param_name.clone(), source);
+                                }
+                            }
+
+                            for constraint in constraints {
+                                result.push(InheritedConstraint {
+                                    target_func: callee_name.clone(),
+                                    via: vec![current_func.to_string()],
+                                    constraint: constraint.clone(),
+                                    target_param_sources: target_param_sources.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                for arg in args {
+                    Self::find_inherited_in_expr(
+                        arg,
+                        func_param_names,
+                        local_constants,
+                        function_constraints,
+                        function_params,
+                        current_func,
+                        result,
+                    );
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::find_inherited_in_expr(
+                    lhs,
+                    func_param_names,
+                    local_constants,
+                    function_constraints,
+                    function_params,
+                    current_func,
+                    result,
+                );
+                Self::find_inherited_in_expr(
+                    rhs,
+                    func_param_names,
+                    local_constants,
+                    function_constraints,
+                    function_params,
+                    current_func,
+                    result,
+                );
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                Self::find_inherited_in_expr(
+                    cond,
+                    func_param_names,
+                    local_constants,
+                    function_constraints,
+                    function_params,
+                    current_func,
+                    result,
+                );
+                Self::find_inherited_in_stmts(
+                    then_branch,
+                    func_param_names,
+                    local_constants,
+                    function_constraints,
+                    function_params,
+                    current_func,
+                    result,
+                );
+                if let Some(else_stmts) = else_branch {
+                    Self::find_inherited_in_stmts(
+                        else_stmts,
+                        func_param_names,
+                        local_constants,
+                        function_constraints,
+                        function_params,
+                        current_func,
+                        result,
+                    );
+                }
+            }
+            Expr::Neg(inner, _) | Expr::Not(inner, _) => {
+                Self::find_inherited_in_expr(
+                    inner,
+                    func_param_names,
+                    local_constants,
+                    function_constraints,
+                    function_params,
+                    current_func,
+                    result,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn classify_arg(
+        arg: &Expr,
+        func_param_names: &[String],
+        local_constants: &HashMap<String, i64>,
+    ) -> ParamSource {
+        match arg {
+            Expr::Ident(id) => {
+                if func_param_names.contains(&id.name) {
+                    ParamSource::Param(id.name.clone())
+                } else if let Some(val) = local_constants.get(&id.name) {
+                    ParamSource::Constant(*val)
+                } else {
+                    ParamSource::Param(id.name.clone())
+                }
+            }
+            Expr::Integer(n, _) => ParamSource::Constant(*n),
+            Expr::Neg(inner, _) => {
+                match Self::classify_arg(inner, func_param_names, local_constants) {
+                    ParamSource::Constant(v) => ParamSource::Constant(-v),
+                    other => other,
+                }
+            }
+            Expr::Binary { lhs, op, rhs, .. } => {
+                let l = Self::classify_arg(lhs, func_param_names, local_constants);
+                let r = Self::classify_arg(rhs, func_param_names, local_constants);
+                match (l, r) {
+                    (ParamSource::Constant(lv), ParamSource::Constant(rv)) => {
+                        let val = match op {
+                            BinOp::Add => Some(lv + rv),
+                            BinOp::Sub => Some(lv - rv),
+                            BinOp::Mul => Some(lv * rv),
+                            BinOp::Div if rv != 0 => Some(lv / rv),
+                            _ => None,
+                        };
+                        match val {
+                            Some(v) => ParamSource::Constant(v),
+                            None => ParamSource::Param(format!("{:?}", arg)),
+                        }
+                    }
+                    _ => ParamSource::Param(format!("{:?}", arg)),
+                }
+            }
+            _ => ParamSource::Param(format!("{:?}", arg)),
+        }
     }
 }
 
@@ -5316,6 +5981,199 @@ mod tests {
         assert!(
             !infos.is_empty(),
             "expected info diagnostic for hushed error in @test-helper, got diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_transitive_constraint_propagation() {
+        let source = r#"
+            package local:test;
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func(x: s32) -> result<bool, string> {
+                    let big = 10;
+                    bounded(x, big);
+                    result#ok(true)
+                }
+                outer: func() -> bool {
+                    let v = 10;
+                    caller(v);
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.code == DiagnosticCode::ConstraintViolation
+            })
+            .collect();
+        assert!(
+            errors.iter().any(|d| d.message.contains("via caller")),
+            "expected transitive constraint violation with 'via caller', got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_transitive_constraint_satisfied() {
+        let source = r#"
+            package local:test;
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func(x: s32) -> result<bool, string> {
+                    let big = 20;
+                    bounded(x, big);
+                    result#ok(true)
+                }
+                outer: func() -> bool {
+                    let v = 10;
+                    caller(v);
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let constraint_errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::ConstraintViolation)
+            .collect();
+        assert!(
+            constraint_errors.is_empty(),
+            "expected no constraint errors for satisfied transitive constraint, got: {:?}",
+            constraint_errors
+        );
+    }
+
+    #[test]
+    fn test_transitive_constraint_with_hush() {
+        let source = r#"
+            package local:test;
+            interface test {
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func(x: s32) -> result<bool, string> {
+                    let big = 10;
+                    bounded(x, big);
+                    result#ok(true)
+                }
+                @test
+                outer: func() -> bool {
+                    let v = 10;
+                    caller(v);
+                    ///    ^ v does not satisfy the constraint "big (10) > small (10)" on bounded (via caller)
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check_with_source(&ast, source);
+        let infos: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Info)
+            .collect();
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.code == DiagnosticCode::ConstraintViolation
+            })
+            .collect();
+        assert!(
+            !infos.is_empty(),
+            "expected info diagnostic for hushed transitive constraint, got diags: {:?}",
+            diags
+        );
+        assert!(
+            errors.is_empty(),
+            "expected no error diagnostics for hushed transitive constraint, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_hush_comment_wrong_column_still_error() {
+        let source = r#"
+            package local:test;
+            interface test {
+                @test
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                @test
+                caller: func() -> bool {
+                    let big = 10;
+                    let small = 20;
+                    bounded(small, big);
+                    ///                          ^ big does not satisfy the constraint "big (10) > small (20)" on bounded
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check_with_source(&ast, source);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.code == DiagnosticCode::ConstraintViolation
+            })
+            .collect();
+        assert!(
+            !errors.is_empty(),
+            "expected error when ^ column is far from span, got diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_hush_comment_wrong_line_still_error() {
+        let source = r#"
+            package local:test;
+            interface test {
+                @test
+                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+                    result#ok(true)
+                }
+                @test
+                caller: func() -> bool {
+                    let big = 10;
+                    let small = 20;
+                    bounded(small, big);
+                    let x = 1;
+                    ///    ^ big does not satisfy the constraint "big (10) > small (20)" on bounded
+                    true
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check_with_source(&ast, source);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.code == DiagnosticCode::ConstraintViolation
+            })
+            .collect();
+        assert!(
+            !errors.is_empty(),
+            "expected error when hush comment is on wrong line, got diags: {:?}",
             diags
         );
     }
