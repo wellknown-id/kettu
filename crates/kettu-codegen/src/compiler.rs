@@ -1421,13 +1421,33 @@ impl<'a> ModuleCompiler<'a> {
         // Phase 1b: Pre-register contract fail import if any function has constraints
         let has_constraints = file.items.iter().any(|item| {
             if let TopLevelItem::Interface(iface) = item {
-                iface.items.iter().any(|ii| {
-                    if let InterfaceItem::Func(func) = ii {
-                        func.params.iter().any(|p| p.constraint.is_some())
+                let has_alias_constraints = iface.items.iter().any(|ii| {
+                    if let InterfaceItem::TypeDef(TypeDef {
+                        kind:
+                            TypeDefKind::Alias {
+                                constraint: Some(_),
+                                ..
+                            },
+                        ..
+                    }) = ii
+                    {
+                        true
                     } else {
                         false
                     }
-                })
+                });
+                let has_param_constraints = iface.items.iter().any(|ii| {
+                    if let InterfaceItem::Func(func) = ii {
+                        func.params.iter().any(|p| p.constraint.is_some())
+                            || func
+                                .result
+                                .as_ref()
+                                .map_or(false, |r| matches!(r, Ty::Named(_)))
+                    } else {
+                        false
+                    }
+                });
+                has_alias_constraints || has_param_constraints
             } else {
                 false
             }
@@ -3283,7 +3303,19 @@ impl<'a> ModuleCompiler<'a> {
             .as_ref()
             .map(|ty| self.resolve_type_constraint(ty).is_some())
             .unwrap_or(false);
-        let extra_locals = 4 + if has_return_constraint { 1 } else { 0 };
+        let is_result_return = func
+            .result
+            .as_ref()
+            .map_or(false, |ty| matches!(ty, Ty::Result { .. }));
+        let extra_locals = 4 + if has_return_constraint {
+            if is_result_return {
+                2
+            } else {
+                1
+            }
+        } else {
+            0
+        };
         let total_declared = let_count + extra_locals + num_string_conversions;
         let local_types: Vec<_> = (0..total_declared)
             .map(|i| {
@@ -3746,14 +3778,21 @@ impl<'a> ModuleCompiler<'a> {
         func: &Func,
         locals: &HashMap<String, u32>,
     ) {
-        let has_constraints = func.params.iter().any(|p| p.constraint.is_some());
-        if !has_constraints {
+        let mut any = false;
+        for param in &func.params {
+            if param.constraint.is_some() || self.resolve_type_constraint(&param.ty).is_some() {
+                any = true;
+                break;
+            }
+        }
+        if !any {
             return;
         }
 
         let contract_fail_idx = self.ensure_contract_fail_import();
 
         for param in &func.params {
+            // Explicit where clause on the parameter
             if let Some(constraint) = &param.constraint {
                 let msg = format!(
                     "{} does not satisfy the constraint \"{}\"",
@@ -3761,10 +3800,27 @@ impl<'a> ModuleCompiler<'a> {
                     self.fmt_constraint_expr(constraint)
                 );
                 let (msg_ptr, msg_len) = self.register_string(&msg);
-
                 self.compile_constraint_expr(function, constraint, locals);
+                function.instruction(&Instruction::I32Eqz);
+                function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                function.instruction(&Instruction::I32Const(msg_ptr as i32));
+                function.instruction(&Instruction::I32Const(msg_len as i32));
+                function.instruction(&Instruction::Call(contract_fail_idx));
+                function.instruction(&Instruction::Unreachable);
+                function.instruction(&Instruction::End);
+            }
 
-                // If constraint is false (== 0), trap
+            // Implicit constraint from the parameter's type alias
+            if let Some(alias_constraint) = self.resolve_type_constraint(&param.ty) {
+                let substituted =
+                    Self::substitute_expr_ident(&alias_constraint, "it", &param.name.name);
+                let msg = format!(
+                    "{} does not satisfy the constraint \"{}\"",
+                    param.name.name,
+                    self.fmt_constraint_expr(&substituted)
+                );
+                let (msg_ptr, msg_len) = self.register_string(&msg);
+                self.compile_constraint_expr(function, &substituted, locals);
                 function.instruction(&Instruction::I32Eqz);
                 function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 function.instruction(&Instruction::I32Const(msg_ptr as i32));
@@ -3883,17 +3939,45 @@ impl<'a> ModuleCompiler<'a> {
         }
     }
 
+    fn substitute_expr_ident(expr: &Expr, from: &str, to: &str) -> Expr {
+        match expr {
+            Expr::Ident(id) if id.name == from => Expr::Ident(Id {
+                name: to.to_string(),
+                span: id.span.clone(),
+            }),
+            Expr::Binary { lhs, op, rhs, span } => Expr::Binary {
+                lhs: Box::new(Self::substitute_expr_ident(lhs, from, to)),
+                op: *op,
+                rhs: Box::new(Self::substitute_expr_ident(rhs, from, to)),
+                span: span.clone(),
+            },
+            Expr::Not(inner, span) => Expr::Not(
+                Box::new(Self::substitute_expr_ident(inner, from, to)),
+                span.clone(),
+            ),
+            Expr::Neg(inner, span) => Expr::Neg(
+                Box::new(Self::substitute_expr_ident(inner, from, to)),
+                span.clone(),
+            ),
+            other => other.clone(),
+        }
+    }
+
     fn emit_return_constraint_check(
         &mut self,
         function: &mut Function,
         func: &Func,
         locals: &HashMap<String, u32>,
     ) {
-        let constraint = match &func.result {
-            Some(ty) => self.resolve_type_constraint(ty),
+        let result_ty = match &func.result {
+            Some(ty) => ty,
             None => return,
         };
+
+        let constraint = self.resolve_type_constraint(result_ty);
         let Some(constraint) = constraint else { return };
+
+        let is_result = matches!(result_ty, Ty::Result { .. });
 
         let contract_fail_idx = self.ensure_contract_fail_import();
 
@@ -3906,14 +3990,47 @@ impl<'a> ModuleCompiler<'a> {
         let result_local = locals.values().copied().max().unwrap_or(0) + 1;
         function.instruction(&Instruction::LocalSet(result_local));
 
-        self.compile_return_constraint_expr(function, &constraint, result_local);
-        function.instruction(&Instruction::I32Eqz);
-        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        function.instruction(&Instruction::I32Const(msg_ptr as i32));
-        function.instruction(&Instruction::I32Const(msg_len as i32));
-        function.instruction(&Instruction::Call(contract_fail_idx));
-        function.instruction(&Instruction::Unreachable);
-        function.instruction(&Instruction::End);
+        // For result types, load the ok payload from offset 4 (after discriminant)
+        // and only check when discriminant == 0 (ok variant)
+        if is_result {
+            function.instruction(&Instruction::LocalGet(result_local));
+            function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+            function.instruction(&Instruction::I32Eqz);
+            function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+            // Load the ok payload value
+            function.instruction(&Instruction::LocalGet(result_local));
+            function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                offset: 4,
+                align: 2,
+                memory_index: 0,
+            }));
+            let payload_local = result_local + 1;
+            function.instruction(&Instruction::LocalSet(payload_local));
+            self.compile_return_constraint_expr(function, &constraint, payload_local);
+            function.instruction(&Instruction::I32Eqz);
+            function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            function.instruction(&Instruction::I32Const(msg_ptr as i32));
+            function.instruction(&Instruction::I32Const(msg_len as i32));
+            function.instruction(&Instruction::Call(contract_fail_idx));
+            function.instruction(&Instruction::Unreachable);
+            function.instruction(&Instruction::End);
+
+            function.instruction(&Instruction::End);
+        } else {
+            self.compile_return_constraint_expr(function, &constraint, result_local);
+            function.instruction(&Instruction::I32Eqz);
+            function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            function.instruction(&Instruction::I32Const(msg_ptr as i32));
+            function.instruction(&Instruction::I32Const(msg_len as i32));
+            function.instruction(&Instruction::Call(contract_fail_idx));
+            function.instruction(&Instruction::Unreachable);
+            function.instruction(&Instruction::End);
+        }
 
         function.instruction(&Instruction::LocalGet(result_local));
     }
@@ -3923,6 +4040,13 @@ impl<'a> ModuleCompiler<'a> {
             Ty::Named(id) => {
                 let type_info = self.type_aliases.get(&id.name)?;
                 Some(type_info.constraint.clone())
+            }
+            Ty::Result { ok, .. } => {
+                if let Some(ok_ty) = ok {
+                    self.resolve_type_constraint(ok_ty)
+                } else {
+                    None
+                }
             }
             _ => None,
         }
@@ -9113,6 +9237,80 @@ mod tests {
         let validation_result = wasmparser::validate(&wasm);
         if let Err(e) = validation_result {
             panic!("type alias constraint WASM should validate: {}", e);
+        }
+    }
+
+    #[test]
+    fn test_compile_type_alias_param_runtime_assertion() {
+        let source = r#"
+            package local:test;
+
+            interface test {
+                type shoesize = u32 where it > 6;
+                set-shoesize: func(size: shoesize) {
+                    return;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("should compile");
+
+        // Must have the contract fail import
+        let mut found_import = false;
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            if let Ok(wasmparser::Payload::ImportSection(reads)) = payload {
+                for import_group in reads {
+                    let group = import_group.expect("import section");
+                    match &group {
+                        wasmparser::Imports::Single(_, imp) => {
+                            if imp.module == "kettu:contract" && imp.name == "fail" {
+                                found_import = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(
+            found_import,
+            "expected kettu:contract/fail import for type alias param"
+        );
+
+        let validation_result = wasmparser::validate(&wasm);
+        if let Err(e) = validation_result {
+            panic!("WASM should validate: {}", e);
+        }
+    }
+
+    #[test]
+    fn test_compile_result_constrained_return_type() {
+        let source = r#"
+            package local:test;
+
+            interface test {
+                type shoesize = u32 where it > 6;
+                make-size: func(x: u32) -> result<shoesize, string> {
+                    return result#ok(x);
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+
+        let options = CompileOptions::default();
+        let wasm = compile_module(&ast, &options).expect("should compile");
+
+        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
+
+        let validation_result = wasmparser::validate(&wasm);
+        if let Err(e) = validation_result {
+            panic!("result<constrained_type> WASM should validate: {}", e);
         }
     }
 }

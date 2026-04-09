@@ -778,8 +778,17 @@ impl Checker {
             self.validate_type(&param.ty);
         }
 
-        let has_constraints = func.params.iter().any(|p| p.constraint.is_some());
-        if has_constraints {
+        let has_param_constraints = func.params.iter().any(|p| p.constraint.is_some())
+            || func
+                .params
+                .iter()
+                .any(|p| self.resolve_type_alias_constraint(&p.ty).is_some());
+        let has_return_constraint = func
+            .result
+            .as_ref()
+            .map_or(false, |ty| self.resolve_type_alias_constraint(ty).is_some());
+
+        if has_param_constraints || has_return_constraint {
             let is_result = match &func.result {
                 Some(ty) => matches!(ty, Ty::Result { .. }),
                 None => false,
@@ -787,7 +796,7 @@ impl Checker {
             if !is_result {
                 self.diagnostics.push(Diagnostic::error(
                     format!(
-                        "Function '{}' with parameter constraints must return result",
+                        "Function '{}' with constraints must return result",
                         func.name.name
                     ),
                     func.name.span.clone(),
@@ -6357,6 +6366,62 @@ mod tests {
             !errors.is_empty(),
             "expected transitive type alias constraint violation, got: {:?}",
             diags
+        );
+    }
+
+    #[test]
+    fn test_constrained_return_type_must_return_result() {
+        let source = r#"
+            package local:test;
+            interface test {
+                type shoesize = u32 where it > 6;
+                make-size: func(x: u32) -> shoesize {
+                    return x;
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error
+                    && d.code == DiagnosticCode::ConstraintViolation
+                    && d.message.contains("must return result")
+            })
+            .collect();
+        assert!(
+            !errors.is_empty(),
+            "expected error: constrained return type must return result, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_constrained_param_type_must_return_result() {
+        let source = r#"
+            package local:test;
+            interface test {
+                type shoesize = u32 where it > 6;
+                set-size: func(size: shoesize) -> result<bool, string> {
+                    result#ok(true)
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let constraint_errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::ConstraintViolation)
+            .collect();
+        assert!(
+            constraint_errors.is_empty(),
+            "constrained param with result return should be ok, got: {:?}",
+            constraint_errors
         );
     }
 }
