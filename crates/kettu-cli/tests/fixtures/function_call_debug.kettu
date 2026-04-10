@@ -1,13 +1,14 @@
 package local:call-stack-debug;
 interface tests {
-    helper: func(x: s32) -> s32 {
-        let doubled = x + x;
-        doubled
+    type positive = s32 where it > 0;
+    make-pos: func(n: positive) -> result<bool, string> {
+        result#ok(true)
     }
     @test
-    test-call-stack: func() -> bool {
-        let a = 5;
-        let result = helper(a);
-        result > 0
+    test-result-display: func() -> bool {
+        guard let result = make-pos(5) else {
+            return false;
+        };
+        result
     }
 }

@@ -1374,7 +1374,7 @@ fn dap_breakpoint_in_called_function_shows_stack_frame_and_locals() {
         Duration::from_secs(2),
     );
 
-    // Set breakpoint on line 4 (inside helper: let doubled = x + x)
+    // Set breakpoint on line 5 (inside make-pos: result#ok(true))
     write_dap_message(
         &mut stdin,
         &json!({
@@ -1383,7 +1383,7 @@ fn dap_breakpoint_in_called_function_shows_stack_frame_and_locals() {
             "command": "setBreakpoints",
             "arguments": {
                 "source": { "path": program.to_string_lossy() },
-                "breakpoints": [{ "line": 4 }]
+                "breakpoints": [{ "line": 5 }]
             }
         }),
     );
@@ -1431,20 +1431,20 @@ fn dap_breakpoint_in_called_function_shows_stack_frame_and_locals() {
         .expect("stack frames");
     assert!(
         frames.len() >= 2,
-        "expected at least 2 stack frames (helper + test), got {:?}",
+        "expected at least 2 stack frames (function + test), got {:?}",
         frames
     );
     assert!(
-        frames[0]["name"].as_str().unwrap().ends_with("helper"),
-        "expected frame name ending with 'helper', got {:?}",
+        frames[0]["name"].as_str().unwrap().ends_with("make-pos"),
+        "expected frame name ending with 'make-pos', got {:?}",
         frames[0]["name"]
     );
-    assert_eq!(frames[0]["line"], json!(4));
-    assert_eq!(frames[1]["name"], json!("@test test-call-stack"));
+    assert_eq!(frames[0]["line"], json!(5));
+    assert_eq!(frames[1]["name"], json!("@test test-result-display"));
 
-    // Check locals in the helper frame (frame id from stack[0])
-    let helper_frame_id = frames[0]["id"].as_i64().unwrap();
-    let locals_ref = helper_frame_id * 10 + 1;
+    // Check locals in the make-pos frame (frame id from stack[0])
+    let func_frame_id = frames[0]["id"].as_i64().unwrap();
+    let locals_ref = func_frame_id * 10 + 1;
     write_dap_message(
         &mut stdin,
         &json!({
@@ -1468,8 +1468,8 @@ fn dap_breakpoint_in_called_function_shows_stack_frame_and_locals() {
         .expect("variables");
     let var_names: Vec<&str> = vars.iter().filter_map(|v| v["name"].as_str()).collect();
     assert!(
-        var_names.contains(&"x"),
-        "expected 'x' in helper locals, got {:?}",
+        var_names.contains(&"n"),
+        "expected 'n' in make-pos locals, got {:?}",
         var_names
     );
 

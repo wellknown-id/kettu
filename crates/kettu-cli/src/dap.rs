@@ -30,6 +30,7 @@ struct TraceEvent {
     env_before: HashMap<String, SimpleValue>,
     runtime_subprogram_start_line: Option<i64>,
     runtime_locals: HashMap<u32, i64>,
+    runtime_pointer_derefs: HashMap<u32, (i32, i32)>,
     runtime_closure_keys: Vec<i64>,
 }
 
@@ -51,6 +52,7 @@ enum SimpleValue {
     Int(i64),
     Float(f64),
     String(String),
+    Result { discriminant: i32, payload: i32 },
     Unknown(String),
 }
 
@@ -61,6 +63,20 @@ impl SimpleValue {
             Self::Int(value) => value.to_string(),
             Self::Float(value) => value.to_string(),
             Self::String(value) => format!("\"{}\"", value),
+            Self::Result {
+                discriminant,
+                payload,
+            } => {
+                let ok_disc = variant_discriminant("ok");
+                let err_disc = variant_discriminant("err");
+                if *discriminant == ok_disc {
+                    format!("ok({})", payload)
+                } else if *discriminant == err_disc {
+                    format!("err({})", payload)
+                } else {
+                    format!("result#{}({})", discriminant, payload)
+                }
+            }
             Self::Unknown(value) => value.clone(),
         }
     }
@@ -71,9 +87,16 @@ impl SimpleValue {
             Self::Int(_) => "i64",
             Self::Float(_) => "f64",
             Self::String(_) => "string",
+            Self::Result { .. } => "result",
             Self::Unknown(_) => "unknown",
         }
     }
+}
+
+fn variant_discriminant(case_name: &str) -> i32 {
+    case_name
+        .bytes()
+        .fold(0u32, |acc, b| acc.wrapping_add(b as u32)) as i32
 }
 
 impl Variable {
@@ -140,6 +163,7 @@ struct DwarfLineRow {
 struct RuntimeTraceState {
     events: Vec<RuntimeTraceEvent>,
     pending_locals: HashMap<u32, i64>,
+    pending_derefs: HashMap<u32, (i32, i32)>,
     active_closure_keys: Vec<i64>,
 }
 
@@ -148,6 +172,7 @@ struct RuntimeTraceEvent {
     line: i64,
     subprogram_start_line: Option<i64>,
     locals: HashMap<u32, i64>,
+    pointer_derefs: HashMap<u32, (i32, i32)>,
     active_closure_keys: Vec<i64>,
 }
 
@@ -963,6 +988,7 @@ fn run_test_with_runtime_trace(
                         subprogram_start_line: (subprogram_start_line > 0)
                             .then_some(subprogram_start_line as i64),
                         locals: std::mem::take(&mut state.pending_locals),
+                        pointer_derefs: std::mem::take(&mut state.pending_derefs),
                         active_closure_keys: state.active_closure_keys.clone(),
                     });
                 }
@@ -974,11 +1000,39 @@ fn run_test_with_runtime_trace(
             "kettu:debug",
             "local",
             |mut caller: wasmtime::Caller<'_, RuntimeTraceState>, local_index: i32, value: i32| {
-                if local_index >= 0 {
+                if local_index < 0 {
+                    return;
+                }
+                let deref = if value > 0 {
                     caller
-                        .data_mut()
-                        .pending_locals
-                        .insert(local_index as u32, value as i64);
+                        .get_export("memory")
+                        .and_then(|e| e.into_memory())
+                        .and_then(|memory| {
+                            let ptr = value as usize;
+                            if ptr + 8 <= memory.data_size(&caller) {
+                                let data = memory.data(&caller);
+                                let disc = i32::from_le_bytes(
+                                    data[ptr..ptr + 4].try_into().unwrap_or([0; 4]),
+                                );
+                                let payload = i32::from_le_bytes(
+                                    data[ptr + 4..ptr + 8].try_into().unwrap_or([0; 4]),
+                                );
+                                Some((disc, payload))
+                            } else {
+                                None
+                            }
+                        })
+                } else {
+                    None
+                };
+                let state = caller.data_mut();
+                state
+                    .pending_locals
+                    .insert(local_index as u32, value as i64);
+                if let Some((disc, payload)) = deref {
+                    state
+                        .pending_derefs
+                        .insert(local_index as u32, (disc, payload));
                 }
             },
         )
@@ -1073,6 +1127,7 @@ fn merge_runtime_trace(
                 env_before,
                 runtime_subprogram_start_line: event.subprogram_start_line,
                 runtime_locals: event.locals,
+                runtime_pointer_derefs: event.pointer_derefs,
                 runtime_closure_keys: event.active_closure_keys,
             }
         })
@@ -2028,10 +2083,28 @@ fn runtime_binding_values_for_target(
             .filter_map(|binding| {
                 let local_index = binding.local_index?;
                 let raw = entry.runtime_locals.get(&local_index)?;
-                Some((
-                    binding.name.clone(),
-                    runtime_value_to_simple(*raw, fallback_values.get(&binding.name)),
-                ))
+                let simple =
+                    if let Some((disc, payload)) = entry.runtime_pointer_derefs.get(&local_index) {
+                        let ok_disc = variant_discriminant("ok");
+                        let err_disc = variant_discriminant("err");
+                        let some_disc = variant_discriminant("some");
+                        let none_disc = variant_discriminant("none");
+                        if *disc == ok_disc
+                            || *disc == err_disc
+                            || *disc == some_disc
+                            || *disc == none_disc
+                        {
+                            SimpleValue::Result {
+                                discriminant: *disc,
+                                payload: *payload,
+                            }
+                        } else {
+                            runtime_value_to_simple(*raw, fallback_values.get(&binding.name))
+                        }
+                    } else {
+                        runtime_value_to_simple(*raw, fallback_values.get(&binding.name))
+                    };
+                Some((binding.name.clone(), simple))
             })
             .collect(),
     )
@@ -2513,6 +2586,7 @@ fn record_trace_event(trace: &mut Vec<TraceEvent>, line: i64, env: &HashMap<Stri
         env_before: env.clone(),
         runtime_subprogram_start_line: None,
         runtime_locals: HashMap::new(),
+        runtime_pointer_derefs: HashMap::new(),
         runtime_closure_keys: Vec::new(),
     });
 }
