@@ -30,7 +30,7 @@ struct TraceEvent {
     env_before: HashMap<String, SimpleValue>,
     runtime_subprogram_start_line: Option<i64>,
     runtime_locals: HashMap<u32, i64>,
-    runtime_pointer_derefs: HashMap<u32, (i32, i32)>,
+    runtime_pointer_derefs: HashMap<u32, PointerDeref>,
     runtime_closure_keys: Vec<i64>,
 }
 
@@ -52,7 +52,11 @@ enum SimpleValue {
     Int(i64),
     Float(f64),
     String(String),
-    Result { discriminant: i32, payload: i32 },
+    Result {
+        discriminant: i32,
+        payload: i32,
+        err_message: Option<String>,
+    },
     Unknown(String),
 }
 
@@ -66,13 +70,17 @@ impl SimpleValue {
             Self::Result {
                 discriminant,
                 payload,
+                err_message,
             } => {
                 let ok_disc = variant_discriminant("ok");
                 let err_disc = variant_discriminant("err");
                 if *discriminant == ok_disc {
                     format!("ok({})", payload)
                 } else if *discriminant == err_disc {
-                    format!("err({})", payload)
+                    match err_message {
+                        Some(msg) => format!("err(\"{}\")", msg),
+                        None => format!("err({})", payload),
+                    }
                 } else {
                     format!("result#{}({})", discriminant, payload)
                 }
@@ -159,11 +167,18 @@ struct DwarfLineRow {
     line: i64,
 }
 
+#[derive(Clone, Debug, Default)]
+struct PointerDeref {
+    discriminant: i32,
+    payload: i32,
+    err_string: Option<String>,
+}
+
 #[derive(Default)]
 struct RuntimeTraceState {
     events: Vec<RuntimeTraceEvent>,
     pending_locals: HashMap<u32, i64>,
-    pending_derefs: HashMap<u32, (i32, i32)>,
+    pending_derefs: HashMap<u32, PointerDeref>,
     active_closure_keys: Vec<i64>,
 }
 
@@ -172,7 +187,7 @@ struct RuntimeTraceEvent {
     line: i64,
     subprogram_start_line: Option<i64>,
     locals: HashMap<u32, i64>,
-    pointer_derefs: HashMap<u32, (i32, i32)>,
+    pointer_derefs: HashMap<u32, PointerDeref>,
     active_closure_keys: Vec<i64>,
 }
 
@@ -1009,18 +1024,45 @@ fn run_test_with_runtime_trace(
                         .and_then(|e| e.into_memory())
                         .and_then(|memory| {
                             let ptr = value as usize;
-                            if ptr + 8 <= memory.data_size(&caller) {
-                                let data = memory.data(&caller);
-                                let disc = i32::from_le_bytes(
-                                    data[ptr..ptr + 4].try_into().unwrap_or([0; 4]),
-                                );
-                                let payload = i32::from_le_bytes(
-                                    data[ptr + 4..ptr + 8].try_into().unwrap_or([0; 4]),
-                                );
-                                Some((disc, payload))
+                            if ptr + 8 > memory.data_size(&caller) {
+                                return None;
+                            }
+                            let data = memory.data(&caller);
+                            let disc =
+                                i32::from_le_bytes(data[ptr..ptr + 4].try_into().unwrap_or([0; 4]));
+                            let payload = i32::from_le_bytes(
+                                data[ptr + 4..ptr + 8].try_into().unwrap_or([0; 4]),
+                            );
+
+                            let err_disc = variant_discriminant("err");
+                            let err_string = if disc == err_disc && payload > 0 {
+                                let str_ptr = payload as usize;
+                                let len_ptr = str_ptr.saturating_sub(4);
+                                if len_ptr + 4 <= data.len() {
+                                    let str_len = u32::from_le_bytes(
+                                        data[len_ptr..len_ptr + 4].try_into().unwrap_or([0; 4]),
+                                    ) as usize;
+                                    if str_ptr + str_len <= data.len() {
+                                        Some(
+                                            std::str::from_utf8(&data[str_ptr..str_ptr + str_len])
+                                                .unwrap_or("<invalid utf8>")
+                                                .to_string(),
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
                             } else {
                                 None
-                            }
+                            };
+
+                            Some(PointerDeref {
+                                discriminant: disc,
+                                payload,
+                                err_string,
+                            })
                         })
                 } else {
                     None
@@ -1029,10 +1071,8 @@ fn run_test_with_runtime_trace(
                 state
                     .pending_locals
                     .insert(local_index as u32, value as i64);
-                if let Some((disc, payload)) = deref {
-                    state
-                        .pending_derefs
-                        .insert(local_index as u32, (disc, payload));
+                if let Some(d) = deref {
+                    state.pending_derefs.insert(local_index as u32, d);
                 }
             },
         )
@@ -2083,27 +2123,27 @@ fn runtime_binding_values_for_target(
             .filter_map(|binding| {
                 let local_index = binding.local_index?;
                 let raw = entry.runtime_locals.get(&local_index)?;
-                let simple =
-                    if let Some((disc, payload)) = entry.runtime_pointer_derefs.get(&local_index) {
-                        let ok_disc = variant_discriminant("ok");
-                        let err_disc = variant_discriminant("err");
-                        let some_disc = variant_discriminant("some");
-                        let none_disc = variant_discriminant("none");
-                        if *disc == ok_disc
-                            || *disc == err_disc
-                            || *disc == some_disc
-                            || *disc == none_disc
-                        {
-                            SimpleValue::Result {
-                                discriminant: *disc,
-                                payload: *payload,
-                            }
-                        } else {
-                            runtime_value_to_simple(*raw, fallback_values.get(&binding.name))
+                let simple = if let Some(deref) = entry.runtime_pointer_derefs.get(&local_index) {
+                    let ok_disc = variant_discriminant("ok");
+                    let err_disc = variant_discriminant("err");
+                    let some_disc = variant_discriminant("some");
+                    let none_disc = variant_discriminant("none");
+                    if deref.discriminant == ok_disc
+                        || deref.discriminant == err_disc
+                        || deref.discriminant == some_disc
+                        || deref.discriminant == none_disc
+                    {
+                        SimpleValue::Result {
+                            discriminant: deref.discriminant,
+                            payload: deref.payload,
+                            err_message: deref.err_string.clone(),
                         }
                     } else {
                         runtime_value_to_simple(*raw, fallback_values.get(&binding.name))
-                    };
+                    }
+                } else {
+                    runtime_value_to_simple(*raw, fallback_values.get(&binding.name))
+                };
                 Some((binding.name.clone(), simple))
             })
             .collect(),
