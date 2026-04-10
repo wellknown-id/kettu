@@ -1,0 +1,13 @@
+package local:call-stack-debug;
+interface tests {
+    helper: func(x: s32) -> s32 {
+        let doubled = x + x;
+        doubled
+    }
+    @test
+    test-call-stack: func() -> bool {
+        let a = 5;
+        let result = helper(a);
+        result > 0
+    }
+}

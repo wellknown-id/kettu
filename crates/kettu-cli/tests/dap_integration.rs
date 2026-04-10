@@ -1,4 +1,4 @@
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -467,11 +467,9 @@ fn dap_exposes_captures_and_evaluate_for_callable_closure() {
         .pointer("/body/variables")
         .and_then(Value::as_array)
         .expect("locals array");
-    assert!(
-        locals
-            .iter()
-            .any(|v| v["name"] == json!("n") && v["value"] == json!("5"))
-    );
+    assert!(locals
+        .iter()
+        .any(|v| v["name"] == json!("n") && v["value"] == json!("5")));
 
     write_dap_message(
         &mut stdin,
@@ -489,11 +487,9 @@ fn dap_exposes_captures_and_evaluate_for_callable_closure() {
         .pointer("/body/variables")
         .and_then(Value::as_array)
         .expect("captures array");
-    assert!(
-        captures
-            .iter()
-            .any(|v| v["name"] == json!("x") && v["value"] == json!("10"))
-    );
+    assert!(captures
+        .iter()
+        .any(|v| v["name"] == json!("x") && v["value"] == json!("10")));
 
     write_dap_message(
         &mut stdin,
@@ -928,11 +924,9 @@ fn dap_uses_runtime_local_values_and_hides_future_locals() {
         .pointer("/body/variables")
         .and_then(Value::as_array)
         .expect("first locals array");
-    assert!(
-        first_locals
-            .iter()
-            .any(|v| v["name"] == json!("total") && v["value"] == json!("0"))
-    );
+    assert!(first_locals
+        .iter()
+        .any(|v| v["name"] == json!("total") && v["value"] == json!("0")));
     assert!(
         first_locals.iter().all(|v| v["name"] != json!("i")),
         "line 37 should not expose i before its declaration"
@@ -1023,11 +1017,9 @@ fn dap_uses_runtime_local_values_and_hides_future_locals() {
             .any(|v| v["name"] == json!("total") && v["value"] == json!("1")),
         "expected runtime-updated total on the second loop hit"
     );
-    assert!(
-        second_locals
-            .iter()
-            .any(|v| v["name"] == json!("i") && v["value"] == json!("0"))
-    );
+    assert!(second_locals
+        .iter()
+        .any(|v| v["name"] == json!("i") && v["value"] == json!("0")));
     assert!(
         second_locals
             .iter()
@@ -1288,6 +1280,198 @@ fn dap_tracks_nested_closure_breakpoints_and_frames() {
         json!('@'.to_string() + "test nested-closure-flow")
     );
     assert_eq!(return_frames[0]["line"], json!(10));
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 99, "command": "disconnect", "arguments": {}}),
+    );
+    let _disc_resp = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("disconnect"))
+        },
+        Duration::from_secs(2),
+    );
+
+    let status = child.wait().expect("wait for dap process");
+    assert!(status.success());
+}
+
+fn function_call_program_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/function_call_debug.kettu")
+}
+
+#[test]
+fn dap_breakpoint_in_called_function_shows_stack_frame_and_locals() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kettu"))
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn kettu dap");
+
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let stdout = child.stdout.take().expect("child stdout");
+
+    let (tx, rx) = mpsc::channel::<Value>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Some(msg) = read_dap_message(&mut reader) {
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
+    let program = function_call_program_path();
+    let cwd = program
+        .parent()
+        .expect("program parent")
+        .to_string_lossy()
+        .to_string();
+
+    write_dap_message(
+        &mut stdin,
+        &json!({
+            "type": "request",
+            "seq": 1,
+            "command": "initialize",
+            "arguments": {}
+        }),
+    );
+    let _init_resp = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("initialize"))
+        },
+        Duration::from_secs(2),
+    );
+
+    write_dap_message(
+        &mut stdin,
+        &json!({
+            "type": "request",
+            "seq": 2,
+            "command": "launch",
+            "arguments": {
+                "program": program.to_string_lossy(),
+                "cwd": cwd,
+                "stopOnEntry": false
+            }
+        }),
+    );
+    let _launch_resp = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("launch")),
+        Duration::from_secs(3),
+    );
+    let _initialized_event = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("initialized")),
+        Duration::from_secs(2),
+    );
+
+    // Set breakpoint on line 4 (inside helper: let doubled = x + x)
+    write_dap_message(
+        &mut stdin,
+        &json!({
+            "type": "request",
+            "seq": 3,
+            "command": "setBreakpoints",
+            "arguments": {
+                "source": { "path": program.to_string_lossy() },
+                "breakpoints": [{ "line": 4 }]
+            }
+        }),
+    );
+    let _bp_resp = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("setBreakpoints"))
+        },
+        Duration::from_secs(2),
+    );
+
+    write_dap_message(
+        &mut stdin,
+        &json!({
+            "type": "request",
+            "seq": 4,
+            "command": "configurationDone",
+            "arguments": {}
+        }),
+    );
+    let stop = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
+        Duration::from_secs(4),
+    );
+    assert_eq!(stop.pointer("/body/reason"), Some(&json!("breakpoint")));
+
+    // Check stack frames — should show helper + @test test-call-stack
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 5, "command": "stackTrace", "arguments": {"threadId": 1}}),
+    );
+    let stack = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("stackTrace"))
+        },
+        Duration::from_secs(2),
+    );
+    let frames = stack
+        .pointer("/body/stackFrames")
+        .and_then(Value::as_array)
+        .expect("stack frames");
+    assert!(
+        frames.len() >= 2,
+        "expected at least 2 stack frames (helper + test), got {:?}",
+        frames
+    );
+    assert!(
+        frames[0]["name"].as_str().unwrap().ends_with("helper"),
+        "expected frame name ending with 'helper', got {:?}",
+        frames[0]["name"]
+    );
+    assert_eq!(frames[0]["line"], json!(4));
+    assert_eq!(frames[1]["name"], json!("@test test-call-stack"));
+
+    // Check locals in the helper frame (frame id from stack[0])
+    let helper_frame_id = frames[0]["id"].as_i64().unwrap();
+    let locals_ref = helper_frame_id * 10 + 1;
+    write_dap_message(
+        &mut stdin,
+        &json!({
+            "type": "request",
+            "seq": 6,
+            "command": "variables",
+            "arguments": { "variablesReference": locals_ref }
+        }),
+    );
+    let vars_resp = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("variables"))
+        },
+        Duration::from_secs(2),
+    );
+    let vars = vars_resp
+        .pointer("/body/variables")
+        .and_then(Value::as_array)
+        .expect("variables");
+    let var_names: Vec<&str> = vars.iter().filter_map(|v| v["name"].as_str()).collect();
+    assert!(
+        var_names.contains(&"x"),
+        "expected 'x' in helper locals, got {:?}",
+        var_names
+    );
 
     write_dap_message(
         &mut stdin,

@@ -155,6 +155,7 @@ struct RuntimeTraceEvent {
 enum FrameTarget {
     Test,
     Closure(usize),
+    Function(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -1114,6 +1115,37 @@ fn collect_stack_frames(session: &DebugSession) -> Vec<FrameDescriptor> {
         next_id += 1;
     }
 
+    let _test_name = session
+        .active_test()
+        .map(|t| t.name.clone())
+        .unwrap_or_default();
+
+    if let Some(entry) = current_trace_event(session) {
+        if let Some(sub_start) = entry.runtime_subprogram_start_line {
+            if let Some(func_idx) = session.debug_symbols.subprograms.iter().position(|sp| {
+                if sp.name.starts_with("lambda#") {
+                    return false;
+                }
+                if sp.start_line != sub_start {
+                    return false;
+                }
+                let is_test = session.active_test().map_or(false, |t| {
+                    sp.name == t.name || sp.name.ends_with(&format!("#{}", t.name))
+                });
+                !is_test
+            }) {
+                let sp = &session.debug_symbols.subprograms[func_idx];
+                frames.push(FrameDescriptor {
+                    id: next_id,
+                    name: sp.name.clone(),
+                    line: session.current_line.max(1),
+                    target: FrameTarget::Function(func_idx),
+                });
+                next_id += 1;
+            }
+        }
+    }
+
     frames.push(FrameDescriptor {
         id: next_id,
         name: session
@@ -1947,6 +1979,7 @@ fn resolve_dwarf_subprogram(
                     })
                 })
         }
+        FrameTarget::Function(idx) => session.debug_symbols.subprograms.get(idx),
     }
 }
 
@@ -2780,6 +2813,48 @@ fn frame_local_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable>
                 })
                 .unwrap_or_else(|| variables_from_env(&locals))
         }
+        FrameTarget::Function(func_idx) => {
+            let sp = &session.debug_symbols.subprograms[func_idx];
+            let mut locals = HashMap::new();
+
+            for binding in &sp.bindings {
+                if matches!(binding.kind, DwarfBindingKind::Parameter) {
+                    locals.insert(
+                        binding.name.clone(),
+                        SimpleValue::Unknown("<param>".to_string()),
+                    );
+                }
+            }
+
+            let inferred = infer_values_in_range(
+                &session.source_lines,
+                sp.start_line + 1,
+                session.current_line,
+                &locals,
+            );
+            for (name, value) in inferred {
+                locals.insert(name, value);
+            }
+
+            if let Some(runtime_values) =
+                runtime_binding_values_for_target(session, target, &locals)
+            {
+                for (name, value) in runtime_values {
+                    locals.insert(name, value);
+                }
+            }
+
+            dwarf_subprogram
+                .map(|subprogram| {
+                    variables_from_dwarf_bindings(
+                        subprogram.bindings.iter().filter(|binding| {
+                            binding_visible_at_line(binding, session.current_line, None)
+                        }),
+                        &locals,
+                    )
+                })
+                .unwrap_or_else(|| variables_from_env(&locals))
+        }
     }
 }
 
@@ -2852,6 +2927,16 @@ fn frame_environment(session: &DebugSession, frame_id: i64) -> HashMap<String, S
                 );
             }
 
+            env
+        }
+        FrameTarget::Function(_) => {
+            let mut env = HashMap::new();
+            for variable in frame_local_variables(session, frame_id) {
+                env.insert(
+                    variable.name,
+                    parse_variable_display(&variable.value, &variable.var_type),
+                );
+            }
             env
         }
     }
