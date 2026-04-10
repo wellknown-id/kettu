@@ -2846,9 +2846,6 @@ fn package_path_to_string(path: &PackagePath) -> String {
 
 impl Checker {
     fn check_call_constraints(&mut self, func: &Id, args: &[Expr], span: &Span) {
-        if self.in_guard_let {
-            return;
-        }
         if let Some(iface_name) = &self.current_interface {
             if let Some(iface) = self.interfaces.get(iface_name) {
                 let mut param_to_arg: HashMap<String, &Expr> = HashMap::new();
@@ -2939,19 +2936,45 @@ impl Checker {
                                 };
 
                                 if is_test && !error_msg.is_empty() {
-                                    let is_hushed = self.check_hush_comment(span, &error_msg);
-                                    if is_hushed {
-                                        self.diagnostics.push(Diagnostic::info(
-                                            error_msg,
-                                            span.clone(),
-                                            DiagnosticCode::ConstraintViolation,
-                                        ));
-                                    } else {
-                                        self.diagnostics.push(Diagnostic::error(
-                                            error_msg,
-                                            span.clone(),
-                                            DiagnosticCode::ConstraintViolation,
-                                        ));
+                                    match eval_result {
+                                        ConstraintEvalResult::NeedsPropagation(_) => {
+                                            if self.in_guard_let {
+                                                // guard let handles uncertainty, skip
+                                            } else {
+                                                let is_hushed =
+                                                    self.check_hush_comment(span, &error_msg);
+                                                if is_hushed {
+                                                    self.diagnostics.push(Diagnostic::info(
+                                                        error_msg,
+                                                        span.clone(),
+                                                        DiagnosticCode::ConstraintViolation,
+                                                    ));
+                                                } else {
+                                                    self.diagnostics.push(Diagnostic::error(
+                                                        error_msg,
+                                                        span.clone(),
+                                                        DiagnosticCode::ConstraintViolation,
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            let is_hushed =
+                                                self.check_hush_comment(span, &error_msg);
+                                            if is_hushed {
+                                                self.diagnostics.push(Diagnostic::info(
+                                                    error_msg,
+                                                    span.clone(),
+                                                    DiagnosticCode::ConstraintViolation,
+                                                ));
+                                            } else {
+                                                self.diagnostics.push(Diagnostic::error(
+                                                    error_msg,
+                                                    span.clone(),
+                                                    DiagnosticCode::ConstraintViolation,
+                                                ));
+                                            }
+                                        }
                                     }
                                 } else {
                                     match eval_result {
@@ -2963,11 +2986,13 @@ impl Checker {
                                             ));
                                         }
                                         ConstraintEvalResult::NeedsPropagation(_vars) => {
-                                            self.diagnostics.push(Diagnostic::warning(
-                                                error_msg,
-                                                span.clone(),
-                                                DiagnosticCode::ConstraintPropagation,
-                                            ));
+                                            if !self.in_guard_let {
+                                                self.diagnostics.push(Diagnostic::warning(
+                                                    error_msg,
+                                                    span.clone(),
+                                                    DiagnosticCode::ConstraintPropagation,
+                                                ));
+                                            }
                                         }
                                         ConstraintEvalResult::Satisfied => {}
                                     }
@@ -3110,19 +3135,41 @@ impl Checker {
         };
 
         if is_test && !error_msg.is_empty() {
-            let is_hushed = self.check_hush_comment(span, &error_msg);
-            if is_hushed {
-                self.diagnostics.push(Diagnostic::info(
-                    error_msg,
-                    span.clone(),
-                    DiagnosticCode::ConstraintViolation,
-                ));
-            } else {
-                self.diagnostics.push(Diagnostic::error(
-                    error_msg,
-                    span.clone(),
-                    DiagnosticCode::ConstraintViolation,
-                ));
+            match eval_result {
+                ConstraintEvalResult::NeedsPropagation(_) => {
+                    if !self.in_guard_let {
+                        let is_hushed = self.check_hush_comment(span, &error_msg);
+                        if is_hushed {
+                            self.diagnostics.push(Diagnostic::info(
+                                error_msg,
+                                span.clone(),
+                                DiagnosticCode::ConstraintViolation,
+                            ));
+                        } else {
+                            self.diagnostics.push(Diagnostic::error(
+                                error_msg,
+                                span.clone(),
+                                DiagnosticCode::ConstraintViolation,
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    let is_hushed = self.check_hush_comment(span, &error_msg);
+                    if is_hushed {
+                        self.diagnostics.push(Diagnostic::info(
+                            error_msg,
+                            span.clone(),
+                            DiagnosticCode::ConstraintViolation,
+                        ));
+                    } else {
+                        self.diagnostics.push(Diagnostic::error(
+                            error_msg,
+                            span.clone(),
+                            DiagnosticCode::ConstraintViolation,
+                        ));
+                    }
+                }
             }
         } else {
             match eval_result {
@@ -3134,11 +3181,13 @@ impl Checker {
                     ));
                 }
                 ConstraintEvalResult::NeedsPropagation(_) => {
-                    self.diagnostics.push(Diagnostic::warning(
-                        error_msg,
-                        span.clone(),
-                        DiagnosticCode::ConstraintPropagation,
-                    ));
+                    if !self.in_guard_let {
+                        self.diagnostics.push(Diagnostic::warning(
+                            error_msg,
+                            span.clone(),
+                            DiagnosticCode::ConstraintPropagation,
+                        ));
+                    }
                 }
                 ConstraintEvalResult::Satisfied => {}
             }
@@ -5689,6 +5738,39 @@ mod tests {
             constraint_diags.is_empty(),
             "expected no constraint diagnostics inside guard-let, got: {:?}",
             constraint_diags
+        );
+    }
+
+    #[test]
+    fn test_constraint_violation_in_guard_let_with_constant() {
+        let source = r#"
+            package local:test;
+            interface test {
+                positive: func(n: s32 where n > 0) -> result<bool, string> {
+                    result#ok(true)
+                }
+                caller: func() -> result<bool, string> {
+                    guard let result = positive(-1) else {
+                        return result#err("fail");
+                    };
+                    result
+                }
+            }
+        "#;
+
+        let (ast, _) = parse_file(source);
+        let ast = ast.expect("Should parse");
+        let diags = check(&ast);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::ConstraintViolation)
+            .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|d| d.message.contains("does not satisfy") && d.message.contains("positive")),
+            "expected constraint violation error for constant arg inside guard-let, got: {:?}",
+            errors
         );
     }
 

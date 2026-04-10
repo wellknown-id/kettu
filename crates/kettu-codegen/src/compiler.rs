@@ -3790,10 +3790,14 @@ impl<'a> ModuleCompiler<'a> {
             return;
         }
 
+        let is_result_return = func
+            .result
+            .as_ref()
+            .map_or(false, |ty| matches!(ty, Ty::Result { .. }));
+
         let contract_fail_idx = self.ensure_contract_fail_import();
 
         for param in &func.params {
-            // Explicit where clause on the parameter
             if let Some(constraint) = &param.constraint {
                 let msg = format!(
                     "{} does not satisfy the constraint \"{}\"",
@@ -3804,14 +3808,17 @@ impl<'a> ModuleCompiler<'a> {
                 self.compile_constraint_expr(function, constraint, locals);
                 function.instruction(&Instruction::I32Eqz);
                 function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-                function.instruction(&Instruction::I32Const(msg_ptr as i32));
-                function.instruction(&Instruction::I32Const(msg_len as i32));
-                function.instruction(&Instruction::Call(contract_fail_idx));
-                function.instruction(&Instruction::Unreachable);
+                if is_result_return {
+                    self.emit_result_err_return(function, msg_ptr, msg_len);
+                } else {
+                    function.instruction(&Instruction::I32Const(msg_ptr as i32));
+                    function.instruction(&Instruction::I32Const(msg_len as i32));
+                    function.instruction(&Instruction::Call(contract_fail_idx));
+                    function.instruction(&Instruction::Unreachable);
+                }
                 function.instruction(&Instruction::End);
             }
 
-            // Implicit constraint from the parameter's type alias
             if let Some(alias_constraint) = self.resolve_type_constraint(&param.ty) {
                 let substituted =
                     Self::substitute_expr_ident(&alias_constraint, "it", &param.name.name);
@@ -3824,13 +3831,49 @@ impl<'a> ModuleCompiler<'a> {
                 self.compile_constraint_expr(function, &substituted, locals);
                 function.instruction(&Instruction::I32Eqz);
                 function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-                function.instruction(&Instruction::I32Const(msg_ptr as i32));
-                function.instruction(&Instruction::I32Const(msg_len as i32));
-                function.instruction(&Instruction::Call(contract_fail_idx));
-                function.instruction(&Instruction::Unreachable);
+                if is_result_return {
+                    self.emit_result_err_return(function, msg_ptr, msg_len);
+                } else {
+                    function.instruction(&Instruction::I32Const(msg_ptr as i32));
+                    function.instruction(&Instruction::I32Const(msg_len as i32));
+                    function.instruction(&Instruction::Call(contract_fail_idx));
+                    function.instruction(&Instruction::Unreachable);
+                }
                 function.instruction(&Instruction::End);
             }
         }
+    }
+
+    fn emit_result_err_return(&mut self, function: &mut Function, msg_ptr: u32, _msg_len: u32) {
+        let alloc_idx = self
+            .alloc_func_idx
+            .unwrap_or_else(|| self.ensure_alloc_func());
+        let err_discriminant = Self::variant_discriminant("err");
+
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::I32Const(8));
+        function.instruction(&Instruction::Call(alloc_idx));
+
+        function.instruction(&Instruction::LocalTee(0));
+        function.instruction(&Instruction::I32Const(err_discriminant));
+        function.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        function.instruction(&Instruction::LocalGet(0));
+        function.instruction(&Instruction::I32Const(msg_ptr as i32));
+        function.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        function.instruction(&Instruction::LocalGet(0));
+        function.instruction(&Instruction::Return);
     }
 
     fn compile_constraint_expr(
@@ -3980,8 +4023,6 @@ impl<'a> ModuleCompiler<'a> {
 
         let is_result = matches!(result_ty, Ty::Result { .. });
 
-        let contract_fail_idx = self.ensure_contract_fail_import();
-
         let msg = format!(
             "return value does not satisfy the constraint \"{}\"",
             self.fmt_constraint_expr(&constraint)
@@ -3991,8 +4032,6 @@ impl<'a> ModuleCompiler<'a> {
         let result_local = locals.values().copied().max().unwrap_or(0) + 1;
         function.instruction(&Instruction::LocalSet(result_local));
 
-        // For result types, load the ok payload from offset 4 (after discriminant)
-        // and only check when discriminant == 0 (ok variant)
         if is_result {
             function.instruction(&Instruction::LocalGet(result_local));
             function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
@@ -4003,7 +4042,6 @@ impl<'a> ModuleCompiler<'a> {
             function.instruction(&Instruction::I32Eqz);
             function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
-            // Load the ok payload value
             function.instruction(&Instruction::LocalGet(result_local));
             function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: 4,
@@ -4015,10 +4053,7 @@ impl<'a> ModuleCompiler<'a> {
             self.compile_return_constraint_expr(function, &constraint, payload_local);
             function.instruction(&Instruction::I32Eqz);
             function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-            function.instruction(&Instruction::I32Const(msg_ptr as i32));
-            function.instruction(&Instruction::I32Const(msg_len as i32));
-            function.instruction(&Instruction::Call(contract_fail_idx));
-            function.instruction(&Instruction::Unreachable);
+            self.emit_result_err_return(function, msg_ptr, msg_len);
             function.instruction(&Instruction::End);
 
             function.instruction(&Instruction::End);
@@ -4026,6 +4061,7 @@ impl<'a> ModuleCompiler<'a> {
             self.compile_return_constraint_expr(function, &constraint, result_local);
             function.instruction(&Instruction::I32Eqz);
             function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            let contract_fail_idx = self.ensure_contract_fail_import();
             function.instruction(&Instruction::I32Const(msg_ptr as i32));
             function.instruction(&Instruction::I32Const(msg_len as i32));
             function.instruction(&Instruction::Call(contract_fail_idx));

@@ -2,45 +2,69 @@ package local:contract-tests;
 
 interface contract-tests {
 
-    /// Example 1: A simple parameter constraint.
-    @test
-    test-bounds: func(small: s32, big: s32 where big > small) -> result<bool, string> {
+    /// A type alias with a constraint: values must be positive.
+    type positive = s32 where it > 0;
+
+    /// A function with an explicit where clause on its parameters.
+    in-range: func(lo: s32, hi: s32 where hi > lo) -> result<bool, string> {
         result#ok(true)
     }
 
-    /// Example 2: Another simple parameter constraint.
-    @test
-    test-ten-items-or-less: func(count: s32 where count < 10, items: list<s32>) -> result<bool, string> {
+    /// A function using a constrained type alias on its parameter.
+    count-items: func(n: positive) -> result<bool, string> {
         result#ok(true)
     }
 
-    /// Example 3: An implicit parameter constraint.
+    /// Test: calling a constrained function with satisfying arguments.
     @test
-    test-bounds-called: func() -> bool {
-        let big = 10;
-        let small = 20;
-        test-bounds(small, big);
-        ///                ^ big does not satisfy the constraint "big (10) > small (20)" on test-bounds
-        true
-    }
-
-    /// Example 4: Another implicit parameter constraint.
-    @test-helper
-    call-test-bounds: func(somesmall: s32) -> bool {
-        let big = 10;
-        test-bounds(somesmall, big);
-        ///                    ^ big may not satisfy the constraint "big (10) > small (somesmall)" because somesmall is an unconstrained parameter, test-bounds must be called with a guard
-        guard let mustbetrue = test-bounds(somesmall, big) else {
-            return result#err("constraint failed");
+    test-in-range-satisfied: func() -> bool {
+        guard let result = in-range(1, 10) else {
+            return false;
         };
-        mustbetrue
+        result
     }
+
+    /// Test: calling a type-aliased constrained function.
     @test
-    test-bounds-called-again: func() -> bool {
-        let small = 10;
-        call-test-bounds(small);
-        ///              ^ small does not satisfy the constraint "big (10) > small (10)" on test-bounds (via call-test-bounds)
-        true
+    test-positive-satisfied: func() -> bool {
+        guard let result = count-items(5) else {
+            return false;
+        };
+        result
+    }
+
+    /// Test helper: wraps count-items so the checker cannot prove
+    /// the constraint at compile time. Guard let catches runtime
+    /// violations and returns false.
+    @test-helper
+    try-count-items: func(n: s32) -> bool {
+        guard let result = count-items(n) else {
+            return false;
+        };
+        result
+    }
+
+    /// Test: a negative number is rejected at runtime by the constraint.
+    /// The checker allows this because it cannot see through the helper.
+    @test
+    test-negative-rejected: func() -> bool {
+        try-count-items(-1) == false
+    }
+
+    /// Test helper: unconstrained params require guard let when
+    /// forwarding to a constrained function.
+    @test-helper
+    check-range: func(lo: s32, hi: s32) -> bool {
+        guard let result = in-range(lo, hi) else {
+            return false;
+        };
+        result
+    }
+
+    /// Test: transitive constraint via test helper.
+    @test
+    test-via-helper: func() -> bool {
+        check-range(0, 100)
     }
 }
 
