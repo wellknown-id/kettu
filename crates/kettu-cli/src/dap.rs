@@ -394,6 +394,29 @@ impl RuntimePauseMode {
 struct RuntimeDebugArtifacts {
     engine: Engine,
     module: Module,
+    #[cfg_attr(not(test), allow(dead_code))]
+    debug_resume_frames: Vec<DebugResumeFrameMetadata>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct DebugResumeFrameMetadata {
+    func_index: u32,
+    name: String,
+    start_line: i64,
+    state_offset: u32,
+    byte_size: u32,
+    slot_count: usize,
+    bindings: Vec<DebugResumeBindingMetadata>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct DebugResumeBindingMetadata {
+    name: String,
+    local_index: u32,
+    decl_line: i64,
+    kind: String,
 }
 
 impl RuntimeDebugArtifacts {
@@ -403,11 +426,16 @@ impl RuntimeDebugArtifacts {
         ast: &kettu_parser::WitFile,
     ) -> Result<Self, String> {
         let wasm = compile_debug_runtime_module(program, source, ast)?;
+        let debug_resume_frames = parse_debug_resume_frames(&wasm)?;
         let engine = Engine::default();
         let module = Module::new(&engine, &wasm)
             .map_err(|err| format!("Failed to load debug runtime wasm: {}", err))?;
 
-        Ok(Self { engine, module })
+        Ok(Self {
+            engine,
+            module,
+            debug_resume_frames,
+        })
     }
 
     fn start_test(&self, test_name: &str) -> Result<RuntimeDebugSession, String> {
@@ -419,6 +447,93 @@ impl RuntimeDebugArtifacts {
         session.run_to_completion()?;
         Ok(session.events())
     }
+}
+
+fn parse_debug_resume_frames(wasm: &[u8]) -> Result<Vec<DebugResumeFrameMetadata>, String> {
+    let mut section_data = None;
+    for payload in Parser::new(0).parse_all(wasm) {
+        match payload.map_err(|err| format!("Failed to parse runtime debug wasm: {}", err))? {
+            Payload::CustomSection(section) if section.name() == "kettu-debug-resume" => {
+                section_data = Some(section.data().to_vec());
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let Some(section_data) = section_data else {
+        return Ok(Vec::new());
+    };
+
+    let json: Value = serde_json::from_slice(&section_data)
+        .map_err(|err| format!("Failed to parse debug resume metadata: {}", err))?;
+    let Some(frames) = json.get("frames").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+
+    frames.iter().map(parse_debug_resume_frame).collect()
+}
+
+fn parse_debug_resume_frame(frame: &Value) -> Result<DebugResumeFrameMetadata, String> {
+    let bindings = frame
+        .get("bindings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Debug resume frame is missing bindings".to_string())?
+        .iter()
+        .map(parse_debug_resume_binding)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(DebugResumeFrameMetadata {
+        func_index: value_as_u32(frame, "funcIndex")?,
+        name: value_as_string(frame, "name")?,
+        start_line: value_as_i64(frame, "startLine")?,
+        state_offset: value_as_u32(frame, "stateOffset")?,
+        byte_size: value_as_u32(frame, "byteSize")?,
+        slot_count: value_as_usize(frame, "slotCount")?,
+        bindings,
+    })
+}
+
+fn parse_debug_resume_binding(binding: &Value) -> Result<DebugResumeBindingMetadata, String> {
+    Ok(DebugResumeBindingMetadata {
+        name: value_as_string(binding, "name")?,
+        local_index: value_as_u32(binding, "localIndex")?,
+        decl_line: value_as_i64(binding, "declLine")?,
+        kind: value_as_string(binding, "kind")?,
+    })
+}
+
+fn value_as_string(value: &Value, key: &str) -> Result<String, String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| format!("Debug resume metadata is missing string field '{}'", key))
+}
+
+fn value_as_u32(value: &Value, key: &str) -> Result<u32, String> {
+    let raw = value
+        .get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("Debug resume metadata is missing numeric field '{}'", key))?;
+    u32::try_from(raw)
+        .map_err(|_| format!("Debug resume metadata field '{}' exceeds u32", key))
+}
+
+fn value_as_usize(value: &Value, key: &str) -> Result<usize, String> {
+    let raw = value
+        .get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("Debug resume metadata is missing numeric field '{}'", key))?;
+    usize::try_from(raw)
+        .map_err(|_| format!("Debug resume metadata field '{}' exceeds usize", key))
+}
+
+fn value_as_i64(value: &Value, key: &str) -> Result<i64, String> {
+    value
+        .get(key)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("Debug resume metadata is missing signed numeric field '{}'", key))
 }
 
 struct RuntimeDebugSession {
@@ -1903,6 +2018,21 @@ fn collect_stack_frames(session: &DebugSession) -> Vec<FrameDescriptor> {
                     target: FrameTarget::Function(func_idx),
                 });
                 next_id += 1;
+            } else if let Some(frame) = active_runtime_debug_frame(session, &snapshot) {
+                if !frame.name.starts_with("lambda#")
+                    && session.active_test().map_or(true, |test| {
+                        frame.name != test.name && !frame.name.ends_with(&format!("#{}", test.name))
+                    })
+                {
+                    frames.push(FrameDescriptor {
+                        id: next_id,
+                        name: frame.name.clone(),
+                        line: session.current_line.max(1),
+                        column: session.current_column.max(1),
+                        target: FrameTarget::Function(usize::MAX),
+                    });
+                    next_id += 1;
+                }
             }
         }
     }
@@ -2825,6 +2955,78 @@ fn resolve_dwarf_subprogram(
     }
 }
 
+fn runtime_binding_kind(binding: &DebugResumeBindingMetadata) -> DwarfBindingKind {
+    match binding.kind.as_str() {
+        "parameter" => DwarfBindingKind::Parameter,
+        _ => DwarfBindingKind::Variable,
+    }
+}
+
+fn active_runtime_debug_frame<'a>(
+    session: &'a DebugSession,
+    snapshot: &PausedRuntimeSnapshot,
+) -> Option<&'a DebugResumeFrameMetadata> {
+    let start_line = snapshot.subprogram_start_line?;
+    session
+        .runtime_debug_artifacts
+        .as_ref()?
+        .debug_resume_frames
+        .iter()
+        .find(|frame| frame.start_line == start_line)
+}
+
+fn resolve_runtime_debug_frame<'a>(
+    session: &'a DebugSession,
+    target: FrameTarget,
+) -> Option<&'a DebugResumeFrameMetadata> {
+    let frames = &session.runtime_debug_artifacts.as_ref()?.debug_resume_frames;
+    match target {
+        FrameTarget::Test => {
+            let test = session.active_test()?;
+            frames.iter().find(|frame| {
+                frame.name == test.name || frame.name.ends_with(&format!("#{}", test.name))
+            })
+        }
+        FrameTarget::Closure(closure_index) => {
+            let closure = &session.closures[closure_index];
+            frames.iter().find(|frame| {
+                frame.name == closure.name
+                    || (frame.name.starts_with("lambda#") && frame.start_line == closure.start_line)
+            })
+        }
+        FrameTarget::Function(idx) => {
+            if let Some(subprogram) = session.debug_symbols.subprograms.get(idx) {
+                frames.iter().find(|frame| {
+                    frame.start_line == subprogram.start_line && frame.name == subprogram.name
+                })
+            } else {
+                let snapshot = paused_runtime_snapshot(session)?;
+                let active = active_runtime_debug_frame(session, &snapshot)?;
+                (!active.name.starts_with("lambda#")).then_some(active)
+            }
+        }
+    }
+}
+
+fn bindings_for_target(session: &DebugSession, target: FrameTarget) -> Vec<DwarfBinding> {
+    if let Some(frame) = resolve_runtime_debug_frame(session, target) {
+        return frame
+            .bindings
+            .iter()
+            .map(|binding| DwarfBinding {
+                name: binding.name.clone(),
+                kind: runtime_binding_kind(binding),
+                decl_line: binding.decl_line,
+                local_index: Some(binding.local_index),
+            })
+            .collect();
+    }
+
+    resolve_dwarf_subprogram(session, target)
+        .map(|subprogram| subprogram.bindings.clone())
+        .unwrap_or_default()
+}
+
 fn current_trace_event(session: &DebugSession) -> Option<&TraceEvent> {
     let test = session.active_test()?;
     let index = session.current_trace_index?;
@@ -2895,15 +3097,31 @@ fn runtime_binding_values_for_target(
     target: FrameTarget,
     fallback_values: &HashMap<String, SimpleValue>,
 ) -> Option<HashMap<String, SimpleValue>> {
-    let subprogram = resolve_dwarf_subprogram(session, target)?;
     let snapshot = paused_runtime_snapshot(session)?;
-    if snapshot.subprogram_start_line != Some(subprogram.start_line) {
-        return None;
-    }
+    let bindings = if let Some(frame) = resolve_runtime_debug_frame(session, target) {
+        if snapshot.subprogram_start_line != Some(frame.start_line) {
+            return None;
+        }
+        frame
+            .bindings
+            .iter()
+            .map(|binding| DwarfBinding {
+                name: binding.name.clone(),
+                kind: runtime_binding_kind(binding),
+                decl_line: binding.decl_line,
+                local_index: Some(binding.local_index),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let subprogram = resolve_dwarf_subprogram(session, target)?;
+        if snapshot.subprogram_start_line != Some(subprogram.start_line) {
+            return None;
+        }
+        subprogram.bindings.clone()
+    };
 
     Some(
-        subprogram
-            .bindings
+        bindings
             .iter()
             .filter_map(|binding| {
                 let local_index = binding.local_index?;
@@ -3983,21 +4201,21 @@ fn frame_local_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable>
         return Vec::new();
     };
 
-    let dwarf_subprogram = resolve_dwarf_subprogram(session, target);
+    let target_bindings = bindings_for_target(session, target);
 
     match target {
         FrameTarget::Test => {
             let locals = test_environment_for_line(session, session.current_line);
-            dwarf_subprogram
-                .map(|subprogram| {
-                    variables_from_dwarf_bindings(
-                        subprogram.bindings.iter().filter(|binding| {
-                            binding_visible_at_line(binding, session.current_line, None)
-                        }),
-                        &locals,
-                    )
-                })
-                .unwrap_or_else(|| variables_from_env(&locals))
+            if target_bindings.is_empty() {
+                variables_from_env(&locals)
+            } else {
+                variables_from_dwarf_bindings(
+                    target_bindings.iter().filter(|binding| {
+                        binding_visible_at_line(binding, session.current_line, None)
+                    }),
+                    &locals,
+                )
+            }
         }
         FrameTarget::Closure(closure_index) => {
             let closure = &session.closures[closure_index];
@@ -4051,27 +4269,29 @@ fn frame_local_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable>
                 }
             }
 
-            dwarf_subprogram
-                .map(|subprogram| {
-                    variables_from_dwarf_bindings(
-                        subprogram.bindings.iter().filter(|binding| {
-                            !capture_names.contains(&binding.name)
-                                && binding_visible_at_line(
-                                    binding,
-                                    session.current_line,
-                                    Some(&capture_names),
-                                )
-                        }),
-                        &locals,
-                    )
-                })
-                .unwrap_or_else(|| variables_from_env(&locals))
+            if target_bindings.is_empty() {
+                variables_from_env(&locals)
+            } else {
+                variables_from_dwarf_bindings(
+                    target_bindings.iter().filter(|binding| {
+                        !capture_names.contains(&binding.name)
+                            && binding_visible_at_line(
+                                binding,
+                                session.current_line,
+                                Some(&capture_names),
+                            )
+                    }),
+                    &locals,
+                )
+            }
         }
         FrameTarget::Function(func_idx) => {
-            let sp = &session.debug_symbols.subprograms[func_idx];
+            let sp = session.debug_symbols.subprograms.get(func_idx);
             let mut locals = HashMap::new();
 
-            for binding in &sp.bindings {
+            for binding in target_bindings.iter().filter(|binding| {
+                matches!(binding.kind, DwarfBindingKind::Parameter)
+            }) {
                 if matches!(binding.kind, DwarfBindingKind::Parameter) {
                     locals.insert(
                         binding.name.clone(),
@@ -4082,7 +4302,10 @@ fn frame_local_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable>
 
             let inferred = infer_values_in_range(
                 &session.source_lines,
-                sp.start_line + 1,
+                sp.map(|subprogram| subprogram.start_line)
+                    .or_else(|| resolve_runtime_debug_frame(session, target).map(|frame| frame.start_line))
+                    .unwrap_or(session.current_line)
+                    + 1,
                 session.current_line,
                 &locals,
             );
@@ -4098,16 +4321,16 @@ fn frame_local_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable>
                 }
             }
 
-            dwarf_subprogram
-                .map(|subprogram| {
-                    variables_from_dwarf_bindings(
-                        subprogram.bindings.iter().filter(|binding| {
-                            binding_visible_at_line(binding, session.current_line, None)
-                        }),
-                        &locals,
-                    )
-                })
-                .unwrap_or_else(|| variables_from_env(&locals))
+            if target_bindings.is_empty() {
+                variables_from_env(&locals)
+            } else {
+                variables_from_dwarf_bindings(
+                    target_bindings.iter().filter(|binding| {
+                        binding_visible_at_line(binding, session.current_line, None)
+                    }),
+                    &locals,
+                )
+            }
         }
     }
 }
@@ -4230,14 +4453,17 @@ fn test_environment_for_line(session: &DebugSession, line: i64) -> HashMap<Strin
     };
 
     let overlay_runtime_locals = |mut env: HashMap<String, SimpleValue>, snapshot: &PausedRuntimeSnapshot| {
-        let Some(subprogram) = resolve_dwarf_subprogram(session, FrameTarget::Test) else {
+        let bindings = bindings_for_target(session, FrameTarget::Test);
+        let start_line = resolve_runtime_debug_frame(session, FrameTarget::Test)
+            .map(|frame| frame.start_line)
+            .or_else(|| resolve_dwarf_subprogram(session, FrameTarget::Test).map(|subprogram| subprogram.start_line));
+        let Some(start_line) = start_line else {
             return env;
         };
-        if snapshot.subprogram_start_line != Some(subprogram.start_line) {
+        if snapshot.subprogram_start_line != Some(start_line) {
             return env;
         }
-        for binding in subprogram
-            .bindings
+        for binding in bindings
             .iter()
             .filter(|binding| binding_visible_at_line(binding, line, None))
         {
@@ -5513,6 +5739,53 @@ interface tests {
     }
 
     #[test]
+    fn runtime_debug_artifacts_parse_debug_resume_metadata() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let base = 10;
+        let add = |n| n + base;
+        return add(2) == 12;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_resume_metadata_test.kettu");
+
+        let artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let test_frame = artifacts
+            .debug_resume_frames
+            .iter()
+            .find(|frame| frame.name == "t")
+            .expect("expected test frame metadata");
+        assert_eq!(test_frame.start_line, 3);
+        assert_eq!(test_frame.slot_count, 2);
+        assert!(test_frame.byte_size >= 16);
+        assert!(test_frame.bindings.iter().any(|binding| {
+            binding.name == "base" && binding.kind == "variable" && binding.decl_line == 5
+        }));
+
+        let lambda_frame = artifacts
+            .debug_resume_frames
+            .iter()
+            .find(|frame| frame.name == "lambda#0")
+            .expect("expected lambda frame metadata");
+        assert_eq!(lambda_frame.start_line, 6);
+        assert!(lambda_frame.state_offset >= test_frame.state_offset + test_frame.byte_size);
+        assert!(lambda_frame.bindings.iter().any(|binding| {
+            binding.name == "base" && binding.kind == "variable"
+        }));
+        assert!(lambda_frame.bindings.iter().any(|binding| {
+            binding.name == "n" && binding.kind == "parameter" && binding.local_index == 0
+        }));
+    }
+
+    #[test]
     fn runtime_debug_session_pauses_at_breakpoint() {
         let source = r#"package local:test;
 interface tests {
@@ -5828,7 +6101,7 @@ interface tests {
         session
             .breakpoints
             .insert(super::normalize_path_key(&program.display().to_string()), BTreeSet::from([
-                super::BreakpointLocation::new(4, None),
+                super::BreakpointLocation::new(5, None),
             ]));
 
         let outcome = session
@@ -5846,6 +6119,71 @@ interface tests {
                 .unwrap_or(false)
         }));
         assert!(frames.iter().any(|frame| frame["name"] == json!("@test t")));
+    }
+
+    #[test]
+    fn runtime_metadata_recovers_function_frame_without_dwarf_symbols() {
+        let source = r#"package local:test;
+interface tests {
+    helper: func(a: s32) -> s32 {
+        let inc = a + 1;
+        return inc;
+    }
+
+    @test
+    t: func() -> bool {
+        let value = helper(2);
+        return value == 3;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_metadata_function_frame_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 8,
+            end_line: 11,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.source_lines = source.lines().map(str::to_string).collect();
+        session.tests = tests;
+        session.closures = super::parse_closures(&session.source_lines);
+        session.current_line = 7;
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session
+            .breakpoints
+            .insert(super::normalize_path_key(&program.display().to_string()), BTreeSet::from([
+                super::BreakpointLocation::new(4, None),
+            ]));
+
+        let outcome = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("runtime-backed continue outcome");
+        assert!(matches!(outcome, super::StopOutcome::Stopped("breakpoint")));
+
+        session.current_trace_index = None;
+        session.capture_paused_frames();
+
+        let helper_frame = session
+            .current_frame_descriptors()
+            .into_iter()
+            .find(|frame| frame.name == "helper" || frame.name.ends_with("#helper"))
+            .expect("expected helper frame from runtime metadata");
+
+        let locals = super::frame_local_variables(&session, helper_frame.id);
+        assert!(locals.iter().any(|var| var.name == "a" && var.value == "2"));
+        assert!(locals.iter().any(|var| var.name == "inc"));
     }
 
     #[test]

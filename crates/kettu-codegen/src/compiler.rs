@@ -58,6 +58,17 @@ struct ActiveDebugHookContext {
     snapshottable_locals: std::collections::HashSet<u32>,
 }
 
+#[derive(Debug, Clone)]
+struct DebugResumeFramePlan {
+    func_idx: u32,
+    name: String,
+    start_line: i64,
+    bindings: Vec<DebugBinding>,
+    state_offset: Option<u32>,
+}
+
+const DEBUG_RESUME_HEADER_BYTES: u32 = 8;
+
 impl RecordTypeInfo {
     fn from_fields(field_names: &[(String, usize)]) -> Self {
         Self {
@@ -766,6 +777,8 @@ struct ModuleCompiler<'a> {
     debug_enter_hook_idx: Option<u32>,
     /// Index of the debugger frame-exit hook import
     debug_exit_hook_idx: Option<u32>,
+    /// Reserved debug-resume frame slots for functions/lambdas compiled with debugger hooks.
+    debug_resume_frames: Vec<DebugResumeFramePlan>,
     /// Active debug hook context while compiling a function/lambda body
     active_debug_hook_context: Option<ActiveDebugHookContext>,
     /// Compile-time constant i32 locals visible in the current function/lambda scope
@@ -832,6 +845,7 @@ impl<'a> ModuleCompiler<'a> {
             debug_value_hook_idx: None,
             debug_enter_hook_idx: None,
             debug_exit_hook_idx: None,
+            debug_resume_frames: Vec::new(),
             active_debug_hook_context: None,
             active_constant_locals: None,
             task_return_types: HashMap::new(),
@@ -1109,6 +1123,99 @@ impl<'a> ModuleCompiler<'a> {
                 .map(|binding| binding.local_index)
                 .collect(),
         })
+    }
+
+    fn register_debug_resume_frame(
+        &mut self,
+        func_idx: u32,
+        name: String,
+        start_line: i64,
+        debug_info: &FunctionDebugInfo,
+    ) {
+        if !self.options.emit_debug_hooks || debug_info.bindings.is_empty() {
+            return;
+        }
+
+        if self
+            .debug_resume_frames
+            .iter()
+            .any(|frame| frame.func_idx == func_idx)
+        {
+            return;
+        }
+
+        let mut bindings = debug_info.bindings.clone();
+        bindings.sort_by_key(|binding| binding.local_index);
+        self.debug_resume_frames.push(DebugResumeFramePlan {
+            func_idx,
+            name,
+            start_line,
+            bindings,
+            state_offset: None,
+        });
+    }
+
+    fn finalize_debug_resume_frames(&mut self) {
+        let mut next_offset = self.string_offset;
+        for frame in &mut self.debug_resume_frames {
+            frame.state_offset = Some(next_offset);
+            next_offset += DEBUG_RESUME_HEADER_BYTES + (frame.bindings.len() as u32 * 4);
+        }
+        self.string_offset = next_offset;
+    }
+
+    fn emit_debug_resume_section(&self, module: &mut Module) {
+        if self.debug_resume_frames.is_empty() {
+            return;
+        }
+
+        let mut json = String::from("{\"version\":1,\"frameHeaderBytes\":");
+        json.push_str(&DEBUG_RESUME_HEADER_BYTES.to_string());
+        json.push_str(",\"frames\":[");
+
+        for (index, frame) in self.debug_resume_frames.iter().enumerate() {
+            if index > 0 {
+                json.push(',');
+            }
+
+            let state_offset = frame.state_offset.unwrap_or(0);
+            let byte_size = DEBUG_RESUME_HEADER_BYTES + (frame.bindings.len() as u32 * 4);
+            json.push_str(&format!(
+                "{{\"funcIndex\":{},\"name\":\"{}\",\"startLine\":{},\"stateOffset\":{},\"byteSize\":{},\"slotCount\":{},\"bindings\":[",
+                frame.func_idx,
+                frame.name.replace('\\', "\\\\").replace('"', "\\\""),
+                frame.start_line,
+                state_offset,
+                byte_size,
+                frame.bindings.len()
+            ));
+
+            for (binding_index, binding) in frame.bindings.iter().enumerate() {
+                if binding_index > 0 {
+                    json.push(',');
+                }
+                let kind = match binding.kind {
+                    DebugBindingKind::Parameter => "parameter",
+                    DebugBindingKind::Variable => "variable",
+                };
+                json.push_str(&format!(
+                    "{{\"name\":\"{}\",\"localIndex\":{},\"declLine\":{},\"kind\":\"{}\"}}",
+                    binding.name.replace('\\', "\\\\").replace('"', "\\\""),
+                    binding.local_index,
+                    binding.decl_line,
+                    kind
+                ));
+            }
+
+            json.push_str("]}");
+        }
+
+        json.push_str("]}");
+        let section = CustomSection {
+            name: "kettu-debug-resume".into(),
+            data: Cow::Owned(json.into_bytes()),
+        };
+        module.section(&section);
     }
 
     fn emit_contracts_section(&self, module: &mut Module, file: &WitFile) {
@@ -1606,6 +1713,17 @@ impl<'a> ModuleCompiler<'a> {
                         fallback_decl_line,
                     );
                     self.func_debug_info.insert(*func_idx, debug_info.clone());
+                    let lambda_name = self
+                        .func_debug_names
+                        .get(func_idx)
+                        .cloned()
+                        .unwrap_or_else(|| format!("lambda#{}", func_idx));
+                    self.register_debug_resume_frame(
+                        *func_idx,
+                        lambda_name,
+                        fallback_decl_line as i64,
+                        &debug_info,
+                    );
                     self.active_debug_hook_context_for_lambda(*func_idx, body, &debug_info)
                 } else {
                     None
@@ -1919,6 +2037,8 @@ impl<'a> ModuleCompiler<'a> {
         });
         module.section(&memories);
 
+        self.finalize_debug_resume_frames();
+
         // 6. Global section
         let mut globals = GlobalSection::new();
         globals.global(
@@ -2012,6 +2132,9 @@ impl<'a> ModuleCompiler<'a> {
 
         // 12. Contract metadata custom section
         self.emit_contracts_section(&mut module, file);
+
+        // 13. Debug-resume metadata custom section
+        self.emit_debug_resume_section(&mut module);
 
         if self.options.emit_dwarf {
             let mut wasm = module.finish();
@@ -3397,6 +3520,12 @@ impl<'a> ModuleCompiler<'a> {
         let debug_context = if let Some(source) = self.options.debug_source.as_deref() {
             let debug_info = build_function_debug_info(func, &locals, source);
             self.func_debug_info.insert(func_idx, debug_info.clone());
+            self.register_debug_resume_frame(
+                func_idx,
+                func.name.name.clone(),
+                offset_to_line(source, func.span.start) as i64,
+                &debug_info,
+            );
             self.active_debug_hook_context_for_function(func, &debug_info, &locals, &v128_locals)?
         } else {
             None
@@ -9567,6 +9696,125 @@ mod tests {
         assert!(
             json_str.contains("\"count < 10\""),
             "JSON should contain count < 10"
+        );
+    }
+
+    #[test]
+    fn test_compile_debug_resume_section_for_function_bindings() {
+        let source = r#"
+            package local:test;
+
+            interface test {
+                inspect: func(x: s32) -> s32 {
+                    let y = x + 1;
+                    y
+                }
+            }
+        "#;
+
+        let (ast, errors) = parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("Should parse");
+
+        let wasm = compile_module(
+            &ast,
+            &CompileOptions {
+                emit_debug_hooks: true,
+                debug_source: Some(source.to_string()),
+                ..CompileOptions::default()
+            },
+        )
+        .expect("should compile");
+
+        let mut section_data = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            if let Ok(wasmparser::Payload::CustomSection(reader)) = payload {
+                if reader.name() == "kettu-debug-resume" {
+                    section_data = reader.data().to_vec();
+                }
+            }
+        }
+
+        let json_str = String::from_utf8(section_data).expect("section should be valid UTF-8");
+        assert!(
+            json_str.contains("\"frameHeaderBytes\":8"),
+            "debug resume metadata should include frame header size"
+        );
+        assert!(
+            json_str.contains("\"inspect\""),
+            "debug resume metadata should include function name"
+        );
+        assert!(
+            json_str.contains("\"slotCount\":2"),
+            "debug resume metadata should reserve one slot per debug binding"
+        );
+        assert!(
+            json_str.contains("\"name\":\"x\""),
+            "debug resume metadata should include parameter bindings"
+        );
+        assert!(
+            json_str.contains("\"name\":\"y\""),
+            "debug resume metadata should include local bindings"
+        );
+        assert!(
+            json_str.contains("\"byteSize\":16"),
+            "debug resume metadata should reserve header plus binding slots"
+        );
+    }
+
+    #[test]
+    fn test_compile_debug_resume_section_for_lambda_bindings() {
+        let source = r#"
+            package local:test;
+
+            interface test {
+                inspect: func() -> s32 {
+                    let base = 10;
+                    let add = |n| n + base;
+                    add(2)
+                }
+            }
+        "#;
+
+        let (ast, errors) = parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("Should parse");
+
+        let wasm = compile_module(
+            &ast,
+            &CompileOptions {
+                emit_debug_hooks: true,
+                debug_source: Some(source.to_string()),
+                ..CompileOptions::default()
+            },
+        )
+        .expect("should compile");
+
+        let mut section_data = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            if let Ok(wasmparser::Payload::CustomSection(reader)) = payload {
+                if reader.name() == "kettu-debug-resume" {
+                    section_data = reader.data().to_vec();
+                }
+            }
+        }
+
+        let json_str = String::from_utf8(section_data).expect("section should be valid UTF-8");
+        assert!(
+            json_str.contains("\"inspect\""),
+            "debug resume metadata should include the enclosing function"
+        );
+        assert!(
+            json_str.contains("\"lambda#0\""),
+            "debug resume metadata should include lambda frames"
+        );
+        assert!(
+            json_str.contains("\"name\":\"base\""),
+            "debug resume metadata should include captured bindings"
+        );
+        assert!(
+            json_str.contains("\"name\":\"n\""),
+            "debug resume metadata should include lambda parameters"
         );
     }
 
