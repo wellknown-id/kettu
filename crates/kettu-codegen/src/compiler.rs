@@ -756,6 +756,10 @@ struct ModuleCompiler<'a> {
     task_return_func_idx: Option<u32>,
     /// Index of the debugger line hook import
     debug_hook_idx: Option<u32>,
+    /// Index of the debugger pause-probe hook import
+    debug_pause_probe_idx: Option<u32>,
+    /// Index of the debugger pause hook import
+    debug_pause_idx: Option<u32>,
     /// Index of the debugger local snapshot hook import
     debug_value_hook_idx: Option<u32>,
     /// Index of the debugger frame-enter hook import
@@ -823,6 +827,8 @@ impl<'a> ModuleCompiler<'a> {
             imported_interfaces: HashMap::new(),
             task_return_func_idx: None,
             debug_hook_idx: None,
+            debug_pause_probe_idx: None,
+            debug_pause_idx: None,
             debug_value_hook_idx: None,
             debug_enter_hook_idx: None,
             debug_exit_hook_idx: None,
@@ -845,6 +851,8 @@ impl<'a> ModuleCompiler<'a> {
         };
         if options.emit_debug_hooks {
             compiler.ensure_debug_hook_import();
+            compiler.ensure_debug_pause_probe_import();
+            compiler.ensure_debug_pause_import();
             compiler.ensure_debug_value_hook_import();
             compiler.ensure_debug_enter_hook_import();
             compiler.ensure_debug_exit_hook_import();
@@ -880,6 +888,20 @@ impl<'a> ModuleCompiler<'a> {
         func_idx
     }
 
+    fn ensure_debug_pause_probe_import(&mut self) -> u32 {
+        if let Some(idx) = self.debug_pause_probe_idx {
+            return idx;
+        }
+
+        let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[ValType::I32]);
+        let func_idx = self.import_count;
+        self.import_count += 1;
+        self.functions
+            .insert("$debug_should_pause".to_string(), (type_idx, func_idx, true));
+        self.debug_pause_probe_idx = Some(func_idx);
+        func_idx
+    }
+
     fn ensure_debug_enter_hook_import(&mut self) -> u32 {
         if let Some(idx) = self.debug_enter_hook_idx {
             return idx;
@@ -891,6 +913,20 @@ impl<'a> ModuleCompiler<'a> {
         self.functions
             .insert("$debug_enter".to_string(), (type_idx, func_idx, true));
         self.debug_enter_hook_idx = Some(func_idx);
+        func_idx
+    }
+
+    fn ensure_debug_pause_import(&mut self) -> u32 {
+        if let Some(idx) = self.debug_pause_idx {
+            return idx;
+        }
+
+        let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
+        let func_idx = self.import_count;
+        self.import_count += 1;
+        self.functions
+            .insert("$debug_pause".to_string(), (type_idx, func_idx, true));
+        self.debug_pause_idx = Some(func_idx);
         func_idx
     }
 
@@ -960,6 +996,19 @@ impl<'a> ModuleCompiler<'a> {
         }
         function.instruction(&Instruction::I32Const(line as i32));
         function.instruction(&Instruction::Call(debug_hook_idx));
+
+        if let (Some(debug_pause_probe_idx), Some(debug_pause_idx)) =
+            (self.debug_pause_probe_idx, self.debug_pause_idx)
+        {
+            function.instruction(&Instruction::I32Const(line as i32));
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::Call(debug_pause_probe_idx));
+            function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            function.instruction(&Instruction::I32Const(line as i32));
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::Call(debug_pause_idx));
+            function.instruction(&Instruction::End);
+        }
     }
 
     fn emit_debug_line_hook_for_expr(&mut self, function: &mut Function, expr: &Expr) {
@@ -1675,6 +1724,14 @@ impl<'a> ModuleCompiler<'a> {
         if self.debug_hook_idx.is_some() {
             let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
             imports.import("kettu:debug", "line", EntityType::Function(type_idx));
+        }
+        if self.debug_pause_probe_idx.is_some() {
+            let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[ValType::I32]);
+            imports.import("kettu:debug", "should_pause", EntityType::Function(type_idx));
+        }
+        if self.debug_pause_idx.is_some() {
+            let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
+            imports.import("kettu:debug", "pause", EntityType::Function(type_idx));
         }
         if self.debug_value_hook_idx.is_some() {
             let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);

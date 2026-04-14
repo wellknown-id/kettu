@@ -2103,6 +2103,55 @@ fn dap_breakpoint_in_called_function_shows_stack_frame_and_locals() {
 
     write_dap_message(
         &mut stdin,
+        &json!({"type": "request", "seq": 7, "command": "stackTrace", "arguments": {"threadId": 1}}),
+    );
+    let repeated_stack = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("stackTrace"))
+        },
+        Duration::from_secs(2),
+    );
+    let repeated_frames = repeated_stack
+        .pointer("/body/stackFrames")
+        .and_then(Value::as_array)
+        .expect("repeated stack frames");
+    assert_eq!(repeated_frames[0]["id"], json!(func_frame_id));
+    assert_eq!(repeated_frames[0]["name"], frames[0]["name"]);
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 8, "command": "scopes", "arguments": {"frameId": func_frame_id}}),
+    );
+    let first_scopes = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("scopes")),
+        Duration::from_secs(2),
+    );
+    let first_locals_ref = first_scopes
+        .pointer("/body/scopes/0/variablesReference")
+        .and_then(Value::as_i64)
+        .expect("first locals variablesReference");
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 9, "command": "scopes", "arguments": {"frameId": func_frame_id}}),
+    );
+    let second_scopes = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("scopes")),
+        Duration::from_secs(2),
+    );
+    let second_locals_ref = second_scopes
+        .pointer("/body/scopes/0/variablesReference")
+        .and_then(Value::as_i64)
+        .expect("second locals variablesReference");
+    assert_eq!(first_locals_ref, locals_ref);
+    assert_eq!(second_locals_ref, locals_ref);
+
+    write_dap_message(
+        &mut stdin,
         &json!({"type": "request", "seq": 99, "command": "disconnect", "arguments": {}}),
     );
     let _disc_resp = wait_for_message(

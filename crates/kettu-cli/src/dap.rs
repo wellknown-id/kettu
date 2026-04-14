@@ -342,6 +342,8 @@ struct RuntimeTraceState {
     pending_locals: HashMap<u32, i64>,
     pending_derefs: HashMap<u32, PointerDeref>,
     active_closure_keys: Vec<i64>,
+    pause_mode: RuntimePauseMode,
+    pause_event: Option<RuntimePauseEvent>,
 }
 
 #[derive(Clone, Debug)]
@@ -352,6 +354,188 @@ struct RuntimeTraceEvent {
     locals: HashMap<u32, i64>,
     pointer_derefs: HashMap<u32, PointerDeref>,
     active_closure_keys: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PausedRuntimeSnapshot {
+    subprogram_start_line: Option<i64>,
+    locals: HashMap<u32, i64>,
+    pointer_derefs: HashMap<u32, PointerDeref>,
+    closure_keys: Vec<i64>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug)]
+struct RuntimePauseEvent {
+    line: i64,
+    column: i64,
+    reason: &'static str,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, Default)]
+enum RuntimePauseMode {
+    #[default]
+    ContinueToEnd,
+    Breakpoints(BTreeSet<BreakpointLocation>),
+}
+
+impl RuntimePauseMode {
+    fn should_pause(&self, position: &SourcePosition) -> bool {
+        match self {
+            Self::ContinueToEnd => false,
+            Self::Breakpoints(breakpoints) => breakpoints
+                .iter()
+                .any(|breakpoint| breakpoint.matches(position)),
+        }
+    }
+}
+
+struct RuntimeDebugArtifacts {
+    engine: Engine,
+    module: Module,
+}
+
+impl RuntimeDebugArtifacts {
+    fn compile(
+        program: &PathBuf,
+        source: &str,
+        ast: &kettu_parser::WitFile,
+    ) -> Result<Self, String> {
+        let wasm = compile_debug_runtime_module(program, source, ast)?;
+        let engine = Engine::default();
+        let module = Module::new(&engine, &wasm)
+            .map_err(|err| format!("Failed to load debug runtime wasm: {}", err))?;
+
+        Ok(Self { engine, module })
+    }
+
+    fn start_test(&self, test_name: &str) -> Result<RuntimeDebugSession, String> {
+        RuntimeDebugSession::start(&self.engine, &self.module, test_name)
+    }
+
+    fn collect_trace_for_test(&self, test_name: &str) -> Result<Vec<RuntimeTraceEvent>, String> {
+        let mut session = self.start_test(test_name)?;
+        session.run_to_completion()?;
+        Ok(session.events())
+    }
+}
+
+struct RuntimeDebugSession {
+    store: Store<RuntimeTraceState>,
+    instance: wasmtime::Instance,
+    export_name: String,
+}
+
+const DEBUG_PAUSE_TRAP_MESSAGE: &str = "debug pause";
+
+enum RuntimeExecutionOutcome {
+    Completed,
+    Paused(RuntimePauseEvent),
+    Fault(String),
+}
+
+impl RuntimeDebugSession {
+    fn start(engine: &Engine, module: &Module, test_name: &str) -> Result<Self, String> {
+        let mut linker = Linker::new(engine);
+        wire_runtime_debug_imports(&mut linker)?;
+
+        let mut store = Store::new(engine, RuntimeTraceState::default());
+        let instance = linker
+            .instantiate(&mut store, module)
+            .map_err(|err| format!("Failed to instantiate runtime debug module: {}", err))?;
+        let export_name = find_test_export_name(&mut store, &instance, test_name)
+            .ok_or_else(|| format!("Failed to find test export for '{}'", test_name))?;
+
+        Ok(Self {
+            store,
+            instance,
+            export_name,
+        })
+    }
+
+    fn run_to_completion(&mut self) -> Result<(), String> {
+        self.store.data_mut().pause_mode = RuntimePauseMode::ContinueToEnd;
+        self.store.data_mut().pause_event = None;
+        match self.execute_test() {
+            RuntimeExecutionOutcome::Completed => Ok(()),
+            RuntimeExecutionOutcome::Paused(pause) => Err(format!(
+                "Runtime unexpectedly paused at {}:{} while collecting trace",
+                pause.line, pause.column
+            )),
+            RuntimeExecutionOutcome::Fault(err) => Err(err),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn run_until_pause(
+        &mut self,
+        breakpoints: BTreeSet<BreakpointLocation>,
+    ) -> Result<Option<RuntimePauseEvent>, String> {
+        self.store.data_mut().pause_mode = RuntimePauseMode::Breakpoints(breakpoints);
+        self.store.data_mut().pause_event = None;
+
+        match self.execute_test() {
+            RuntimeExecutionOutcome::Completed => Ok(None),
+            RuntimeExecutionOutcome::Paused(pause) => Ok(Some(pause)),
+            RuntimeExecutionOutcome::Fault(err) => Err(err),
+        }
+    }
+
+    fn execute_test(&mut self) -> RuntimeExecutionOutcome {
+        let test_func = self
+            .instance
+            .get_func(&mut self.store, &self.export_name)
+            .ok_or_else(|| format!("Failed to load test export '{}'", self.export_name));
+
+        let test_func = match test_func {
+            Ok(test_func) => test_func,
+            Err(err) => return RuntimeExecutionOutcome::Fault(err),
+        };
+
+        let ty = test_func.ty(&self.store);
+        let mut results = vec![wasmtime::Val::I32(0); ty.results().len()];
+        match test_func.call(&mut self.store, &[], &mut results) {
+            Ok(()) => RuntimeExecutionOutcome::Completed,
+            Err(err) => self.classify_runtime_trap(err),
+        }
+    }
+
+    fn classify_runtime_trap(&self, err: wasmtime::Error) -> RuntimeExecutionOutcome {
+        let error_chain = format_runtime_error_chain(&err);
+        if self.store.data().pause_event.is_some() && error_chain.contains(DEBUG_PAUSE_TRAP_MESSAGE) {
+            return RuntimeExecutionOutcome::Paused(
+                self.store
+                    .data()
+                    .pause_event
+                    .clone()
+                    .expect("pause event checked above"),
+            );
+        }
+
+        RuntimeExecutionOutcome::Fault(format!(
+            "Failed to execute test export '{}': {}",
+            self.export_name, error_chain
+        ))
+    }
+
+    fn events(&self) -> Vec<RuntimeTraceEvent> {
+        self.store.data().events.clone()
+    }
+
+    fn latest_event(&self) -> Option<&RuntimeTraceEvent> {
+        self.store.data().events.last()
+    }
+}
+
+fn format_runtime_error_chain(err: &wasmtime::Error) -> String {
+    let mut chain = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        chain.push_str(&format!("\n  caused by: {}", cause));
+        source = cause.source();
+    }
+    chain
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -370,16 +554,15 @@ struct FrameDescriptor {
     target: FrameTarget,
 }
 
-#[derive(Clone, Debug)]
 struct ProgramState {
     source_text: String,
     source_lines: Vec<String>,
     tests: Vec<ListedTest>,
     closures: Vec<ClosureRange>,
     debug_symbols: DebugSymbols,
+    runtime_debug_artifacts: RuntimeDebugArtifacts,
 }
 
-#[derive(Clone, Debug)]
 struct DebugSession {
     program: Option<PathBuf>,
     cwd: Option<PathBuf>,
@@ -400,6 +583,10 @@ struct DebugSession {
     active_closures: Vec<ActiveClosure>,
     child_variables: HashMap<i64, Vec<Variable>>,
     next_child_variables_reference: i64,
+    runtime_debug_artifacts: Option<RuntimeDebugArtifacts>,
+    active_runtime_session: Option<RuntimeDebugSession>,
+    runtime_pause_event: Option<RuntimePauseEvent>,
+    paused_frames: Vec<FrameDescriptor>,
 }
 
 impl DebugSession {
@@ -424,12 +611,154 @@ impl DebugSession {
             active_closures: Vec::new(),
             child_variables: HashMap::new(),
             next_child_variables_reference: 1_000_000,
+            runtime_debug_artifacts: None,
+            active_runtime_session: None,
+            runtime_pause_event: None,
+            paused_frames: Vec::new(),
         }
     }
 
     fn reset_child_variables(&mut self) {
         self.child_variables.clear();
         self.next_child_variables_reference = 1_000_000;
+    }
+
+    fn reset_runtime_pause_state(&mut self) {
+        self.active_runtime_session = None;
+        self.runtime_pause_event = None;
+    }
+
+    fn clear_paused_frames(&mut self) {
+        self.paused_frames.clear();
+    }
+
+    fn capture_paused_frames(&mut self) {
+        self.paused_frames = collect_stack_frames(self);
+    }
+
+    fn current_frame_descriptors(&self) -> Vec<FrameDescriptor> {
+        if self.paused_frames.is_empty() {
+            collect_stack_frames(self)
+        } else {
+            self.paused_frames.clone()
+        }
+    }
+
+    fn start_runtime_session_for_test(&mut self, test_index: usize) -> Result<bool, String> {
+        let Some(runtime_debug_artifacts) = self.runtime_debug_artifacts.as_ref() else {
+            return Ok(false);
+        };
+        let Some(test) = self.tests.get(test_index) else {
+            return Ok(false);
+        };
+
+        let session = runtime_debug_artifacts.start_test(&test.name)?;
+        self.active_runtime_session = Some(session);
+        self.runtime_pause_event = None;
+        Ok(true)
+    }
+
+    fn run_active_runtime_until_pause(&mut self) -> Result<Option<RuntimePauseEvent>, String> {
+        let breakpoints = self.current_file_breakpoints();
+        let Some(runtime_session) = self.active_runtime_session.as_mut() else {
+            return Ok(None);
+        };
+
+        let pause = runtime_session.run_until_pause(breakpoints)?;
+        self.runtime_pause_event = pause.clone();
+        if let Some(pause) = &self.runtime_pause_event {
+            self.current_line = pause.line;
+            self.current_column = pause.column;
+        }
+        Ok(pause)
+    }
+
+    fn current_file_breakpoints(&self) -> BTreeSet<BreakpointLocation> {
+        let Some(file) = self.current_file_key() else {
+            return BTreeSet::new();
+        };
+        self.breakpoints.get(&file).cloned().unwrap_or_default()
+    }
+
+    fn current_file_has_column_breakpoints(&self) -> bool {
+        self.current_file_breakpoints()
+            .iter()
+            .any(|breakpoint| breakpoint.column.is_some())
+    }
+
+    fn can_continue_with_runtime(&self) -> bool {
+        self.tests
+            .get(self.current_test)
+            .map(|test| {
+                self.current_trace_index.is_none()
+                    && self.current_line < test.line
+                    && !self.current_file_has_column_breakpoints()
+            })
+            .unwrap_or(false)
+    }
+
+    fn sync_trace_cursor_to_current_position(&mut self) {
+        let best_match = self.tests.get(self.current_test).and_then(|test| {
+            test.trace
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.line == self.current_line)
+                .min_by_key(|(_, entry)| ((entry.column - self.current_column).abs(), entry.column))
+                .map(|(index, entry)| (index, entry.column))
+        });
+
+        if let Some((index, column)) = best_match {
+            self.current_trace_index = Some(index);
+            self.current_column = column;
+        } else {
+            self.current_trace_index = None;
+        }
+
+        self.sync_active_closures_with_current_line();
+    }
+
+    fn run_live_runtime_until_breakpoint_or_end(&mut self) -> Option<StopOutcome> {
+        if !self.can_continue_with_runtime() {
+            return None;
+        }
+
+        loop {
+            if self.current_test >= self.tests.len() {
+                return Some(StopOutcome::Terminated);
+            }
+
+            if self.active_runtime_session.is_none() {
+                match self.start_runtime_session_for_test(self.current_test) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => {
+                        self.reset_runtime_pause_state();
+                        return None;
+                    }
+                }
+            }
+
+            match self.run_active_runtime_until_pause() {
+                Ok(Some(_pause)) => {
+                    self.sync_trace_cursor_to_current_position();
+                    return Some(StopOutcome::Stopped("breakpoint"));
+                }
+                Ok(None) => {
+                    self.reset_runtime_pause_state();
+                    self.current_trace_index = None;
+                    self.active_closures.clear();
+                    self.current_test += 1;
+                    if self.current_test >= self.tests.len() {
+                        return Some(StopOutcome::Terminated);
+                    }
+                    self.current_line = self.tests[self.current_test].line - 1;
+                    self.current_column = 1;
+                }
+                Err(_) => {
+                    self.reset_runtime_pause_state();
+                    return None;
+                }
+            }
+        }
     }
 
     fn allocate_child_variables_reference(&mut self, vars: Vec<Variable>) -> i64 {
@@ -545,8 +874,8 @@ impl DebugSession {
     fn active_closure_indices(&self) -> Vec<usize> {
         let mut indices = Vec::new();
 
-        if let Some(entry) = current_trace_event(self) {
-            for closure_key in &entry.runtime_closure_keys {
+        if let Some(snapshot) = paused_runtime_snapshot(self) {
+            for closure_key in &snapshot.closure_keys {
                 if let Some(index) = self
                     .closures
                     .iter()
@@ -869,6 +1198,7 @@ pub fn run_server() -> io::Result<()> {
                         session.tests = program_state.tests;
                         session.closures = program_state.closures;
                         session.debug_symbols = program_state.debug_symbols;
+                        session.runtime_debug_artifacts = Some(program_state.runtime_debug_artifacts);
                         session.stop_on_entry = stop_on_entry;
                         session.enable_evaluate = enable_evaluate;
                         session.configured = false;
@@ -880,6 +1210,8 @@ pub fn run_server() -> io::Result<()> {
                         session.current_column = 1;
                         session.active_closures.clear();
                         session.reset_child_variables();
+                        session.reset_runtime_pause_state();
+                        session.clear_paused_frames();
 
                         send_response(&mut writer, seq, command, true, Some(json!({})), None)?;
                         send_event(&mut writer, "initialized", Some(json!({})))?;
@@ -940,19 +1272,31 @@ pub fn run_server() -> io::Result<()> {
                 }
 
                 if session.stop_on_entry {
+                    session.clear_paused_frames();
                     if session.advance_one_line() {
+                        session.capture_paused_frames();
                         send_stopped_event(&mut writer, "entry")?;
                     } else {
                         session.terminated = true;
+                        session.clear_paused_frames();
                         send_event(&mut writer, "terminated", Some(json!({})))?;
                     }
                 } else {
-                    match session.run_until_breakpoint_or_end() {
+                    session.clear_paused_frames();
+                    let outcome = if let Some(outcome) = session.run_live_runtime_until_breakpoint_or_end() {
+                        outcome
+                    } else {
+                        session.reset_runtime_pause_state();
+                        session.run_until_breakpoint_or_end()
+                    };
+                    match outcome {
                         StopOutcome::Stopped(reason) => {
+                            session.capture_paused_frames();
                             send_stopped_event(&mut writer, reason)?;
                         }
                         StopOutcome::Terminated => {
                             session.terminated = true;
+                            session.clear_paused_frames();
                             send_event(&mut writer, "terminated", Some(json!({})))?;
                         }
                     }
@@ -1082,11 +1426,22 @@ pub fn run_server() -> io::Result<()> {
                 }
 
                 session.reset_child_variables();
+                session.clear_paused_frames();
 
-                match session.run_until_breakpoint_or_end() {
-                    StopOutcome::Stopped(reason) => send_stopped_event(&mut writer, reason)?,
+                let outcome = if let Some(outcome) = session.run_live_runtime_until_breakpoint_or_end() {
+                    outcome
+                } else {
+                    session.reset_runtime_pause_state();
+                    session.run_until_breakpoint_or_end()
+                };
+                match outcome {
+                    StopOutcome::Stopped(reason) => {
+                        session.capture_paused_frames();
+                        send_stopped_event(&mut writer, reason)?
+                    }
                     StopOutcome::Terminated => {
                         session.terminated = true;
+                        session.clear_paused_frames();
                         send_event(&mut writer, "terminated", Some(json!({})))?;
                     }
                 }
@@ -1099,11 +1454,17 @@ pub fn run_server() -> io::Result<()> {
                 }
 
                 session.reset_child_variables();
+                session.reset_runtime_pause_state();
+                session.clear_paused_frames();
 
                 match session.step_once_or_end(command) {
-                    StopOutcome::Stopped(reason) => send_stopped_event(&mut writer, reason)?,
+                    StopOutcome::Stopped(reason) => {
+                        session.capture_paused_frames();
+                        send_stopped_event(&mut writer, reason)?
+                    }
                     StopOutcome::Terminated => {
                         session.terminated = true;
+                        session.clear_paused_frames();
                         send_event(&mut writer, "terminated", Some(json!({})))?;
                     }
                 }
@@ -1111,11 +1472,13 @@ pub fn run_server() -> io::Result<()> {
             "pause" => {
                 send_response(&mut writer, seq, command, true, Some(json!({})), None)?;
                 if !session.terminated {
+                    session.capture_paused_frames();
                     send_stopped_event(&mut writer, "pause")?;
                 }
             }
             "disconnect" => {
                 session.terminated = true;
+                session.clear_paused_frames();
                 send_response(&mut writer, seq, command, true, Some(json!({})), None)?;
                 send_event(&mut writer, "terminated", Some(json!({})))?;
                 break;
@@ -1166,7 +1529,8 @@ fn load_program_state(program: Option<PathBuf>) -> Result<ProgramState, String> 
     let debug_symbols = build_debug_symbols(&program, &source, &ast)?;
     apply_debug_symbols(&mut tests, &mut closures, &debug_symbols);
     build_test_traces(&mut tests, &closures, &source);
-    build_runtime_test_traces(&program, &source, &ast, &mut tests)?;
+    let runtime_debug_artifacts = RuntimeDebugArtifacts::compile(&program, &source, &ast)?;
+    build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)?;
 
     Ok(ProgramState {
         source_text: source.clone(),
@@ -1174,23 +1538,17 @@ fn load_program_state(program: Option<PathBuf>) -> Result<ProgramState, String> 
         tests,
         closures,
         debug_symbols,
+        runtime_debug_artifacts,
     })
 }
 
 fn build_runtime_test_traces(
-    program: &PathBuf,
-    source: &str,
-    ast: &kettu_parser::WitFile,
+    runtime_debug_artifacts: &RuntimeDebugArtifacts,
     tests: &mut [ListedTest],
 ) -> Result<(), String> {
-    let wasm = compile_debug_runtime_module(program, source, ast)?;
-    let engine = Engine::default();
-    let module = Module::new(&engine, &wasm)
-        .map_err(|err| format!("Failed to load debug runtime wasm: {}", err))?;
-
     for test in tests {
         let simulated_trace = std::mem::take(&mut test.trace);
-        let actual_events = run_test_with_runtime_trace(&engine, &module, &test.name)?;
+        let actual_events = runtime_debug_artifacts.collect_trace_for_test(&test.name)?;
         if actual_events.is_empty() {
             test.trace = simulated_trace;
             continue;
@@ -1204,6 +1562,169 @@ fn build_runtime_test_traces(
         }
         test.trace = merge_runtime_trace(actual_events, &simulated_trace);
     }
+
+    Ok(())
+}
+
+fn wire_runtime_debug_imports(linker: &mut Linker<RuntimeTraceState>) -> Result<(), String> {
+    linker
+        .func_wrap(
+            "kettu:debug",
+            "line",
+            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>,
+             subprogram_start_line: i32,
+             line: i32| {
+                if line > 0 {
+                    let state = caller.data_mut();
+                    state.events.push(RuntimeTraceEvent {
+                        line: line as i64,
+                        column: 1,
+                        subprogram_start_line: (subprogram_start_line > 0)
+                            .then_some(subprogram_start_line as i64),
+                        locals: std::mem::take(&mut state.pending_locals),
+                        pointer_derefs: std::mem::take(&mut state.pending_derefs),
+                        active_closure_keys: state.active_closure_keys.clone(),
+                    });
+                }
+            },
+        )
+        .map_err(|err| format!("Failed to wire debug line hook: {}", err))?;
+    linker
+        .func_wrap(
+            "kettu:debug",
+            "should_pause",
+            |caller: wasmtime::Caller<'_, RuntimeTraceState>, line: i32, column: i32| -> i32 {
+                if line <= 0 {
+                    return 0;
+                }
+
+                let position = SourcePosition::new(line as i64, column as i64);
+                let state = caller.data();
+                if state.pause_event.is_some() {
+                    return 0;
+                }
+                if state.pause_mode.should_pause(&position) {
+                    1
+                } else {
+                    0
+                }
+            },
+        )
+        .map_err(|err| format!("Failed to wire debug should_pause hook: {}", err))?;
+    linker
+        .func_wrap(
+            "kettu:debug",
+            "pause",
+            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>,
+             line: i32,
+             column: i32|
+             -> Result<(), wasmtime::Error> {
+                if line > 0 {
+                    let position = SourcePosition::new(line as i64, column as i64);
+                    let state = caller.data_mut();
+                    state.pause_event = Some(RuntimePauseEvent {
+                        line: position.line,
+                        column: position.column,
+                        reason: "breakpoint",
+                    });
+                }
+                Err(wasmtime::Error::msg(DEBUG_PAUSE_TRAP_MESSAGE))
+            },
+        )
+        .map_err(|err| format!("Failed to wire debug pause hook: {}", err))?;
+    linker
+        .func_wrap(
+            "kettu:debug",
+            "local",
+            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>, local_index: i32, value: i32| {
+                if local_index < 0 {
+                    return;
+                }
+                let deref = if value > 0 {
+                    caller
+                        .get_export("memory")
+                        .and_then(|e| e.into_memory())
+                        .and_then(|memory| {
+                            let ptr = value as usize;
+                            if ptr + 8 > memory.data_size(&caller) {
+                                return None;
+                            }
+                            let data = memory.data(&caller);
+                            let disc =
+                                i32::from_le_bytes(data[ptr..ptr + 4].try_into().unwrap_or([0; 4]));
+                            let payload = i32::from_le_bytes(
+                                data[ptr + 4..ptr + 8].try_into().unwrap_or([0; 4]),
+                            );
+
+                            let err_disc = variant_discriminant("err");
+                            let err_string = if disc == err_disc && payload > 0 {
+                                let str_ptr = payload as usize;
+                                let len_ptr = str_ptr.saturating_sub(4);
+                                if len_ptr + 4 <= data.len() {
+                                    let str_len = u32::from_le_bytes(
+                                        data[len_ptr..len_ptr + 4].try_into().unwrap_or([0; 4]),
+                                    ) as usize;
+                                    if str_ptr + str_len <= data.len() {
+                                        Some(
+                                            std::str::from_utf8(&data[str_ptr..str_ptr + str_len])
+                                                .unwrap_or("<invalid utf8>")
+                                                .to_string(),
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            Some(PointerDeref {
+                                discriminant: disc,
+                                payload,
+                                err_string,
+                            })
+                        })
+                } else {
+                    None
+                };
+                let state = caller.data_mut();
+                state.pending_locals.insert(local_index as u32, value as i64);
+                if let Some(d) = deref {
+                    state.pending_derefs.insert(local_index as u32, d);
+                }
+            },
+        )
+        .map_err(|err| format!("Failed to wire debug local hook: {}", err))?;
+    linker
+        .func_wrap(
+            "kettu:debug",
+            "enter",
+            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>, closure_key: i32| {
+                caller.data_mut().active_closure_keys.push(closure_key as i64);
+            },
+        )
+        .map_err(|err| format!("Failed to wire debug enter hook: {}", err))?;
+    linker
+        .func_wrap(
+            "kettu:debug",
+            "exit",
+            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>, closure_key: i32| {
+                let closure_key = closure_key as i64;
+                let active = &mut caller.data_mut().active_closure_keys;
+                if active.last().copied() == Some(closure_key) {
+                    active.pop();
+                } else if let Some(index) = active.iter().rposition(|key| *key == closure_key) {
+                    active.remove(index);
+                }
+            },
+        )
+        .map_err(|err| format!("Failed to wire debug exit hook: {}", err))?;
+
+    linker
+        .func_wrap("kettu:contract", "fail", |_ptr: i32, _len: i32| -> () {})
+        .map_err(|err| format!("Failed to wire kettu:contract/fail: {}", err))?;
 
     Ok(())
 }
@@ -1266,149 +1787,6 @@ fn compile_debug_runtime_module(
     }
 }
 
-fn run_test_with_runtime_trace(
-    engine: &Engine,
-    module: &Module,
-    test_name: &str,
-) -> Result<Vec<RuntimeTraceEvent>, String> {
-    let mut linker = Linker::new(engine);
-    linker
-        .func_wrap(
-            "kettu:debug",
-            "line",
-            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>,
-             subprogram_start_line: i32,
-             line: i32| {
-                if line > 0 {
-                    let state = caller.data_mut();
-                    state.events.push(RuntimeTraceEvent {
-                        line: line as i64,
-                        column: 1,
-                        subprogram_start_line: (subprogram_start_line > 0)
-                            .then_some(subprogram_start_line as i64),
-                        locals: std::mem::take(&mut state.pending_locals),
-                        pointer_derefs: std::mem::take(&mut state.pending_derefs),
-                        active_closure_keys: state.active_closure_keys.clone(),
-                    });
-                }
-            },
-        )
-        .map_err(|err| format!("Failed to wire debug line hook: {}", err))?;
-    linker
-        .func_wrap(
-            "kettu:debug",
-            "local",
-            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>, local_index: i32, value: i32| {
-                if local_index < 0 {
-                    return;
-                }
-                let deref = if value > 0 {
-                    caller
-                        .get_export("memory")
-                        .and_then(|e| e.into_memory())
-                        .and_then(|memory| {
-                            let ptr = value as usize;
-                            if ptr + 8 > memory.data_size(&caller) {
-                                return None;
-                            }
-                            let data = memory.data(&caller);
-                            let disc =
-                                i32::from_le_bytes(data[ptr..ptr + 4].try_into().unwrap_or([0; 4]));
-                            let payload = i32::from_le_bytes(
-                                data[ptr + 4..ptr + 8].try_into().unwrap_or([0; 4]),
-                            );
-
-                            let err_disc = variant_discriminant("err");
-                            let err_string = if disc == err_disc && payload > 0 {
-                                let str_ptr = payload as usize;
-                                let len_ptr = str_ptr.saturating_sub(4);
-                                if len_ptr + 4 <= data.len() {
-                                    let str_len = u32::from_le_bytes(
-                                        data[len_ptr..len_ptr + 4].try_into().unwrap_or([0; 4]),
-                                    ) as usize;
-                                    if str_ptr + str_len <= data.len() {
-                                        Some(
-                                            std::str::from_utf8(&data[str_ptr..str_ptr + str_len])
-                                                .unwrap_or("<invalid utf8>")
-                                                .to_string(),
-                                        )
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-
-                            Some(PointerDeref {
-                                discriminant: disc,
-                                payload,
-                                err_string,
-                            })
-                        })
-                } else {
-                    None
-                };
-                let state = caller.data_mut();
-                state
-                    .pending_locals
-                    .insert(local_index as u32, value as i64);
-                if let Some(d) = deref {
-                    state.pending_derefs.insert(local_index as u32, d);
-                }
-            },
-        )
-        .map_err(|err| format!("Failed to wire debug local hook: {}", err))?;
-    linker
-        .func_wrap(
-            "kettu:debug",
-            "enter",
-            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>, closure_key: i32| {
-                caller
-                    .data_mut()
-                    .active_closure_keys
-                    .push(closure_key as i64);
-            },
-        )
-        .map_err(|err| format!("Failed to wire debug enter hook: {}", err))?;
-    linker
-        .func_wrap(
-            "kettu:debug",
-            "exit",
-            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>, closure_key: i32| {
-                let closure_key = closure_key as i64;
-                let active = &mut caller.data_mut().active_closure_keys;
-                if active.last().copied() == Some(closure_key) {
-                    active.pop();
-                } else if let Some(index) = active.iter().rposition(|key| *key == closure_key) {
-                    active.remove(index);
-                }
-            },
-        )
-        .map_err(|err| format!("Failed to wire debug exit hook: {}", err))?;
-
-    linker
-        .func_wrap("kettu:contract", "fail", |_ptr: i32, _len: i32| -> () {})
-        .map_err(|err| format!("Failed to wire kettu:contract/fail: {}", err))?;
-
-    let mut store = Store::new(engine, RuntimeTraceState::default());
-    let instance = linker
-        .instantiate(&mut store, module)
-        .map_err(|err| format!("Failed to instantiate runtime debug module: {}", err))?;
-    let export_name = find_test_export_name(&mut store, &instance, test_name)
-        .ok_or_else(|| format!("Failed to find test export for '{}'", test_name))?;
-    let test_func = instance
-        .get_func(&mut store, &export_name)
-        .ok_or_else(|| format!("Failed to load test export '{}'", export_name))?;
-
-    let ty = test_func.ty(&store);
-    let mut results = vec![wasmtime::Val::I32(0); ty.results().len()];
-    let _ = test_func.call(&mut store, &[], &mut results);
-    Ok(store.data().events.clone())
-}
-
 fn find_test_export_name(
     store: &mut Store<RuntimeTraceState>,
     instance: &wasmtime::Instance,
@@ -1464,7 +1842,8 @@ fn build_stack_frames(session: &DebugSession) -> Vec<Value> {
         return vec![];
     };
 
-    collect_stack_frames(session)
+    session
+        .current_frame_descriptors()
         .into_iter()
         .map(|frame| {
             json!({
@@ -1501,8 +1880,8 @@ fn collect_stack_frames(session: &DebugSession) -> Vec<FrameDescriptor> {
         .map(|t| t.name.clone())
         .unwrap_or_default();
 
-    if let Some(entry) = current_trace_event(session) {
-        if let Some(sub_start) = entry.runtime_subprogram_start_line {
+    if let Some(snapshot) = paused_runtime_snapshot(session) {
+        if let Some(sub_start) = snapshot.subprogram_start_line {
             if let Some(func_idx) = session.debug_symbols.subprograms.iter().position(|sp| {
                 if sp.name.starts_with("lambda#") {
                     return false;
@@ -1543,7 +1922,8 @@ fn collect_stack_frames(session: &DebugSession) -> Vec<FrameDescriptor> {
 }
 
 fn resolve_frame_target(session: &DebugSession, frame_id: i64) -> Option<FrameTarget> {
-    collect_stack_frames(session)
+    session
+        .current_frame_descriptors()
         .into_iter()
         .find(|frame| frame.id == frame_id)
         .map(|frame| frame.target)
@@ -2451,6 +2831,30 @@ fn current_trace_event(session: &DebugSession) -> Option<&TraceEvent> {
     test.trace.get(index)
 }
 
+fn paused_runtime_snapshot(session: &DebugSession) -> Option<PausedRuntimeSnapshot> {
+    if session.runtime_pause_event.is_some() {
+        if let Some(event) = session
+            .active_runtime_session
+            .as_ref()
+            .and_then(RuntimeDebugSession::latest_event)
+        {
+            return Some(PausedRuntimeSnapshot {
+                subprogram_start_line: event.subprogram_start_line,
+                locals: event.locals.clone(),
+                pointer_derefs: event.pointer_derefs.clone(),
+                closure_keys: event.active_closure_keys.clone(),
+            });
+        }
+    }
+
+    current_trace_event(session).map(|entry| PausedRuntimeSnapshot {
+        subprogram_start_line: entry.runtime_subprogram_start_line,
+        locals: entry.runtime_locals.clone(),
+        pointer_derefs: entry.runtime_pointer_derefs.clone(),
+        closure_keys: entry.runtime_closure_keys.clone(),
+    })
+}
+
 fn binding_visible_at_line(
     binding: &DwarfBinding,
     line: i64,
@@ -2492,8 +2896,8 @@ fn runtime_binding_values_for_target(
     fallback_values: &HashMap<String, SimpleValue>,
 ) -> Option<HashMap<String, SimpleValue>> {
     let subprogram = resolve_dwarf_subprogram(session, target)?;
-    let entry = current_trace_event(session)?;
-    if entry.runtime_subprogram_start_line != Some(subprogram.start_line) {
+    let snapshot = paused_runtime_snapshot(session)?;
+    if snapshot.subprogram_start_line != Some(subprogram.start_line) {
         return None;
     }
 
@@ -2503,9 +2907,9 @@ fn runtime_binding_values_for_target(
             .iter()
             .filter_map(|binding| {
                 let local_index = binding.local_index?;
-                let raw = entry.runtime_locals.get(&local_index)?;
+                let raw = snapshot.locals.get(&local_index)?;
                 let fallback_value = fallback_values.get(&binding.name);
-                let simple = if let Some(deref) = entry.runtime_pointer_derefs.get(&local_index) {
+                let simple = if let Some(deref) = snapshot.pointer_derefs.get(&local_index) {
                     let ok_disc = variant_discriminant("ok");
                     let err_disc = variant_discriminant("err");
                     let some_disc = variant_discriminant("some");
@@ -3825,11 +4229,11 @@ fn test_environment_for_line(session: &DebugSession, line: i64) -> HashMap<Strin
         return HashMap::new();
     };
 
-    let overlay_runtime_locals = |mut env: HashMap<String, SimpleValue>, entry: &TraceEvent| {
+    let overlay_runtime_locals = |mut env: HashMap<String, SimpleValue>, snapshot: &PausedRuntimeSnapshot| {
         let Some(subprogram) = resolve_dwarf_subprogram(session, FrameTarget::Test) else {
             return env;
         };
-        if entry.runtime_subprogram_start_line != Some(subprogram.start_line) {
+        if snapshot.subprogram_start_line != Some(subprogram.start_line) {
             return env;
         }
         for binding in subprogram
@@ -3840,7 +4244,7 @@ fn test_environment_for_line(session: &DebugSession, line: i64) -> HashMap<Strin
             let Some(local_index) = binding.local_index else {
                 continue;
             };
-            let Some(raw) = entry.runtime_locals.get(&local_index) else {
+            let Some(raw) = snapshot.locals.get(&local_index) else {
                 continue;
             };
             env.insert(
@@ -3851,17 +4255,40 @@ fn test_environment_for_line(session: &DebugSession, line: i64) -> HashMap<Strin
         env
     };
 
+    if line == session.current_line {
+        if let Some(snapshot) = paused_runtime_snapshot(session) {
+            let base_env = current_trace_event(session)
+                .map(|entry| entry.env_before.clone())
+                .unwrap_or_else(|| {
+                    infer_values_in_range(&session.source_lines, test.line, line, &HashMap::new())
+                });
+            return overlay_runtime_locals(base_env, &snapshot);
+        }
+    }
+
     if !test.trace.is_empty() {
         if line == session.current_line {
             if let Some(index) = session.current_trace_index {
                 if let Some(entry) = test.trace.get(index) {
-                    return overlay_runtime_locals(entry.env_before.clone(), entry);
+                    let snapshot = PausedRuntimeSnapshot {
+                        subprogram_start_line: entry.runtime_subprogram_start_line,
+                        locals: entry.runtime_locals.clone(),
+                        pointer_derefs: entry.runtime_pointer_derefs.clone(),
+                        closure_keys: entry.runtime_closure_keys.clone(),
+                    };
+                    return overlay_runtime_locals(entry.env_before.clone(), &snapshot);
                 }
             }
         }
 
         if let Some(entry) = test.trace.iter().find(|entry| entry.line == line) {
-            return overlay_runtime_locals(entry.env_before.clone(), entry);
+            let snapshot = PausedRuntimeSnapshot {
+                subprogram_start_line: entry.runtime_subprogram_start_line,
+                locals: entry.runtime_locals.clone(),
+                pointer_derefs: entry.runtime_pointer_derefs.clone(),
+                closure_keys: entry.runtime_closure_keys.clone(),
+            };
+            return overlay_runtime_locals(entry.env_before.clone(), &snapshot);
         }
     }
 
@@ -4696,7 +5123,7 @@ mod tests {
     };
     use kettu_codegen::CompileOptions;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
 
     #[test]
@@ -5056,5 +5483,423 @@ interface math {
                 && binding.decl_line == 4
                 && binding.local_index == Some(2)
         }));
+    }
+
+    #[test]
+    fn runtime_debug_artifacts_collect_trace_for_test() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let x = 1;
+        let y = x + 2;
+        return y == 3;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_test.kettu");
+
+        let artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+        let events = artifacts
+            .collect_trace_for_test("t")
+            .expect("collect runtime trace");
+
+        assert!(!events.is_empty(), "expected runtime trace events");
+        assert!(events.iter().any(|event| event.line >= 5));
+    }
+
+    #[test]
+    fn runtime_debug_session_pauses_at_breakpoint() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let x = 1;
+        let y = x + 2;
+        return y == 3;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_pause_test.kettu");
+
+        let artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+        let mut session = artifacts.start_test("t").expect("start runtime session");
+        let breakpoints = BTreeSet::from([super::BreakpointLocation::new(5, None)]);
+
+        let pause = session
+            .run_until_pause(breakpoints)
+            .expect("run until pause")
+            .expect("pause event");
+
+        assert_eq!(pause.reason, "breakpoint");
+        assert_eq!(pause.line, 5);
+        assert_eq!(pause.column, 1);
+        assert!(session.events().iter().any(|event| event.line == 5));
+    }
+
+    #[test]
+    fn runtime_debug_session_surfaces_real_runtime_faults() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let x = 1;
+        let y = x / 0;
+        return y == 3;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_fault_test.kettu");
+
+        let artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+        let mut session = artifacts.start_test("t").expect("start runtime session");
+
+        let error = session
+            .run_until_pause(BTreeSet::new())
+            .expect_err("expected runtime fault");
+
+        assert!(error.contains("Failed to execute test export"));
+        assert!(session.store.data().pause_event.is_none());
+    }
+
+    #[test]
+    fn debug_session_owns_runtime_pause_state() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let x = 1;
+        let y = x + 2;
+        return y == 3;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_session_owner_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.tests = vec![ListedTest {
+            name: "t".into(),
+            line: 4,
+            end_line: 8,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session
+            .breakpoints
+            .insert(super::normalize_path_key(&program.display().to_string()), BTreeSet::from([
+                super::BreakpointLocation::new(5, None),
+            ]));
+
+        assert!(session.start_runtime_session_for_test(0).expect("start runtime session"));
+        let pause = session
+            .run_active_runtime_until_pause()
+            .expect("run active runtime until pause")
+            .expect("pause event");
+
+        assert_eq!(pause.line, 5);
+        assert_eq!(session.current_line, 5);
+        assert_eq!(session.current_column, 1);
+        assert!(session.active_runtime_session.is_some());
+        assert!(session.runtime_pause_event.is_some());
+    }
+
+    #[test]
+    fn runtime_continue_syncs_trace_cursor_on_pause() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let x = 1;
+        let y = x + 2;
+        return y == 3;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_continue_sync_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 4,
+            end_line: 8,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.tests = tests;
+        session.current_line = 3;
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session
+            .breakpoints
+            .insert(super::normalize_path_key(&program.display().to_string()), BTreeSet::from([
+                super::BreakpointLocation::new(6, None),
+            ]));
+
+        let outcome = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("runtime-backed continue outcome");
+
+        match outcome {
+            super::StopOutcome::Stopped(reason) => assert_eq!(reason, "breakpoint"),
+            super::StopOutcome::Terminated => panic!("expected breakpoint stop"),
+        }
+
+        assert_eq!(session.current_line, 6);
+        assert!(session.current_trace_index.is_some());
+        assert!(session.active_runtime_session.is_some());
+        assert!(session.runtime_pause_event.is_some());
+    }
+
+    #[test]
+    fn synthetic_step_discards_live_runtime_session() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let x = 1;
+        let y = x + 2;
+        return y == 3;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_step_boundary_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 4,
+            end_line: 8,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.tests = tests;
+        session.current_line = 3;
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session
+            .breakpoints
+            .insert(super::normalize_path_key(&program.display().to_string()), BTreeSet::from([
+                super::BreakpointLocation::new(5, None),
+            ]));
+
+        let outcome = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("runtime-backed continue outcome");
+        assert!(matches!(outcome, super::StopOutcome::Stopped("breakpoint")));
+        assert!(session.active_runtime_session.is_some());
+
+        session.reset_runtime_pause_state();
+        let step_outcome = session.step_once_or_end("next");
+
+        assert!(matches!(step_outcome, super::StopOutcome::Stopped("step")));
+        assert!(session.active_runtime_session.is_none());
+        assert!(!session.can_continue_with_runtime());
+    }
+
+    #[test]
+    fn paused_runtime_snapshot_survives_without_trace_cursor() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let x = 1;
+        let y = x + 2;
+        return y == 3;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_snapshot_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 4,
+            end_line: 8,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.tests = tests;
+        session.current_line = 3;
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session
+            .breakpoints
+            .insert(super::normalize_path_key(&program.display().to_string()), BTreeSet::from([
+                super::BreakpointLocation::new(5, None),
+            ]));
+
+        let outcome = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("runtime-backed continue outcome");
+        assert!(matches!(outcome, super::StopOutcome::Stopped("breakpoint")));
+
+        session.current_trace_index = None;
+        let snapshot = super::paused_runtime_snapshot(&session).expect("paused runtime snapshot");
+
+        assert!(!snapshot.locals.is_empty());
+    }
+
+    #[test]
+    fn paused_runtime_snapshot_keeps_function_frame_without_trace_cursor() {
+        let source = r#"package local:test;
+interface tests {
+    helper: func(a: s32) -> s32 {
+        let inc = a + 1;
+        return inc;
+    }
+
+    @test
+    t: func() -> bool {
+        let value = helper(2);
+        return value == 3;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_function_frame_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+        let debug_symbols = super::build_debug_symbols(&program, source, &ast)
+            .expect("build debug symbols");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 8,
+            end_line: 11,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.source_lines = source.lines().map(str::to_string).collect();
+        session.tests = tests;
+        session.closures = super::parse_closures(&session.source_lines);
+        session.debug_symbols = debug_symbols;
+        session.current_line = 7;
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session
+            .breakpoints
+            .insert(super::normalize_path_key(&program.display().to_string()), BTreeSet::from([
+                super::BreakpointLocation::new(4, None),
+            ]));
+
+        let outcome = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("runtime-backed continue outcome");
+        assert!(matches!(outcome, super::StopOutcome::Stopped("breakpoint")));
+
+        session.current_trace_index = None;
+        let frames = super::build_stack_frames(&session);
+
+        assert!(frames.iter().any(|frame| {
+            frame["name"]
+                .as_str()
+                .map(|name| name == "helper" || name.ends_with("#helper"))
+                .unwrap_or(false)
+        }));
+        assert!(frames.iter().any(|frame| frame["name"] == json!("@test t")));
+    }
+
+    #[test]
+    fn paused_frame_snapshot_keeps_frame_ids_stable() {
+        let lines = vec![
+            "package local:test;".to_string(),
+            "interface tests {".to_string(),
+            "    @test".to_string(),
+            "    t: func() -> bool {".to_string(),
+            "        let y = |n|".to_string(),
+            "            n + 1;".to_string(),
+            "        let total = y(2);".to_string(),
+            "        return total > 0;".to_string(),
+            "    }".to_string(),
+            "}".to_string(),
+        ];
+
+        let closures = parse_closures(&lines);
+        let mut session = DebugSession::new();
+        session.program = Some(PathBuf::from("/tmp/frame_snapshot_test.kettu"));
+        session.source_lines = lines;
+        session.tests = vec![ListedTest {
+            name: "t".into(),
+            line: 4,
+            end_line: 10,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        session.current_line = 6;
+        session.current_column = 1;
+        session.closures = closures;
+        session.capture_paused_frames();
+
+        let first_frames = session.current_frame_descriptors();
+        assert!(matches!(
+            first_frames.first().map(|frame| frame.target),
+            Some(super::FrameTarget::Closure(_))
+        ));
+        let first_frame_id = first_frames[0].id;
+
+        session.current_line = 8;
+        session.active_closures.clear();
+
+        let second_frames = session.current_frame_descriptors();
+        assert_eq!(second_frames[0].id, first_frame_id);
+        assert_eq!(second_frames[0].name, first_frames[0].name);
+        assert!(matches!(
+            super::resolve_frame_target(&session, first_frame_id),
+            Some(super::FrameTarget::Closure(_))
+        ));
+
+        session.clear_paused_frames();
+        let rebuilt_frames = session.current_frame_descriptors();
+        assert_eq!(rebuilt_frames.len(), 1);
+        assert_eq!(rebuilt_frames[0].name, "@test t");
     }
 }
