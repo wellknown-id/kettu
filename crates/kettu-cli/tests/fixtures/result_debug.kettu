@@ -1,0 +1,13 @@
+package local:result-debug;
+
+interface tests {
+    @test
+    test-result-display: func() -> bool {
+        let r = ok(10);
+        return true;
+    }
+}
+
+world tests {
+    export tests;
+}

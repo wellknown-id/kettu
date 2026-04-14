@@ -1,0 +1,9 @@
+package local:same-line-closure-debug;
+
+interface tests {
+    @test
+    same-line-closure-selection: func() -> bool {
+        let inc = map([1, 2], |x| x + 1); let big = filter(inc, |y| y > 1);
+        return list-len(big) == 2;
+    }
+}

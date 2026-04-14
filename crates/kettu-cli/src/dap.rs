@@ -1,12 +1,50 @@
 use gimli::{self, constants, DwarfSections, EndianSlice, LittleEndian, Reader};
 use serde_json::{json, Value};
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use wasmparser::{Parser, Payload};
 use wasmtime::{Engine, Linker, Module, Store};
+
+#[derive(Clone, Debug)]
+struct SourcePosition {
+    line: i64,
+    column: i64,
+}
+
+impl SourcePosition {
+    fn new(line: i64, column: i64) -> Self {
+        Self {
+            line: line.max(1),
+            column: column.max(1),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BreakpointLocation {
+    line: i64,
+    column: Option<i64>,
+}
+
+impl BreakpointLocation {
+    fn new(line: i64, column: Option<i64>) -> Self {
+        Self {
+            line: line.max(1),
+            column: column.map(|value| value.max(1)),
+        }
+    }
+
+    fn matches(&self, position: &SourcePosition) -> bool {
+        self.line == position.line
+            && self
+                .column
+                .map(|column| column == position.column)
+                .unwrap_or(true)
+    }
+}
 
 #[derive(Clone, Debug)]
 struct ListedTest {
@@ -22,11 +60,14 @@ struct Variable {
     name: String,
     value: String,
     var_type: String,
+    variables_reference: i64,
+    raw_value: SimpleValue,
 }
 
 #[derive(Clone, Debug)]
 struct TraceEvent {
     line: i64,
+    column: i64,
     env_before: HashMap<String, SimpleValue>,
     runtime_subprogram_start_line: Option<i64>,
     runtime_locals: HashMap<u32, i64>,
@@ -38,6 +79,7 @@ struct TraceEvent {
 struct ClosureRange {
     debug_key: i64,
     start_line: i64,
+    start_column: i64,
     end_line: i64,
     name: String,
     params: Vec<String>,
@@ -52,9 +94,12 @@ enum SimpleValue {
     Int(i64),
     Float(f64),
     String(String),
+    List(Vec<SimpleValue>),
+    Record(BTreeMap<String, SimpleValue>),
     Result {
         discriminant: i32,
         payload: i32,
+        payload_value: Option<Box<SimpleValue>>,
         err_message: Option<String>,
     },
     Unknown(String),
@@ -67,22 +112,37 @@ impl SimpleValue {
             Self::Int(value) => value.to_string(),
             Self::Float(value) => value.to_string(),
             Self::String(value) => format!("\"{}\"", value),
+            Self::List(values) => {
+                let rendered = values
+                    .iter()
+                    .map(SimpleValue::display)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("[{}]", rendered)
+            }
+            Self::Record(fields) => {
+                let rendered = fields
+                    .iter()
+                    .map(|(name, value)| format!("{}: {}", name, value.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{ {} }}", rendered)
+            }
             Self::Result {
                 discriminant,
                 payload,
+                payload_value,
                 err_message,
             } => {
-                let ok_disc = variant_discriminant("ok");
-                let err_disc = variant_discriminant("err");
-                if *discriminant == ok_disc {
-                    format!("ok({})", payload)
-                } else if *discriminant == err_disc {
-                    match err_message {
-                        Some(msg) => format!("err(\"{}\")", msg),
-                        None => format!("err({})", payload),
-                    }
-                } else {
-                    format!("result#{}({})", discriminant, payload)
+                let case_name = variant_case_name(*discriminant);
+                match variant_payload_value(
+                    *discriminant,
+                    *payload,
+                    payload_value.as_deref(),
+                    err_message.as_ref(),
+                ) {
+                    Some(value) => format!("{case_name}({})", value.display()),
+                    None => case_name,
                 }
             }
             Self::Unknown(value) => value.clone(),
@@ -95,6 +155,8 @@ impl SimpleValue {
             Self::Int(_) => "i64",
             Self::Float(_) => "f64",
             Self::String(_) => "string",
+            Self::List(_) => "list",
+            Self::Record(_) => "record",
             Self::Result { .. } => "result",
             Self::Unknown(_) => "unknown",
         }
@@ -107,12 +169,112 @@ fn variant_discriminant(case_name: &str) -> i32 {
         .fold(0u32, |acc, b| acc.wrapping_add(b as u32)) as i32
 }
 
+fn variant_case_name(discriminant: i32) -> String {
+    for case_name in ["ok", "err", "some", "none"] {
+        if discriminant == variant_discriminant(case_name) {
+            return case_name.to_string();
+        }
+    }
+    format!("variant#{discriminant}")
+}
+
+fn simple_value_to_i32(value: &SimpleValue) -> Option<i32> {
+    match value {
+        SimpleValue::Bool(value) => Some(if *value { 1 } else { 0 }),
+        SimpleValue::Int(value) => i32::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn variant_payload_value(
+    discriminant: i32,
+    payload: i32,
+    payload_value: Option<&SimpleValue>,
+    err_message: Option<&String>,
+) -> Option<SimpleValue> {
+    if let Some(value) = payload_value {
+        return Some(value.clone());
+    }
+
+    match variant_case_name(discriminant).as_str() {
+        "none" => None,
+        "err" => err_message
+            .cloned()
+            .map(SimpleValue::String)
+            .or(Some(SimpleValue::Int(i64::from(payload)))),
+        _ => Some(SimpleValue::Int(i64::from(payload))),
+    }
+}
+
+fn result_child_variables(
+    discriminant: i32,
+    payload: i32,
+    payload_value: Option<&SimpleValue>,
+    err_message: Option<&String>,
+) -> Vec<Variable> {
+    let case_name = variant_case_name(discriminant);
+    let mut vars = vec![Variable::from_value(
+        "case",
+        SimpleValue::String(case_name.clone()),
+    )];
+
+    if let Some(value) = variant_payload_value(discriminant, payload, payload_value, err_message) {
+        vars.push(Variable::from_value("payload", value));
+    }
+
+    vars
+}
+
+fn simple_variant_value(case_name: &str, payload: Option<SimpleValue>) -> SimpleValue {
+    let discriminant = variant_discriminant(case_name);
+    let payload_int = payload
+        .as_ref()
+        .and_then(simple_value_to_i32)
+        .unwrap_or_default();
+    let err_message = if case_name == "err" {
+        match payload.as_ref() {
+            Some(SimpleValue::String(message)) => Some(message.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    SimpleValue::Result {
+        discriminant,
+        payload: payload_int,
+        payload_value: payload.map(Box::new),
+        err_message,
+    }
+}
+
+fn variant_pattern_binding_value(value: &SimpleValue) -> Option<SimpleValue> {
+    match value {
+        SimpleValue::Result {
+            discriminant,
+            payload,
+            payload_value,
+            err_message,
+        } => variant_payload_value(
+            *discriminant,
+            *payload,
+            payload_value.as_deref(),
+            err_message.as_ref(),
+        ),
+        _ => None,
+    }
+}
+
 impl Variable {
     fn from_value(name: impl Into<String>, value: SimpleValue) -> Self {
+        let display = value.display();
+        let type_name = value.type_name().to_string();
         Self {
             name: name.into(),
-            value: value.display(),
-            var_type: value.type_name().to_string(),
+            value: display,
+            var_type: type_name,
+            variables_reference: 0,
+            raw_value: value,
         }
     }
 }
@@ -185,6 +347,7 @@ struct RuntimeTraceState {
 #[derive(Clone, Debug)]
 struct RuntimeTraceEvent {
     line: i64,
+    column: i64,
     subprogram_start_line: Option<i64>,
     locals: HashMap<u32, i64>,
     pointer_derefs: HashMap<u32, PointerDeref>,
@@ -203,6 +366,7 @@ struct FrameDescriptor {
     id: i64,
     name: String,
     line: i64,
+    column: i64,
     target: FrameTarget,
 }
 
@@ -231,8 +395,11 @@ struct DebugSession {
     current_test: usize,
     current_trace_index: Option<usize>,
     current_line: i64,
-    breakpoints: HashMap<String, BTreeSet<i64>>,
+    current_column: i64,
+    breakpoints: HashMap<String, BTreeSet<BreakpointLocation>>,
     active_closures: Vec<ActiveClosure>,
+    child_variables: HashMap<i64, Vec<Variable>>,
+    next_child_variables_reference: i64,
 }
 
 impl DebugSession {
@@ -252,9 +419,62 @@ impl DebugSession {
             current_test: 0,
             current_trace_index: None,
             current_line: 0,
+            current_column: 1,
             breakpoints: HashMap::new(),
             active_closures: Vec::new(),
+            child_variables: HashMap::new(),
+            next_child_variables_reference: 1_000_000,
         }
+    }
+
+    fn reset_child_variables(&mut self) {
+        self.child_variables.clear();
+        self.next_child_variables_reference = 1_000_000;
+    }
+
+    fn allocate_child_variables_reference(&mut self, vars: Vec<Variable>) -> i64 {
+        let reference = self.next_child_variables_reference;
+        self.next_child_variables_reference += 1;
+        self.child_variables.insert(reference, vars);
+        reference
+    }
+
+    fn attach_child_references(&mut self, vars: Vec<Variable>) -> Vec<Variable> {
+        vars.into_iter()
+            .map(|var| self.attach_child_reference(var))
+            .collect()
+    }
+
+    fn attach_child_reference(&mut self, mut var: Variable) -> Variable {
+        let child_vars = match &var.raw_value {
+            SimpleValue::List(values) => values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| Variable::from_value(index.to_string(), value.clone()))
+                .collect::<Vec<_>>(),
+            SimpleValue::Record(fields) => fields
+                .iter()
+                .map(|(name, value)| Variable::from_value(name.clone(), value.clone()))
+                .collect::<Vec<_>>(),
+            SimpleValue::Result {
+                discriminant,
+                payload,
+                payload_value,
+                err_message,
+            } => result_child_variables(
+                *discriminant,
+                *payload,
+                payload_value.as_deref(),
+                err_message.as_ref(),
+            ),
+            _ => Vec::new(),
+        };
+
+        if !child_vars.is_empty() {
+            let child_vars = self.attach_child_references(child_vars);
+            var.variables_reference = self.allocate_child_variables_reference(child_vars);
+        }
+        var
     }
 
     fn has_tests(&self) -> bool {
@@ -267,14 +487,52 @@ impl DebugSession {
             .map(|p| normalize_path_key(&p.display().to_string()))
     }
 
-    fn breakpoint_hit(&self, line: i64) -> bool {
+    fn snapped_breakpoint_position(&self, breakpoint: &BreakpointLocation) -> Option<SourcePosition> {
+        let column = breakpoint.column?;
+        self.closures
+            .iter()
+            .filter(|closure| {
+                closure.start_line == breakpoint.line
+                    && closure.inline_invocation_line == Some(breakpoint.line)
+            })
+            .min_by_key(|closure| {
+                let distance = (closure.start_column - column).abs();
+                (distance, closure.start_column)
+            })
+            .map(|closure| SourcePosition::new(closure.start_line, closure.start_column))
+    }
+
+    fn matched_breakpoint_position(&self, position: &SourcePosition) -> Option<SourcePosition> {
         let Some(file) = self.current_file_key() else {
-            return false;
+            return None;
         };
         self.breakpoints
             .get(&file)
-            .map(|set| set.contains(&line))
-            .unwrap_or(false)
+            .and_then(|set| {
+                set.iter().find_map(|breakpoint| {
+                    if breakpoint.matches(position) {
+                        Some(position.clone())
+                    } else if breakpoint.line == position.line {
+                        self.snapped_breakpoint_position(breakpoint)
+                    } else {
+                        None
+                    }
+                })
+            })
+    }
+
+    fn breakpoint_hit(&mut self, position: &SourcePosition) -> bool {
+        if let Some(position) = self.matched_breakpoint_position(position) {
+            self.current_line = position.line;
+            self.current_column = position.column;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn current_position(&self) -> SourcePosition {
+        SourcePosition::new(self.current_line, self.current_column)
     }
 
     fn active_test(&self) -> Option<&ListedTest> {
@@ -374,6 +632,7 @@ impl DebugSession {
                 if let Some(entry) = test.trace.get(next_index) {
                     self.current_trace_index = Some(next_index);
                     self.current_line = entry.line;
+                    self.current_column = entry.column;
                     self.sync_active_closures_with_current_line();
                     return true;
                 }
@@ -384,16 +643,19 @@ impl DebugSession {
                     return false;
                 }
                 self.current_line = self.tests[self.current_test].line - 1;
+                self.current_column = 1;
                 continue;
             }
 
             if self.current_line < test.line {
                 self.current_line = test.line;
+                self.current_column = 1;
                 return true;
             }
 
             if self.current_line < test.end_line {
                 self.current_line += 1;
+                self.current_column = 1;
                 return true;
             }
 
@@ -404,12 +666,13 @@ impl DebugSession {
 
             let next_start = self.tests[self.current_test].line;
             self.current_line = next_start - 1;
+            self.current_column = 1;
         }
     }
 
     fn run_until_breakpoint_or_end(&mut self) -> StopOutcome {
         while self.advance_one_line() {
-            if self.breakpoint_hit(self.current_line) {
+            if self.breakpoint_hit(&self.current_position()) {
                 return StopOutcome::Stopped("breakpoint");
             }
         }
@@ -418,7 +681,7 @@ impl DebugSession {
 
     fn step_once_or_end(&mut self, action: &str) -> StopOutcome {
         if action == "stepOut" && self.step_out_of_closure() {
-            if self.breakpoint_hit(self.current_line) {
+            if self.breakpoint_hit(&self.current_position()) {
                 return StopOutcome::Stopped("breakpoint");
             }
             return StopOutcome::Stopped("step");
@@ -441,10 +704,11 @@ impl DebugSession {
                     capture_bindings,
                 });
                 if enter_in_place {
+                    self.current_column = closure.start_column;
                     return StopOutcome::Stopped("step");
                 }
                 if self.advance_one_line() {
-                    if self.breakpoint_hit(self.current_line) {
+                    if self.breakpoint_hit(&self.current_position()) {
                         return StopOutcome::Stopped("breakpoint");
                     }
                     return StopOutcome::Stopped("step");
@@ -454,7 +718,7 @@ impl DebugSession {
         }
 
         if self.advance_one_line() {
-            if self.breakpoint_hit(self.current_line) {
+            if self.breakpoint_hit(&self.current_position()) {
                 StopOutcome::Stopped("breakpoint")
             } else {
                 StopOutcome::Stopped("step")
@@ -570,6 +834,7 @@ pub fn run_server() -> io::Result<()> {
                     true,
                     Some(json!({
                         "supportsConfigurationDoneRequest": true,
+                        "supportsColumnBreakpoints": true,
                         "supportsStepInTargetsRequest": false,
                         "supportsEvaluateForHovers": true,
                         "supportsSetVariable": false,
@@ -612,7 +877,9 @@ pub fn run_server() -> io::Result<()> {
                         session.current_trace_index = None;
                         session.current_line =
                             session.tests.first().map(|t| t.line - 1).unwrap_or(0);
+                        session.current_column = 1;
                         session.active_closures.clear();
+                        session.reset_child_variables();
 
                         send_response(&mut writer, seq, command, true, Some(json!({})), None)?;
                         send_event(&mut writer, "initialized", Some(json!({})))?;
@@ -630,21 +897,29 @@ pub fn run_server() -> io::Result<()> {
                     .unwrap_or_default();
                 let key = normalize_path_key(source_path);
 
-                let mut lines = BTreeSet::new();
+                let mut locations = BTreeSet::new();
                 let mut response_bps = Vec::new();
 
                 if let Some(req_bps) = arguments.get("breakpoints").and_then(Value::as_array) {
                     for bp in req_bps {
                         let line = bp.get("line").and_then(Value::as_i64).unwrap_or(1).max(1);
-                        lines.insert(line);
-                        response_bps.push(json!({
+                        let column = bp
+                            .get("column")
+                            .and_then(Value::as_i64)
+                            .map(|value| value.max(1));
+                        locations.insert(BreakpointLocation::new(line, column));
+                        let mut response = json!({
                             "verified": true,
                             "line": line
-                        }));
+                        });
+                        if let Some(column) = column {
+                            response["column"] = json!(column);
+                        }
+                        response_bps.push(response);
                     }
                 }
 
-                session.breakpoints.insert(key, lines);
+                session.breakpoints.insert(key, locations);
                 send_response(
                     &mut writer,
                     seq,
@@ -728,14 +1003,14 @@ pub fn run_server() -> io::Result<()> {
                     .get("variablesReference")
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
-                let vars: Vec<Value> = variables_for_reference(&session, variables_reference)
+                let vars: Vec<Value> = variables_for_reference(&mut session, variables_reference)
                     .into_iter()
                     .map(|v| {
                         json!({
                             "name": v.name,
                             "value": v.value,
                             "type": v.var_type,
-                            "variablesReference": 0
+                            "variablesReference": v.variables_reference
                         })
                     })
                     .collect();
@@ -770,15 +1045,19 @@ pub fn run_server() -> io::Result<()> {
 
                 match evaluate_in_frame(&session, frame_id, expression) {
                     Ok(value) => {
+                        let evaluated = session.attach_child_reference(Variable::from_value(
+                            expression.to_string(),
+                            value,
+                        ));
                         send_response(
                             &mut writer,
                             seq,
                             command,
                             true,
                             Some(json!({
-                                "result": value.display(),
-                                "type": value.type_name(),
-                                "variablesReference": 0
+                                "result": evaluated.value,
+                                "type": evaluated.var_type,
+                                "variablesReference": evaluated.variables_reference
                             })),
                             None,
                         )?;
@@ -802,6 +1081,8 @@ pub fn run_server() -> io::Result<()> {
                     continue;
                 }
 
+                session.reset_child_variables();
+
                 match session.run_until_breakpoint_or_end() {
                     StopOutcome::Stopped(reason) => send_stopped_event(&mut writer, reason)?,
                     StopOutcome::Terminated => {
@@ -816,6 +1097,8 @@ pub fn run_server() -> io::Result<()> {
                 if session.terminated {
                     continue;
                 }
+
+                session.reset_child_variables();
 
                 match session.step_once_or_end(command) {
                     StopOutcome::Stopped(reason) => send_stopped_event(&mut writer, reason)?,
@@ -1000,6 +1283,7 @@ fn run_test_with_runtime_trace(
                     let state = caller.data_mut();
                     state.events.push(RuntimeTraceEvent {
                         line: line as i64,
+                        column: 1,
                         subprogram_start_line: (subprogram_start_line > 0)
                             .then_some(subprogram_start_line as i64),
                         locals: std::mem::take(&mut state.pending_locals),
@@ -1146,24 +1430,25 @@ fn merge_runtime_trace(
         .into_iter()
         .map(|event| {
             let line = event.line;
-            let env_before = simulated_trace[search_start..]
+            let (env_before, column) = simulated_trace[search_start..]
                 .iter()
                 .position(|entry| entry.line == line)
                 .and_then(|offset| {
                     let entry = simulated_trace.get(search_start + offset)?;
                     search_start += offset + 1;
-                    Some(entry.env_before.clone())
+                    Some((entry.env_before.clone(), entry.column))
                 })
                 .or_else(|| {
                     simulated_trace
                         .iter()
                         .find(|entry| entry.line == line)
-                        .map(|entry| entry.env_before.clone())
+                        .map(|entry| (entry.env_before.clone(), entry.column))
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|| (HashMap::new(), event.column));
 
             TraceEvent {
                 line,
+                column,
                 env_before,
                 runtime_subprogram_start_line: event.subprogram_start_line,
                 runtime_locals: event.locals,
@@ -1186,7 +1471,7 @@ fn build_stack_frames(session: &DebugSession) -> Vec<Value> {
                 "id": frame.id,
                 "name": frame.name,
                 "line": frame.line.max(1),
-                "column": 1,
+                "column": frame.column.max(1),
                 "source": {
                     "name": program.file_name().and_then(|n| n.to_str()).unwrap_or("program.kettu"),
                     "path": program.display().to_string()
@@ -1205,6 +1490,7 @@ fn collect_stack_frames(session: &DebugSession) -> Vec<FrameDescriptor> {
             id: next_id,
             name: session.closures[closure_index].name.clone(),
             line: session.current_line.max(1),
+            column: session.closures[closure_index].start_column.max(1),
             target: FrameTarget::Closure(closure_index),
         });
         next_id += 1;
@@ -1234,6 +1520,7 @@ fn collect_stack_frames(session: &DebugSession) -> Vec<FrameDescriptor> {
                     id: next_id,
                     name: sp.name.clone(),
                     line: session.current_line.max(1),
+                    column: session.current_column.max(1),
                     target: FrameTarget::Function(func_idx),
                 });
                 next_id += 1;
@@ -1248,6 +1535,7 @@ fn collect_stack_frames(session: &DebugSession) -> Vec<FrameDescriptor> {
             .map(|t| format!("@test {}", t.name))
             .unwrap_or_else(|| "@test <unknown>".to_string()),
         line: session.current_line.max(1),
+        column: session.current_column.max(1),
         target: FrameTarget::Test,
     });
 
@@ -1314,15 +1602,20 @@ fn decode_scope_reference(reference: i64) -> Option<(i64, ScopeReferenceKind)> {
     }
 }
 
-fn variables_for_reference(session: &DebugSession, reference: i64) -> Vec<Variable> {
-    let Some((frame_id, scope_kind)) = decode_scope_reference(reference) else {
-        return Vec::new();
-    };
-
-    match scope_kind {
-        ScopeReferenceKind::Locals => frame_local_variables(session, frame_id),
-        ScopeReferenceKind::Captures => frame_capture_variables(session, frame_id),
+fn variables_for_reference(session: &mut DebugSession, reference: i64) -> Vec<Variable> {
+    if let Some(vars) = session.child_variables.get(&reference).cloned() {
+        return vars;
     }
+
+    if let Some((frame_id, scope_kind)) = decode_scope_reference(reference) {
+        let vars = match scope_kind {
+            ScopeReferenceKind::Locals => frame_local_variables(session, frame_id),
+            ScopeReferenceKind::Captures => frame_capture_variables(session, frame_id),
+        };
+        return session.attach_child_references(vars);
+    }
+
+    Vec::new()
 }
 
 fn evaluate_in_frame(
@@ -1332,7 +1625,62 @@ fn evaluate_in_frame(
 ) -> Result<SimpleValue, String> {
     let frame_id = frame_id.unwrap_or(1);
     let env = frame_environment(session, frame_id);
-    evaluate_expression(expression, &env)
+    let source = session.source_lines.join("\n");
+
+    if let Ok(expr) = parse_eval_expression(expression) {
+        let value = evaluate_ast_expr(&expr, &session.closures, &source, &env);
+        if !is_placeholder_unknown(&value) {
+            return Ok(value);
+        }
+    }
+
+    evaluate_expression(expression, &env).or_else(|_| Ok(infer_expr_value(expression, &env)))
+}
+
+fn parse_eval_expression(expression: &str) -> Result<kettu_parser::Expr, String> {
+    let wrapped = format!(
+        "package local:debug;\ninterface debug {{\n    eval: func() -> bool {{\n        return {};\n    }}\n}}",
+        expression.trim()
+    );
+
+    let (ast, errors) = kettu_parser::parse_file(&wrapped);
+    if !errors.is_empty() {
+        let joined = errors
+            .into_iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(joined);
+    }
+
+    let ast = ast.ok_or_else(|| "missing eval AST".to_string())?;
+    let func = ast
+        .items
+        .iter()
+        .find_map(|item| match item {
+            kettu_parser::TopLevelItem::Interface(interface) => interface.items.iter().find_map(
+                |item| match item {
+                    kettu_parser::InterfaceItem::Func(func) if func.name.name == "eval" => {
+                        Some(func)
+                    }
+                    _ => None,
+                },
+            ),
+            _ => None,
+        })
+        .ok_or_else(|| "missing eval function".to_string())?;
+    let body = func.body.as_ref().ok_or_else(|| "missing eval body".to_string())?;
+
+    match body.statements.first() {
+        Some(kettu_parser::Statement::Return(Some(expr))) => Ok(expr.clone()),
+        Some(kettu_parser::Statement::Expr(expr)) => Ok(expr.clone()),
+        Some(other) => Err(format!("unexpected eval statement: {other:?}")),
+        None => Err("missing eval statement".to_string()),
+    }
+}
+
+fn is_placeholder_unknown(value: &SimpleValue) -> bool {
+    matches!(value, SimpleValue::Unknown(text) if text.starts_with('<') && text.ends_with('>'))
 }
 
 fn normalize_path_key(path: &str) -> String {
@@ -1349,6 +1697,22 @@ fn offset_to_line(source: &str, offset: usize) -> usize {
         .filter(|&b| b == b'\n')
         .count()
         + 1
+}
+
+fn offset_to_line_col(source: &str, offset: usize) -> (usize, usize) {
+    let clamped = offset.min(source.len());
+    let prefix = &source[..clamped];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map(|(_, tail)| tail.chars().count() + 1)
+        .unwrap_or_else(|| prefix.chars().count() + 1);
+    (line, column)
+}
+
+fn offset_to_position(source: &str, offset: usize) -> SourcePosition {
+    let (line, column) = offset_to_line_col(source, offset);
+    SourcePosition::new(line as i64, column as i64)
 }
 
 fn list_tests_from_ast(ast: &kettu_parser::WitFile, source: &str) -> Vec<ListedTest> {
@@ -1562,13 +1926,16 @@ fn collect_closures_from_expr(
             captures,
             span,
         } => {
-            let start_line = offset_to_line(source, span.start) as i64;
-            let end_line = offset_to_line(source, span.end) as i64;
+            let start = offset_to_position(source, span.start);
+            let end = offset_to_position(source, span.end);
+            let start_line = start.line;
+            let end_line = end.line;
             let inline_invocation_line = preferred_name.is_none().then_some(start_line);
             let fallback_name = format!("closure#{}", closures.len() + 1);
             closures.push(ClosureRange {
                 debug_key: span.start as i64,
                 start_line,
+                start_column: start.column,
                 end_line,
                 name: preferred_name.unwrap_or(fallback_name),
                 params: params.iter().map(|param| param.name.clone()).collect(),
@@ -2101,6 +2468,20 @@ fn binding_visible_at_line(
 fn runtime_value_to_simple(raw: i64, fallback: Option<&SimpleValue>) -> SimpleValue {
     match fallback {
         Some(SimpleValue::Bool(_)) => SimpleValue::Bool(raw != 0),
+        Some(SimpleValue::String(value)) => SimpleValue::String(value.clone()),
+        Some(SimpleValue::List(values)) => SimpleValue::List(values.clone()),
+        Some(SimpleValue::Record(fields)) => SimpleValue::Record(fields.clone()),
+        Some(SimpleValue::Result {
+            discriminant,
+            payload,
+            payload_value,
+            err_message,
+        }) => SimpleValue::Result {
+            discriminant: *discriminant,
+            payload: *payload,
+            payload_value: payload_value.clone(),
+            err_message: err_message.clone(),
+        },
         _ => SimpleValue::Int(raw),
     }
 }
@@ -2123,6 +2504,7 @@ fn runtime_binding_values_for_target(
             .filter_map(|binding| {
                 let local_index = binding.local_index?;
                 let raw = entry.runtime_locals.get(&local_index)?;
+                let fallback_value = fallback_values.get(&binding.name);
                 let simple = if let Some(deref) = entry.runtime_pointer_derefs.get(&local_index) {
                     let ok_disc = variant_discriminant("ok");
                     let err_disc = variant_discriminant("err");
@@ -2133,16 +2515,26 @@ fn runtime_binding_values_for_target(
                         || deref.discriminant == some_disc
                         || deref.discriminant == none_disc
                     {
+                        let payload_value = match fallback_value {
+                            Some(SimpleValue::Result {
+                                discriminant,
+                                payload_value,
+                                ..
+                            }) if *discriminant == deref.discriminant => payload_value.clone(),
+                            _ => None,
+                        };
+
                         SimpleValue::Result {
                             discriminant: deref.discriminant,
                             payload: deref.payload,
+                            payload_value,
                             err_message: deref.err_string.clone(),
                         }
                     } else {
-                        runtime_value_to_simple(*raw, fallback_values.get(&binding.name))
+                        runtime_value_to_simple(*raw, fallback_value)
                     }
                 } else {
-                    runtime_value_to_simple(*raw, fallback_values.get(&binding.name))
+                    runtime_value_to_simple(*raw, fallback_value)
                 };
                 Some((binding.name.clone(), simple))
             })
@@ -2167,6 +2559,16 @@ fn variables_from_dwarf_bindings<'a>(
             .unwrap_or_else(|| SimpleValue::Unknown(binding.name.clone()));
         variables.push(Variable::from_value(binding.name.clone(), value));
     }
+
+    for (name, value) in values {
+        if seen.contains(name) || !is_identifier(name) {
+            continue;
+        }
+        seen.insert(name.clone());
+        variables.push(Variable::from_value(name.clone(), value.clone()));
+    }
+
+    variables.sort_by(|left, right| left.name.cmp(&right.name));
 
     variables
 }
@@ -2247,7 +2649,7 @@ fn simulate_statement(
             simulate_expr_statement(expr, closures, source, env, trace, is_tail)
         }
         kettu_parser::Statement::Let { name, value } => {
-            record_trace_event(trace, offset_to_line(source, name.span.start) as i64, env);
+            record_trace_event(trace, offset_to_position(source, name.span.start), env);
             env.insert(
                 name.name.clone(),
                 evaluate_ast_expr(value, closures, source, env),
@@ -2255,15 +2657,15 @@ fn simulate_statement(
             StatementFlow::Continue
         }
         kettu_parser::Statement::Return(Some(expr)) => {
-            record_trace_event(trace, expr_start_line(expr, source), env);
+            record_trace_event(trace, expr_start_position(expr, source), env);
             StatementFlow::Return(Some(evaluate_ast_expr(expr, closures, source, env)))
         }
         kettu_parser::Statement::Return(None) => {
-            record_trace_event(trace, 0, env);
+            record_trace_event(trace, SourcePosition { line: 0, column: 0 }, env);
             StatementFlow::Return(None)
         }
         kettu_parser::Statement::Assign { name, value } => {
-            record_trace_event(trace, offset_to_line(source, name.span.start) as i64, env);
+            record_trace_event(trace, offset_to_position(source, name.span.start), env);
             env.insert(
                 name.name.clone(),
                 evaluate_ast_expr(value, closures, source, env),
@@ -2271,7 +2673,7 @@ fn simulate_statement(
             StatementFlow::Continue
         }
         kettu_parser::Statement::CompoundAssign { name, op, value } => {
-            record_trace_event(trace, offset_to_line(source, name.span.start) as i64, env);
+            record_trace_event(trace, offset_to_position(source, name.span.start), env);
             let current = env
                 .get(&name.name)
                 .cloned()
@@ -2285,11 +2687,11 @@ fn simulate_statement(
             StatementFlow::Continue
         }
         kettu_parser::Statement::Break { condition } => {
-            let line = condition
+            let position = condition
                 .as_deref()
-                .map(|expr| expr_start_line(expr, source))
-                .unwrap_or(0);
-            record_trace_event(trace, line, env);
+                .map(|expr| expr_start_position(expr, source))
+                .unwrap_or(SourcePosition { line: 0, column: 0 });
+            record_trace_event(trace, position, env);
             match condition.as_deref() {
                 Some(expr) => match evaluate_ast_expr(expr, closures, source, env) {
                     SimpleValue::Bool(true) => StatementFlow::Break,
@@ -2299,11 +2701,11 @@ fn simulate_statement(
             }
         }
         kettu_parser::Statement::Continue { condition } => {
-            let line = condition
+            let position = condition
                 .as_deref()
-                .map(|expr| expr_start_line(expr, source))
-                .unwrap_or(0);
-            record_trace_event(trace, line, env);
+                .map(|expr| expr_start_position(expr, source))
+                .unwrap_or(SourcePosition { line: 0, column: 0 });
+            record_trace_event(trace, position, env);
             match condition.as_deref() {
                 Some(expr) => match evaluate_ast_expr(expr, closures, source, env) {
                     SimpleValue::Bool(true) => StatementFlow::ContinueLoop,
@@ -2316,7 +2718,7 @@ fn simulate_statement(
             name,
             initial_value,
         } => {
-            record_trace_event(trace, offset_to_line(source, name.span.start) as i64, env);
+            record_trace_event(trace, offset_to_position(source, name.span.start), env);
             env.insert(
                 name.name.clone(),
                 evaluate_ast_expr(initial_value, closures, source, env),
@@ -2327,7 +2729,7 @@ fn simulate_statement(
             condition,
             else_body,
         } => {
-            record_trace_event(trace, expr_start_line(condition, source), env);
+            record_trace_event(trace, expr_start_position(condition, source), env);
             match evaluate_ast_expr(condition, closures, source, env) {
                 SimpleValue::Bool(true) => StatementFlow::Continue,
                 _ => simulate_statements(else_body, closures, source, env, trace, is_tail),
@@ -2338,7 +2740,7 @@ fn simulate_statement(
             value,
             else_body,
         } => {
-            record_trace_event(trace, offset_to_line(source, name.span.start) as i64, env);
+            record_trace_event(trace, offset_to_position(source, name.span.start), env);
             let evaluated = evaluate_ast_expr(value, closures, source, env);
             if matches!(evaluated, SimpleValue::Unknown(_)) {
                 simulate_statements(else_body, closures, source, env, trace, is_tail)
@@ -2365,7 +2767,7 @@ fn simulate_expr_statement(
             else_branch,
             ..
         } => {
-            record_trace_event(trace, expr_start_line(expr, source), env);
+            record_trace_event(trace, expr_start_position(expr, source), env);
             match evaluate_ast_expr(cond, closures, source, env) {
                 SimpleValue::Bool(true) => {
                     simulate_statements(then_branch, closures, source, env, trace, is_tail)
@@ -2384,7 +2786,7 @@ fn simulate_expr_statement(
         kettu_parser::Expr::While {
             condition, body, ..
         } => loop {
-            record_trace_event(trace, expr_start_line(expr, source), env);
+            record_trace_event(trace, expr_start_position(expr, source), env);
             match evaluate_ast_expr(condition, closures, source, env) {
                 SimpleValue::Bool(true) => {
                     match simulate_statements(body, closures, source, env, trace, false) {
@@ -2404,7 +2806,7 @@ fn simulate_expr_statement(
             body,
             ..
         } => {
-            record_trace_event(trace, expr_start_line(expr, source), env);
+            record_trace_event(trace, expr_start_position(expr, source), env);
             if let Some(values) = evaluate_range_values(range, closures, source, env) {
                 for value in values {
                     env.insert(variable.name.clone(), SimpleValue::Int(value));
@@ -2418,19 +2820,43 @@ fn simulate_expr_statement(
             }
             StatementFlow::Continue
         }
+        kettu_parser::Expr::ForEach {
+            variable,
+            collection,
+            body,
+            ..
+        } => {
+            record_trace_event(trace, expr_start_position(expr, source), env);
+            if let SimpleValue::List(values) = evaluate_ast_expr(collection, closures, source, env) {
+                for value in values {
+                    env.insert(variable.name.clone(), value);
+                    match simulate_statements(body, closures, source, env, trace, false) {
+                        StatementFlow::Continue => {}
+                        StatementFlow::Break => break,
+                        StatementFlow::ContinueLoop => continue,
+                        flow => return flow,
+                    }
+                }
+            }
+            StatementFlow::Continue
+        }
         kettu_parser::Expr::Match {
             scrutinee, arms, ..
         } => {
-            record_trace_event(trace, expr_start_line(expr, source), env);
+            record_trace_event(trace, expr_start_position(expr, source), env);
             let scrutinee = evaluate_ast_expr(scrutinee, closures, source, env);
-            if let Some(arm) = select_match_arm(arms, &scrutinee, closures, source, env) {
-                simulate_statements(&arm.body, closures, source, env, trace, is_tail)
+            if let Some((arm, bindings)) =
+                select_match_arm(arms, &scrutinee, closures, source, env)
+            {
+                let mut match_env = env.clone();
+                match_env.extend(bindings);
+                simulate_statements(&arm.body, closures, source, &mut match_env, trace, is_tail)
             } else {
                 StatementFlow::Continue
             }
         }
         _ => {
-            record_trace_event(trace, expr_start_line(expr, source), env);
+            record_trace_event(trace, expr_start_position(expr, source), env);
             let value = evaluate_ast_expr(expr, closures, source, env);
             if is_tail {
                 StatementFlow::Return(Some(value))
@@ -2467,6 +2893,101 @@ fn evaluate_ast_expr(
             }
             SimpleValue::String(result)
         }
+        kettu_parser::Expr::ListLiteral { elements, .. } => SimpleValue::List(
+            elements
+                .iter()
+                .map(|element| evaluate_ast_expr(element, closures, source, env))
+                .collect(),
+        ),
+        kettu_parser::Expr::RecordLiteral { fields, .. } => SimpleValue::Record(
+            fields
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.name.clone(),
+                        evaluate_ast_expr(value, closures, source, env),
+                    )
+                })
+                .collect(),
+        ),
+        kettu_parser::Expr::VariantLiteral {
+            case_name, payload, ..
+        } => simple_variant_value(
+            &case_name.name,
+            payload
+                .as_ref()
+                .map(|value| evaluate_ast_expr(value, closures, source, env)),
+        ),
+        kettu_parser::Expr::Field { expr, field, .. } => {
+            match evaluate_ast_expr(expr, closures, source, env) {
+                SimpleValue::Record(fields) => fields
+                    .get(&field.name)
+                    .cloned()
+                    .unwrap_or_else(|| SimpleValue::Unknown(field.name.clone())),
+                _ => SimpleValue::Unknown("<field>".to_string()),
+            }
+        }
+        kettu_parser::Expr::OptionalChain { expr, field, .. } => {
+            match evaluate_ast_expr(expr, closures, source, env) {
+                SimpleValue::Result {
+                    discriminant,
+                    payload,
+                    payload_value,
+                    err_message,
+                } if discriminant == variant_discriminant("some") => {
+                    match variant_payload_value(
+                        discriminant,
+                        payload,
+                        payload_value.as_deref(),
+                        err_message.as_ref(),
+                    ) {
+                        Some(SimpleValue::Record(fields)) => fields
+                            .get(&field.name)
+                            .cloned()
+                            .map(|value| simple_variant_value("some", Some(value)))
+                            .unwrap_or_else(|| simple_variant_value("none", None)),
+                        Some(value) => simple_variant_value("some", Some(value)),
+                        None => simple_variant_value("none", None),
+                    }
+                }
+                SimpleValue::Result { discriminant, .. }
+                    if discriminant == variant_discriminant("none") =>
+                {
+                    simple_variant_value("none", None)
+                }
+                _ => SimpleValue::Unknown("<optional-chain>".to_string()),
+            }
+        }
+        kettu_parser::Expr::Try { expr, .. } => match evaluate_ast_expr(expr, closures, source, env) {
+            SimpleValue::Result {
+                discriminant,
+                payload,
+                payload_value,
+                err_message,
+            } if discriminant == variant_discriminant("some")
+                || discriminant == variant_discriminant("ok") => {
+                variant_payload_value(
+                    discriminant,
+                    payload,
+                    payload_value.as_deref(),
+                    err_message.as_ref(),
+                )
+                    .unwrap_or_else(|| SimpleValue::Unknown("<try>".to_string()))
+            }
+            result @ SimpleValue::Result { .. } => result,
+            other => other,
+        },
+        kettu_parser::Expr::Index { expr, index, .. } => {
+            let list = evaluate_ast_expr(expr, closures, source, env);
+            let index = evaluate_ast_expr(index, closures, source, env);
+            match (list, index) {
+                (SimpleValue::List(values), SimpleValue::Int(index)) if index >= 0 => values
+                    .get(index as usize)
+                    .cloned()
+                    .unwrap_or_else(|| SimpleValue::Unknown("<index>".to_string())),
+                _ => SimpleValue::Unknown("<index>".to_string()),
+            }
+        }
         kettu_parser::Expr::Binary { lhs, op, rhs, .. } => apply_binary_op(
             evaluate_ast_expr(lhs, closures, source, env),
             evaluate_ast_expr(rhs, closures, source, env),
@@ -2498,6 +3019,114 @@ fn evaluate_ast_expr(
             let rhs = evaluate_ast_expr(rhs, closures, source, env);
             SimpleValue::Bool(lhs == rhs)
         }
+        kettu_parser::Expr::ListLen(inner, _) => {
+            match evaluate_ast_expr(inner, closures, source, env) {
+                SimpleValue::List(values) => SimpleValue::Int(values.len() as i64),
+                _ => SimpleValue::Unknown("<list-len>".to_string()),
+            }
+        }
+        kettu_parser::Expr::ListPush(list, value, _) => {
+            match evaluate_ast_expr(list, closures, source, env) {
+                SimpleValue::List(mut values) => {
+                    values.push(evaluate_ast_expr(value, closures, source, env));
+                    SimpleValue::List(values)
+                }
+                _ => SimpleValue::Unknown("<list-push>".to_string()),
+            }
+        }
+        kettu_parser::Expr::ListSet(list, index, value, _) => {
+            let list = evaluate_ast_expr(list, closures, source, env);
+            let index = evaluate_ast_expr(index, closures, source, env);
+            let value = evaluate_ast_expr(value, closures, source, env);
+            match (list, index) {
+                (SimpleValue::List(mut values), SimpleValue::Int(index)) if index >= 0 => {
+                    if let Some(slot) = values.get_mut(index as usize) {
+                        *slot = value;
+                        SimpleValue::List(values)
+                    } else {
+                        SimpleValue::Unknown("<list-set>".to_string())
+                    }
+                }
+                _ => SimpleValue::Unknown("<list-set>".to_string()),
+            }
+        }
+        kettu_parser::Expr::Slice {
+            expr, start, end, ..
+        } => {
+            let list = evaluate_ast_expr(expr, closures, source, env);
+            let start = evaluate_ast_expr(start, closures, source, env);
+            let end = evaluate_ast_expr(end, closures, source, env);
+            match (list, start, end) {
+                (SimpleValue::List(values), SimpleValue::Int(start), SimpleValue::Int(end)) => {
+                    let len = values.len();
+                    let start = start.max(0) as usize;
+                    let end = end.max(0) as usize;
+                    let start = start.min(len);
+                    let end = end.min(len);
+                    if start > end {
+                        SimpleValue::List(Vec::new())
+                    } else {
+                        SimpleValue::List(values[start..end].to_vec())
+                    }
+                }
+                _ => SimpleValue::Unknown("<slice>".to_string()),
+            }
+        }
+        kettu_parser::Expr::Map { list, lambda, .. } => {
+            match evaluate_ast_expr(list, closures, source, env) {
+                SimpleValue::List(values) => SimpleValue::List(
+                    values
+                        .into_iter()
+                        .map(|value| apply_lambda_expr(lambda, vec![value], closures, source, env))
+                        .collect(),
+                ),
+                _ => SimpleValue::Unknown("<map>".to_string()),
+            }
+        }
+        kettu_parser::Expr::Filter { list, lambda, .. } => {
+            match evaluate_ast_expr(list, closures, source, env) {
+                SimpleValue::List(values) => SimpleValue::List(
+                    values
+                        .into_iter()
+                        .filter(|value| {
+                            matches!(
+                                apply_lambda_expr(
+                                    lambda,
+                                    vec![value.clone()],
+                                    closures,
+                                    source,
+                                    env,
+                                ),
+                                SimpleValue::Bool(true)
+                            )
+                        })
+                        .collect(),
+                ),
+                _ => SimpleValue::Unknown("<filter>".to_string()),
+            }
+        }
+        kettu_parser::Expr::Reduce {
+            list, init, lambda, ..
+        } => {
+            let values = match evaluate_ast_expr(list, closures, source, env) {
+                SimpleValue::List(values) => values,
+                _ => return SimpleValue::Unknown("<reduce>".to_string()),
+            };
+            let mut acc = evaluate_ast_expr(init, closures, source, env);
+            for value in values {
+                acc = apply_lambda_expr(lambda, vec![acc, value], closures, source, env);
+            }
+            acc
+        }
+        kettu_parser::Expr::Range { .. } => evaluate_range_values(expr, closures, source, env)
+            .map(|values| {
+                SimpleValue::List(values.into_iter().map(SimpleValue::Int).collect())
+            })
+            .unwrap_or_else(|| SimpleValue::Unknown("<range>".to_string())),
+        kettu_parser::Expr::While { .. }
+        | kettu_parser::Expr::For { .. }
+        | kettu_parser::Expr::ForEach { .. } => evaluate_simulated_expr_value(expr, closures, source, env)
+            .unwrap_or_else(|| SimpleValue::Unknown("<loop>".to_string())),
         kettu_parser::Expr::Call { func, args, .. } => {
             if let kettu_parser::Expr::Ident(id) = func.as_ref() {
                 if let Some(closure) = closures
@@ -2532,7 +3161,64 @@ fn evaluate_ast_expr(
             ),
             _ => SimpleValue::Unknown("<if>".to_string()),
         },
+        kettu_parser::Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            let scrutinee = evaluate_ast_expr(scrutinee, closures, source, env);
+            if let Some((arm, bindings)) = select_match_arm(arms, &scrutinee, closures, source, env)
+            {
+                let mut match_env = env.clone();
+                match_env.extend(bindings);
+                evaluate_tail_block_value(&arm.body, closures, source, &match_env)
+            } else {
+                SimpleValue::Unknown("<match>".to_string())
+            }
+        }
         _ => SimpleValue::Unknown("<expr>".to_string()),
+    }
+}
+
+fn evaluate_simulated_expr_value(
+    expr: &kettu_parser::Expr,
+    closures: &[ClosureRange],
+    source: &str,
+    env: &HashMap<String, SimpleValue>,
+) -> Option<SimpleValue> {
+    let mut env = env.clone();
+    let mut trace = Vec::new();
+    match simulate_expr_statement(expr, closures, source, &mut env, &mut trace, true) {
+        StatementFlow::Return(Some(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn apply_lambda_expr(
+    lambda: &kettu_parser::Expr,
+    args: Vec<SimpleValue>,
+    closures: &[ClosureRange],
+    source: &str,
+    env: &HashMap<String, SimpleValue>,
+) -> SimpleValue {
+    match lambda {
+        kettu_parser::Expr::Lambda { params, body, .. } => {
+            let mut lambda_env = env.clone();
+            for (param, value) in params.iter().zip(args.into_iter()) {
+                lambda_env.insert(param.name.clone(), value);
+            }
+            evaluate_ast_expr(body, closures, source, &lambda_env)
+        }
+        kettu_parser::Expr::Ident(id) => {
+            if let Some(closure) = closures.iter().rev().find(|closure| closure.name == id.name) {
+                let mut closure_env = env.clone();
+                for (param, value) in closure.params.iter().zip(args.into_iter()) {
+                    closure_env.insert(param.clone(), value);
+                }
+                evaluate_ast_expr(&closure.body, closures, source, &closure_env)
+            } else {
+                SimpleValue::Unknown("<lambda>".to_string())
+            }
+        }
+        _ => SimpleValue::Unknown("<lambda>".to_string()),
     }
 }
 
@@ -2607,22 +3293,43 @@ fn select_match_arm<'a>(
     closures: &[ClosureRange],
     source: &str,
     env: &HashMap<String, SimpleValue>,
-) -> Option<&'a kettu_parser::MatchArm> {
-    arms.iter().find(|arm| match &arm.pattern {
-        kettu_parser::Pattern::Wildcard(_) => true,
+) -> Option<(&'a kettu_parser::MatchArm, HashMap<String, SimpleValue>)> {
+    arms.iter().find_map(|arm| match &arm.pattern {
+        kettu_parser::Pattern::Wildcard(_) => Some((arm, HashMap::new())),
         kettu_parser::Pattern::Literal(expr) => {
-            evaluate_ast_expr(expr, closures, source, env) == *scrutinee
+            (evaluate_ast_expr(expr, closures, source, env) == *scrutinee)
+                .then(|| (arm, HashMap::new()))
         }
-        kettu_parser::Pattern::Variant { .. } => false,
+        kettu_parser::Pattern::Variant {
+            case_name, binding, ..
+        } => match scrutinee {
+            SimpleValue::Result { discriminant, .. }
+                if *discriminant == variant_discriminant(&case_name.name) =>
+            {
+                let mut bindings = HashMap::new();
+                if let Some(binding) = binding {
+                    if let Some(value) = variant_pattern_binding_value(scrutinee) {
+                        bindings.insert(binding.name.clone(), value);
+                    }
+                }
+                Some((arm, bindings))
+            }
+            _ => None,
+        },
     })
 }
 
-fn record_trace_event(trace: &mut Vec<TraceEvent>, line: i64, env: &HashMap<String, SimpleValue>) {
-    if line <= 0 {
+fn record_trace_event(
+    trace: &mut Vec<TraceEvent>,
+    position: SourcePosition,
+    env: &HashMap<String, SimpleValue>,
+) {
+    if position.line <= 0 {
         return;
     }
     trace.push(TraceEvent {
-        line,
+        line: position.line,
+        column: position.column,
         env_before: env.clone(),
         runtime_subprogram_start_line: None,
         runtime_locals: HashMap::new(),
@@ -2631,9 +3338,9 @@ fn record_trace_event(trace: &mut Vec<TraceEvent>, line: i64, env: &HashMap<Stri
     });
 }
 
-fn expr_start_line(expr: &kettu_parser::Expr, source: &str) -> i64 {
+fn expr_start_position(expr: &kettu_parser::Expr, source: &str) -> SourcePosition {
     match expr {
-        kettu_parser::Expr::Ident(id) => offset_to_line(source, id.span.start) as i64,
+        kettu_parser::Expr::Ident(id) => offset_to_position(source, id.span.start),
         kettu_parser::Expr::Integer(_, span)
         | kettu_parser::Expr::String(_, span)
         | kettu_parser::Expr::InterpolatedString(_, span)
@@ -2678,7 +3385,7 @@ fn expr_start_line(expr: &kettu_parser::Expr, source: &str) -> i64 {
         | kettu_parser::Expr::ThreadJoin { span, .. }
         | kettu_parser::Expr::AtomicBlock { span, .. }
         | kettu_parser::Expr::SimdOp { span, .. }
-        | kettu_parser::Expr::SimdForEach { span, .. } => offset_to_line(source, span.start) as i64,
+        | kettu_parser::Expr::SimdForEach { span, .. } => offset_to_position(source, span.start),
     }
 }
 
@@ -2763,25 +3470,54 @@ fn find_invoked_closure(
         }
     }
 
-    session
+    let inline_closure = session
         .closures
         .iter()
         .enumerate()
         .filter(|(_, closure)| closure.inline_invocation_line == Some(current_line))
-        .max_by_key(|(_, closure)| (closure.start_line, closure.end_line))
-        .map(|(closure_index, closure)| {
-            let parent_target = session
-                .active_closures
-                .last()
-                .map(|active| FrameTarget::Closure(active.closure_index))
-                .unwrap_or(FrameTarget::Test);
-            let call_env = frame_base_environment(session, parent_target);
-            let capture_bindings = capture_values_for_closure(session, closure_index, &call_env);
-            let param_bindings = closure
-                .params
+        .min_by_key(|(_, closure)| {
+            let current_column = session.current_column.max(1);
+            let distance = if closure.start_line == current_line && current_column == closure.start_column {
+                0
+            } else if closure.start_line == current_line && closure.start_column >= current_column {
+                closure.start_column - current_column
+            } else {
+                i64::MAX / 4 + closure.start_column
+            };
+            (distance, closure.start_column)
+        })
+        .or_else(|| {
+            session
+                .closures
                 .iter()
-                .map(|param| (param.clone(), SimpleValue::Unknown("<param>".to_string())))
-                .collect();
+                .enumerate()
+                .filter(|(_, closure)| closure.inline_invocation_line == Some(current_line))
+                .max_by_key(|(_, closure)| (closure.start_line, closure.end_line, closure.start_column))
+        });
+
+    inline_closure.map(|(closure_index, closure)| {
+        let parent_target = session
+            .active_closures
+            .last()
+            .map(|active| FrameTarget::Closure(active.closure_index))
+            .unwrap_or(FrameTarget::Test);
+        let call_env = frame_base_environment(session, parent_target);
+        let capture_bindings = capture_values_for_closure(session, closure_index, &call_env);
+        let source_env = infer_values_in_range(
+            &session.source_lines,
+            1,
+            current_line,
+            &HashMap::new(),
+        );
+        let param_bindings = build_inline_hof_param_bindings(closure, line, &call_env)
+            .or_else(|| build_inline_hof_param_bindings(closure, line, &source_env))
+            .unwrap_or_else(|| {
+                closure
+                    .params
+                    .iter()
+                    .map(|param| (param.clone(), SimpleValue::Unknown("<param>".to_string())))
+                    .collect()
+            });
             (
                 closure_index,
                 current_line + 1,
@@ -3172,6 +3908,44 @@ fn build_param_bindings(
         .collect()
 }
 
+fn first_list_element(value: SimpleValue) -> Option<SimpleValue> {
+    match value {
+        SimpleValue::List(values) => values.into_iter().next(),
+        _ => None,
+    }
+}
+
+fn build_inline_hof_param_bindings(
+    closure: &ClosureRange,
+    line: &str,
+    env: &HashMap<String, SimpleValue>,
+) -> Option<HashMap<String, SimpleValue>> {
+    let call_name = extract_call_name(line)?;
+    let args = extract_call_arguments(line)?;
+
+    match call_name.as_str() {
+        "map" | "filter" if closure.params.len() == 1 => {
+            let element = args
+                .first()
+                .map(|arg| infer_expr_value(arg, env))
+                .and_then(first_list_element)?;
+            Some(HashMap::from([(closure.params[0].clone(), element)]))
+        }
+        "reduce" if closure.params.len() >= 2 && args.len() >= 2 => {
+            let acc = infer_expr_value(&args[1], env);
+            let element = first_list_element(infer_expr_value(&args[0], env))?;
+            let mut bindings = HashMap::new();
+            bindings.insert(closure.params[0].clone(), acc);
+            bindings.insert(closure.params[1].clone(), element);
+            for param in closure.params.iter().skip(2) {
+                bindings.insert(param.clone(), SimpleValue::Unknown("<param>".to_string()));
+            }
+            Some(bindings)
+        }
+        _ => None,
+    }
+}
+
 fn extract_call_arguments(line: &str) -> Option<Vec<String>> {
     let start = line.find('(')?;
     let mut depth = 0i64;
@@ -3349,7 +4123,41 @@ fn infer_expr_value(expr: &str, env: &HashMap<String, SimpleValue>) -> SimpleVal
         return SimpleValue::Unknown("<unknown>".to_string());
     }
 
-    evaluate_expression(trimmed, env).unwrap_or_else(|_| parse_literal_or_unknown(trimmed))
+    evaluate_expression(trimmed, env).unwrap_or_else(|_| parse_variant_or_literal(trimmed, env))
+}
+
+fn parse_variant_or_literal(expr: &str, env: &HashMap<String, SimpleValue>) -> SimpleValue {
+    let trimmed = expr.trim();
+
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        return SimpleValue::List(
+            split_top_level_arguments(inner)
+                .into_iter()
+                .map(|value| infer_expr_value(&value, env))
+                .collect(),
+        );
+    }
+
+    if trimmed == "none" {
+        return simple_variant_value("none", None);
+    }
+
+    if let Some((constructor, rest)) = trimmed.split_once('(') {
+        if let Some(inner) = rest.strip_suffix(')') {
+            match constructor.trim() {
+                "some" | "ok" | "err" => {
+                    return simple_variant_value(
+                        constructor.trim(),
+                        Some(infer_expr_value(inner, env)),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    parse_literal_or_unknown(trimmed)
 }
 
 fn parse_literal_or_unknown(expr: &str) -> SimpleValue {
@@ -3888,6 +4696,7 @@ mod tests {
     };
     use kettu_codegen::CompileOptions;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     #[test]
@@ -3968,6 +4777,181 @@ mod tests {
 
         assert_eq!(a.value, "2");
         assert_eq!(b.value, "\"ok\"");
+    }
+
+    #[test]
+    fn evaluate_ast_expr_supports_record_literals_and_fields() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let r = { a: 1, b: 2, c: 3 };
+        return r.b == 2;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let func = ast
+            .items
+            .iter()
+            .find_map(|item| match item {
+                kettu_parser::TopLevelItem::Interface(interface) => interface
+                    .items
+                    .iter()
+                    .find_map(|item| match item {
+                        kettu_parser::InterfaceItem::Func(func) if func.name.name == "t" => {
+                            Some(func)
+                        }
+                        _ => None,
+                    }),
+                _ => None,
+            })
+            .expect("test function");
+
+        let body = func.body.as_ref().expect("function body");
+        let mut env = HashMap::new();
+        let record_value = match &body.statements[0] {
+            kettu_parser::Statement::Let { value, .. } => {
+                super::evaluate_ast_expr(value, &[], source, &env)
+            }
+            other => panic!("expected let statement, got {other:?}"),
+        };
+        env.insert("r".to_string(), record_value.clone());
+
+        assert_eq!(record_value.display(), "{ a: 1, b: 2, c: 3 }");
+
+        let field_value = match &body.statements[1] {
+            kettu_parser::Statement::Return(Some(kettu_parser::Expr::Binary { lhs, .. })) => {
+                super::evaluate_ast_expr(lhs, &[], source, &env)
+            }
+            other => panic!("expected return binary statement, got {other:?}"),
+        };
+        assert_eq!(field_value, super::SimpleValue::Int(2));
+    }
+
+    #[test]
+    fn evaluate_ast_expr_supports_variant_literals_and_match() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let r = ok(10);
+        return match r {
+            #ok(v) => v == 10,
+            #err(_) => false,
+        };
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let func = ast
+            .items
+            .iter()
+            .find_map(|item| match item {
+                kettu_parser::TopLevelItem::Interface(interface) => interface
+                    .items
+                    .iter()
+                    .find_map(|item| match item {
+                        kettu_parser::InterfaceItem::Func(func) if func.name.name == "t" => {
+                            Some(func)
+                        }
+                        _ => None,
+                    }),
+                _ => None,
+            })
+            .expect("test function");
+
+        let body = func.body.as_ref().expect("function body");
+        let mut env = HashMap::new();
+        let variant_value = match &body.statements[0] {
+            kettu_parser::Statement::Let { value, .. } => {
+                super::evaluate_ast_expr(value, &[], source, &env)
+            }
+            other => panic!("expected let statement, got {other:?}"),
+        };
+        env.insert("r".to_string(), variant_value.clone());
+
+        assert_eq!(variant_value.display(), "ok(10)");
+
+        let match_value = match &body.statements[1] {
+            kettu_parser::Statement::Return(Some(expr)) => {
+                super::evaluate_ast_expr(expr, &[], source, &env)
+            }
+            other => panic!("expected return statement, got {other:?}"),
+        };
+        assert_eq!(match_value, super::SimpleValue::Bool(true));
+    }
+
+    #[test]
+    fn parse_eval_expression_supports_list_transforms() {
+        let expr = super::parse_eval_expression("map([1, 2, 3], |v| v + 1)")
+            .expect("parse eval expression");
+        let value = super::evaluate_ast_expr(&expr, &[], "", &HashMap::new());
+
+        assert_eq!(
+            value,
+            super::SimpleValue::List(vec![
+                super::SimpleValue::Int(2),
+                super::SimpleValue::Int(3),
+                super::SimpleValue::Int(4),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_eval_expression_supports_try_and_list_set() {
+        let try_expr = super::parse_eval_expression("ok(10)? + 5").expect("parse try expression");
+        let try_value = super::evaluate_ast_expr(&try_expr, &[], "", &HashMap::new());
+        assert_eq!(try_value, super::SimpleValue::Int(15));
+
+        let list_set_expr = super::parse_eval_expression("list-set([1, 2, 3], 1, 9)")
+            .expect("parse list-set expression");
+        let list_set_value = super::evaluate_ast_expr(&list_set_expr, &[], "", &HashMap::new());
+        assert_eq!(
+            list_set_value,
+            super::SimpleValue::List(vec![
+                super::SimpleValue::Int(1),
+                super::SimpleValue::Int(9),
+                super::SimpleValue::Int(3),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_eval_expression_preserves_structured_variant_payloads() {
+        let ok_expr = super::parse_eval_expression("ok([1, 2])").expect("parse ok expression");
+        let ok_value = super::evaluate_ast_expr(&ok_expr, &[], "", &HashMap::new());
+        assert_eq!(ok_value.display(), "ok([1, 2])");
+
+        let try_expr = super::parse_eval_expression("ok([1, 2])?")
+            .expect("parse structured try expression");
+        let try_value = super::evaluate_ast_expr(&try_expr, &[], "", &HashMap::new());
+        assert_eq!(
+            try_value,
+            super::SimpleValue::List(vec![
+                super::SimpleValue::Int(1),
+                super::SimpleValue::Int(2),
+            ])
+        );
+
+        let optional_expr = super::parse_eval_expression("some({ total: 9 })?.total")
+            .expect("parse optional-chain expression");
+        let optional_value = super::evaluate_ast_expr(&optional_expr, &[], "", &HashMap::new());
+        assert_eq!(optional_value.display(), "some(9)");
+    }
+
+    #[test]
+    fn offset_to_line_col_tracks_columns() {
+        let source = "first\n  second\nthird";
+
+        assert_eq!(super::offset_to_line_col(source, 0), (1, 1));
+        assert_eq!(super::offset_to_line_col(source, 6), (2, 1));
+        assert_eq!(super::offset_to_line_col(source, 8), (2, 3));
+        assert_eq!(super::offset_to_line_col(source, source.len()), (3, 6));
     }
 
     #[test]

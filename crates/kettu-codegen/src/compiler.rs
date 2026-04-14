@@ -600,10 +600,39 @@ struct ForEachLoopAnalysis {
     memory_access: MemoryAccessPattern,
 }
 
-fn const_i32_expr(expr: &Expr) -> Option<i32> {
+fn const_i32_expr_with_locals(
+    expr: &Expr,
+    local_constants: Option<&HashMap<String, i32>>,
+) -> Option<i32> {
     match expr {
         Expr::Integer(value, _) if *value >= i32::MIN as i64 && *value <= i32::MAX as i64 => {
             Some(*value as i32)
+        }
+        Expr::Ident(id) => local_constants.and_then(|constants| constants.get(&id.name).copied()),
+        Expr::Neg(inner, _) => const_i32_expr_with_locals(inner, local_constants)?.checked_neg(),
+        Expr::Binary { lhs, op, rhs, .. } => {
+            let lhs = const_i32_expr_with_locals(lhs, local_constants)?;
+            let rhs = const_i32_expr_with_locals(rhs, local_constants)?;
+            match op {
+                BinOp::Add => lhs.checked_add(rhs),
+                BinOp::Sub => lhs.checked_sub(rhs),
+                BinOp::Mul => lhs.checked_mul(rhs),
+                BinOp::Div => {
+                    if rhs == 0 {
+                        None
+                    } else {
+                        lhs.checked_div(rhs)
+                    }
+                }
+                BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::And
+                | BinOp::Or => None,
+            }
         }
         _ => None,
     }
@@ -630,6 +659,14 @@ fn compute_range_trip_count(start: i32, end: i32, step: i32, descending: bool) -
 }
 
 fn analyze_range_loop(induction_variable: &str, range: &Expr) -> Option<RangeLoopAnalysis> {
+    analyze_range_loop_with_locals(induction_variable, range, None)
+}
+
+fn analyze_range_loop_with_locals(
+    induction_variable: &str,
+    range: &Expr,
+    local_constants: Option<&HashMap<String, i32>>,
+) -> Option<RangeLoopAnalysis> {
     let Expr::Range {
         start,
         end,
@@ -642,11 +679,15 @@ fn analyze_range_loop(induction_variable: &str, range: &Expr) -> Option<RangeLoo
     };
 
     let constant_step = match step.as_deref() {
-        Some(step_expr) => const_i32_expr(step_expr),
+        Some(step_expr) => const_i32_expr_with_locals(step_expr, local_constants),
         None => Some(1),
     };
 
-    let trip_count = match (const_i32_expr(start), const_i32_expr(end), constant_step) {
+    let trip_count = match (
+        const_i32_expr_with_locals(start, local_constants),
+        const_i32_expr_with_locals(end, local_constants),
+        constant_step,
+    ) {
         (Some(start), Some(end), Some(step)) => {
             compute_range_trip_count(start, end, step, *descending).map(LoopTripCount::Constant)
         }
@@ -723,6 +764,8 @@ struct ModuleCompiler<'a> {
     debug_exit_hook_idx: Option<u32>,
     /// Active debug hook context while compiling a function/lambda body
     active_debug_hook_context: Option<ActiveDebugHookContext>,
+    /// Compile-time constant i32 locals visible in the current function/lambda scope
+    active_constant_locals: Option<HashMap<String, i32>>,
     /// Type index for task.return for each result type
     task_return_types: HashMap<Vec<ValType>, u32>,
     /// Callback function bodies for async functions: (entry_func_name, func, state_local_count)
@@ -784,6 +827,7 @@ impl<'a> ModuleCompiler<'a> {
             debug_enter_hook_idx: None,
             debug_exit_hook_idx: None,
             active_debug_hook_context: None,
+            active_constant_locals: None,
             task_return_types: HashMap::new(),
             callback_bodies: Vec::new(),
             waitable_set_new_idx: None,
@@ -1518,15 +1562,17 @@ impl<'a> ModuleCompiler<'a> {
                     None
                 };
                 self.with_active_debug_hook_context(debug_context, |compiler| {
-                    if let Some(key) = debug_runtime_key {
-                        compiler.emit_debug_enter_hook(&mut func, key);
-                    }
-                    compiler.emit_debug_line_hook_for_expr(&mut func, body);
-                    compiler.compile_expr_with_locals(&mut func, body, &locals, &locals_types)?;
-                    if let Some(key) = debug_runtime_key {
-                        compiler.emit_debug_exit_hook(&mut func, key);
-                    }
-                    Ok(())
+                    compiler.with_active_constant_locals(Some(HashMap::new()), |compiler| {
+                        if let Some(key) = debug_runtime_key {
+                            compiler.emit_debug_enter_hook(&mut func, key);
+                        }
+                        compiler.emit_debug_line_hook_for_expr(&mut func, body);
+                        compiler.compile_expr_with_locals(&mut func, body, &locals, &locals_types)?;
+                        if let Some(key) = debug_runtime_key {
+                            compiler.emit_debug_exit_hook(&mut func, key);
+                        }
+                        Ok(())
+                    })
                 })?;
                 func.instruction(&Instruction::End);
                 compiled_lambdas.push(func);
@@ -1571,37 +1617,40 @@ impl<'a> ModuleCompiler<'a> {
             let mut locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();
             let locals: HashMap<String, u32> = HashMap::new();
             let mut func = Function::new(vec![(16, ValType::I32)]);
-            for stmt in body_stmts {
-                self.emit_debug_line_hook_for_statement(&mut func, stmt);
-                match stmt {
-                    Statement::Expr(e) => {
-                        self.compile_expr_with_locals(&mut func, e, &locals, &locals_types)?;
-                        func.instruction(&Instruction::Drop);
-                    }
-                    Statement::Let { name: _, value, .. } => {
-                        self.compile_expr_with_locals(&mut func, value, &locals, &locals_types)?;
-                        func.instruction(&Instruction::Drop);
-                    }
-                    Statement::GuardLet {
-                        value, else_body, ..
-                    } => {
-                        self.compile_guard_let_statement(&mut func, value, else_body)?;
-                    }
-                    Statement::Guard {
-                        condition,
-                        else_body,
-                    } => {
-                        self.compile_guard_statement_with_locals(
-                            &mut func,
+            self.with_active_constant_locals(Some(HashMap::new()), |compiler| {
+                for stmt in body_stmts {
+                    compiler.emit_debug_line_hook_for_statement(&mut func, stmt);
+                    match stmt {
+                        Statement::Expr(e) => {
+                            compiler.compile_expr_with_locals(&mut func, e, &locals, &locals_types)?;
+                            func.instruction(&Instruction::Drop);
+                        }
+                        Statement::Let { name: _, value, .. } => {
+                            compiler.compile_expr_with_locals(&mut func, value, &locals, &locals_types)?;
+                            func.instruction(&Instruction::Drop);
+                        }
+                        Statement::GuardLet {
+                            value, else_body, ..
+                        } => {
+                            compiler.compile_guard_let_statement(&mut func, value, else_body)?;
+                        }
+                        Statement::Guard {
                             condition,
                             else_body,
-                            &locals,
-                            &mut locals_types,
-                        )?;
+                        } => {
+                            compiler.compile_guard_statement_with_locals(
+                                &mut func,
+                                condition,
+                                else_body,
+                                &locals,
+                                &mut locals_types,
+                            )?;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
+                Ok(())
+            })?;
             func.instruction(&Instruction::End);
             compiled_spawns.push(func);
         }
@@ -3379,177 +3428,191 @@ impl<'a> ModuleCompiler<'a> {
         let mut locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();
 
         self.with_active_debug_hook_context(debug_context, |compiler| {
-            if let Some(ref body) = func.body {
-                let stmts = &body.statements;
-                if !stmts.is_empty() {
-                    // Compile all but last statement normally
-                    for stmt in &stmts[..stmts.len() - 1] {
-                        compiler.compile_statement_with_locals(
-                            &mut function,
-                            stmt,
-                            &locals,
-                            &mut locals_types,
-                        )?;
-                    }
-                    // Last statement: if it's an expression, leave value on stack for return
-                    let last = &stmts[stmts.len() - 1];
-                    compiler.emit_debug_line_hook_for_statement(&mut function, last);
-                    match last {
-                        Statement::CompoundAssign { name, op, value } => {
-                            // Compile as: local.get + value + op + local.set
-                            if let Some(&idx) = locals.get(&name.name) {
-                                function.instruction(&Instruction::LocalGet(idx));
-                            }
-                            compiler.compile_expr_with_locals(
+            compiler.with_active_constant_locals(Some(HashMap::new()), |compiler| {
+                if let Some(ref body) = func.body {
+                    let stmts = &body.statements;
+                    if !stmts.is_empty() {
+                        for stmt in &stmts[..stmts.len() - 1] {
+                            compiler.compile_statement_with_locals(
                                 &mut function,
-                                value,
+                                stmt,
                                 &locals,
-                                &locals_types,
+                                &mut locals_types,
                             )?;
-                            match op {
-                                BinOp::Add => function.instruction(&Instruction::I32Add),
-                                BinOp::Sub => function.instruction(&Instruction::I32Sub),
-                                _ => function.instruction(&Instruction::I32Add),
-                            };
-                            if let Some(&idx) = locals.get(&name.name) {
-                                function.instruction(&Instruction::LocalSet(idx));
-                            }
-                            function.instruction(&Instruction::I32Const(0));
                         }
-                        Statement::Expr(expr) => {
-                            compiler.compile_expr_with_locals(
-                                &mut function,
-                                expr,
-                                &locals,
-                                &locals_types,
-                            )?;
 
-                            if func.is_async && compiler.options.wasip3 {
-                                if let Some(ref result_ty) = func.result {
-                                    let result_valtype = compiler.ty_to_valtype(result_ty)?;
-                                    let task_return_idx =
-                                        compiler.ensure_task_return_import(&[result_valtype]);
-                                    function.instruction(&Instruction::Call(task_return_idx));
+                        let last = &stmts[stmts.len() - 1];
+                        compiler.emit_debug_line_hook_for_statement(&mut function, last);
+                        match last {
+                            Statement::CompoundAssign { name, op, value } => {
+                                if let Some(&idx) = locals.get(&name.name) {
+                                    function.instruction(&Instruction::LocalGet(idx));
+                                }
+                                compiler.compile_expr_with_locals(
+                                    &mut function,
+                                    value,
+                                    &locals,
+                                    &locals_types,
+                                )?;
+                                match op {
+                                    BinOp::Add => function.instruction(&Instruction::I32Add),
+                                    BinOp::Sub => function.instruction(&Instruction::I32Sub),
+                                    _ => function.instruction(&Instruction::I32Add),
+                                };
+                                if let Some(&idx) = locals.get(&name.name) {
+                                    function.instruction(&Instruction::LocalSet(idx));
                                 }
                                 function.instruction(&Instruction::I32Const(0));
                             }
-                        }
-                        Statement::Return(Some(expr)) => {
-                            compiler.compile_expr_with_locals(
-                                &mut function,
-                                expr,
-                                &locals,
-                                &locals_types,
-                            )?;
+                            Statement::Expr(expr) => {
+                                compiler.compile_expr_with_locals(
+                                    &mut function,
+                                    expr,
+                                    &locals,
+                                    &locals_types,
+                                )?;
 
-                            if func.is_async && compiler.options.wasip3 {
-                                if let Some(ref result_ty) = func.result {
-                                    let result_valtype = compiler.ty_to_valtype(result_ty)?;
-                                    let task_return_idx =
-                                        compiler.ensure_task_return_import(&[result_valtype]);
-                                    function.instruction(&Instruction::Call(task_return_idx));
+                                if func.is_async && compiler.options.wasip3 {
+                                    if let Some(ref result_ty) = func.result {
+                                        let result_valtype = compiler.ty_to_valtype(result_ty)?;
+                                        let task_return_idx =
+                                            compiler.ensure_task_return_import(&[result_valtype]);
+                                        function.instruction(&Instruction::Call(task_return_idx));
+                                    }
+                                    function.instruction(&Instruction::I32Const(0));
                                 }
-                                function.instruction(&Instruction::I32Const(0));
+                            }
+                            Statement::Return(Some(expr)) => {
+                                compiler.compile_expr_with_locals(
+                                    &mut function,
+                                    expr,
+                                    &locals,
+                                    &locals_types,
+                                )?;
+
+                                if func.is_async && compiler.options.wasip3 {
+                                    if let Some(ref result_ty) = func.result {
+                                        let result_valtype = compiler.ty_to_valtype(result_ty)?;
+                                        let task_return_idx =
+                                            compiler.ensure_task_return_import(&[result_valtype]);
+                                        function.instruction(&Instruction::Call(task_return_idx));
+                                    }
+                                    function.instruction(&Instruction::I32Const(0));
+                                    function.instruction(&Instruction::Return);
+                                } else {
+                                    function.instruction(&Instruction::Return);
+                                }
+                            }
+                            Statement::Return(None) => {
+                                if func.is_async && compiler.options.wasip3 {
+                                    let task_return_idx = compiler.ensure_task_return_import(&[]);
+                                    function.instruction(&Instruction::Call(task_return_idx));
+                                    function.instruction(&Instruction::I32Const(0));
+                                }
                                 function.instruction(&Instruction::Return);
-                            } else {
-                                function.instruction(&Instruction::Return);
                             }
-                        }
-                        Statement::Return(None) => {
-                            if func.is_async && compiler.options.wasip3 {
-                                let task_return_idx = compiler.ensure_task_return_import(&[]);
-                                function.instruction(&Instruction::Call(task_return_idx));
-                                function.instruction(&Instruction::I32Const(0));
+                            Statement::Let { name, value } => {
+                                if let Expr::RecordLiteral { fields, .. } = value {
+                                    let field_info: Vec<_> = fields
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, (field_name, _))| {
+                                            (field_name.name.clone(), i * 4)
+                                        })
+                                        .collect();
+                                    locals_types.insert(
+                                        name.name.clone(),
+                                        RecordTypeInfo::from_fields(&field_info),
+                                    );
+                                }
+                                compiler.compile_expr_with_locals(
+                                    &mut function,
+                                    value,
+                                    &locals,
+                                    &locals_types,
+                                )?;
+                                if let Some(&idx) = locals.get(&name.name) {
+                                    function.instruction(&Instruction::LocalSet(idx));
+                                }
+                                if (func.is_async && compiler.options.wasip3)
+                                    || func.result.is_some()
+                                {
+                                    function.instruction(&Instruction::I32Const(0));
+                                }
                             }
-                            function.instruction(&Instruction::Return);
-                        }
-                        Statement::Let { name, value } => {
-                            if let Expr::RecordLiteral { fields, .. } = value {
-                                let field_info: Vec<_> = fields
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, (field_name, _))| (field_name.name.clone(), i * 4))
-                                    .collect();
-                                locals_types.insert(
-                                    name.name.clone(),
-                                    RecordTypeInfo::from_fields(&field_info),
-                                );
+                            Statement::Assign { name, value } => {
+                                compiler.compile_expr_with_locals(
+                                    &mut function,
+                                    value,
+                                    &locals,
+                                    &locals_types,
+                                )?;
+                                if let Some(&idx) = locals.get(&name.name) {
+                                    function.instruction(&Instruction::LocalSet(idx));
+                                }
+                                if (func.is_async && compiler.options.wasip3)
+                                    || func.result.is_some()
+                                {
+                                    function.instruction(&Instruction::I32Const(0));
+                                }
                             }
-                            compiler.compile_expr_with_locals(
-                                &mut function,
-                                value,
-                                &locals,
-                                &locals_types,
-                            )?;
-                            if let Some(&idx) = locals.get(&name.name) {
-                                function.instruction(&Instruction::LocalSet(idx));
+                            Statement::Break { .. } | Statement::Continue { .. } => {
+                                if (func.is_async && compiler.options.wasip3)
+                                    || func.result.is_some()
+                                {
+                                    function.instruction(&Instruction::I32Const(0));
+                                }
                             }
-                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
-                                function.instruction(&Instruction::I32Const(0));
+                            Statement::SharedLet { .. } => {
+                                if (func.is_async && compiler.options.wasip3)
+                                    || func.result.is_some()
+                                {
+                                    function.instruction(&Instruction::I32Const(0));
+                                }
                             }
-                        }
-                        Statement::Assign { name, value } => {
-                            compiler.compile_expr_with_locals(
-                                &mut function,
-                                value,
-                                &locals,
-                                &locals_types,
-                            )?;
-                            if let Some(&idx) = locals.get(&name.name) {
-                                function.instruction(&Instruction::LocalSet(idx));
-                            }
-                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
-                                function.instruction(&Instruction::I32Const(0));
-                            }
-                        }
-                        Statement::Break { .. } | Statement::Continue { .. } => {
-                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
-                                function.instruction(&Instruction::I32Const(0));
-                            }
-                        }
-                        Statement::SharedLet { .. } => {
-                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
-                                function.instruction(&Instruction::I32Const(0));
-                            }
-                        }
-                        Statement::GuardLet {
-                            name,
-                            value,
-                            else_body,
-                        } => {
-                            compiler.compile_guard_let_statement_with_locals(
-                                &mut function,
+                            Statement::GuardLet {
                                 name,
                                 value,
                                 else_body,
-                                &locals,
-                                &mut locals_types,
-                            )?;
-                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
-                                function.instruction(&Instruction::I32Const(0));
+                            } => {
+                                compiler.compile_guard_let_statement_with_locals(
+                                    &mut function,
+                                    name,
+                                    value,
+                                    else_body,
+                                    &locals,
+                                    &mut locals_types,
+                                )?;
+                                if (func.is_async && compiler.options.wasip3)
+                                    || func.result.is_some()
+                                {
+                                    function.instruction(&Instruction::I32Const(0));
+                                }
                             }
-                        }
-                        Statement::Guard {
-                            condition,
-                            else_body,
-                        } => {
-                            compiler.compile_guard_statement_with_locals(
-                                &mut function,
+                            Statement::Guard {
                                 condition,
                                 else_body,
-                                &locals,
-                                &mut locals_types,
-                            )?;
-                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
-                                function.instruction(&Instruction::I32Const(0));
+                            } => {
+                                compiler.compile_guard_statement_with_locals(
+                                    &mut function,
+                                    condition,
+                                    else_body,
+                                    &locals,
+                                    &mut locals_types,
+                                )?;
+                                if (func.is_async && compiler.options.wasip3)
+                                    || func.result.is_some()
+                                {
+                                    function.instruction(&Instruction::I32Const(0));
+                                }
                             }
                         }
                     }
                 } else if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
                     function.instruction(&Instruction::I32Const(0));
                 }
-            }
-            Ok(())
+                Ok(())
+            })
         })?;
 
         // If this async function has await points, register a callback export
@@ -3665,9 +3728,12 @@ impl<'a> ModuleCompiler<'a> {
         function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         self.enter_nested_control_block();
         let mut guard_locals_types = locals_types.clone();
-        for stmt in else_body {
-            self.compile_statement_with_locals(function, stmt, locals, &mut guard_locals_types)?;
-        }
+        self.with_active_constant_locals(self.active_constant_locals.clone(), |compiler| {
+            for stmt in else_body {
+                compiler.compile_statement_with_locals(function, stmt, locals, &mut guard_locals_types)?;
+            }
+            Ok(())
+        })?;
         self.exit_nested_control_block();
         function.instruction(&Instruction::Else);
         function.instruction(&Instruction::LocalGet(binding_idx));
@@ -3694,9 +3760,12 @@ impl<'a> ModuleCompiler<'a> {
         function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         self.enter_nested_control_block();
         let mut guard_locals_types = locals_types.clone();
-        for stmt in else_body {
-            self.compile_statement_with_locals(function, stmt, locals, &mut guard_locals_types)?;
-        }
+        self.with_active_constant_locals(self.active_constant_locals.clone(), |compiler| {
+            for stmt in else_body {
+                compiler.compile_statement_with_locals(function, stmt, locals, &mut guard_locals_types)?;
+            }
+            Ok(())
+        })?;
         self.exit_nested_control_block();
         function.instruction(&Instruction::End);
         Ok(())
@@ -4303,6 +4372,7 @@ impl<'a> ModuleCompiler<'a> {
                 )?;
             }
         }
+        self.apply_constant_statement_effect(stmt);
         Ok(())
     }
 
@@ -6473,7 +6543,8 @@ impl<'a> ModuleCompiler<'a> {
                 //   )
                 // )
 
-                let analysis = analyze_range_loop(&variable.name, range.as_ref());
+                let analysis =
+                    analyze_range_loop_with_locals(&variable.name, range.as_ref(), self.active_constant_locals.as_ref());
                 if matches!(
                     analysis
                         .as_ref()
@@ -6535,15 +6606,17 @@ impl<'a> ModuleCompiler<'a> {
                     self.loop_continue_depth = Some(0);
 
                     // Compile body statements
-                    for stmt in body {
-                        self.emit_debug_line_hook_for_statement(function, stmt);
-                        match stmt {
+                    self.with_active_constant_locals(self.active_constant_locals.clone(), |compiler| {
+                        compiler.apply_constant_binding(&analysis.induction_variable, None);
+                        for stmt in body {
+                            compiler.emit_debug_line_hook_for_statement(function, stmt);
+                            match stmt {
                             Statement::Expr(e) => {
-                                self.compile_expr_with_locals(function, e, locals, locals_types)?;
+                                compiler.compile_expr_with_locals(function, e, locals, locals_types)?;
                                 function.instruction(&Instruction::Drop);
                             }
                             Statement::Assign { name, value } => {
-                                self.compile_expr_with_locals(
+                                compiler.compile_expr_with_locals(
                                     function,
                                     value,
                                     locals,
@@ -6552,12 +6625,13 @@ impl<'a> ModuleCompiler<'a> {
                                 if let Some(&idx) = locals.get(&name.name) {
                                     function.instruction(&Instruction::LocalSet(idx));
                                 }
+                                compiler.apply_constant_statement_effect(stmt);
                             }
                             Statement::CompoundAssign { name, op, value } => {
                                 if let Some(&idx) = locals.get(&name.name) {
                                     function.instruction(&Instruction::LocalGet(idx));
                                 }
-                                self.compile_expr_with_locals(
+                                compiler.compile_expr_with_locals(
                                     function,
                                     value,
                                     locals,
@@ -6577,9 +6651,10 @@ impl<'a> ModuleCompiler<'a> {
                                 if let Some(&idx) = locals.get(&name.name) {
                                     function.instruction(&Instruction::LocalSet(idx));
                                 }
+                                compiler.apply_constant_statement_effect(stmt);
                             }
                             Statement::Let { name, value } => {
-                                self.compile_expr_with_locals(
+                                compiler.compile_expr_with_locals(
                                     function,
                                     value,
                                     locals,
@@ -6588,10 +6663,11 @@ impl<'a> ModuleCompiler<'a> {
                                 if let Some(&idx) = locals.get(&name.name) {
                                     function.instruction(&Instruction::LocalSet(idx));
                                 }
+                                compiler.apply_constant_statement_effect(stmt);
                             }
                             Statement::Return(opt_e) => {
                                 if let Some(e) = opt_e {
-                                    self.compile_expr_with_locals(
+                                    compiler.compile_expr_with_locals(
                                         function,
                                         e,
                                         locals,
@@ -6603,7 +6679,7 @@ impl<'a> ModuleCompiler<'a> {
                             Statement::Break { condition } => {
                                 // break -> br 2 (exit outer block, exit loop)
                                 if let Some(cond) = condition {
-                                    self.compile_expr_with_locals(
+                                    compiler.compile_expr_with_locals(
                                         function,
                                         cond,
                                         locals,
@@ -6617,7 +6693,7 @@ impl<'a> ModuleCompiler<'a> {
                             Statement::Continue { condition } => {
                                 // continue -> br 0 (exit body block, fall through to increment)
                                 if let Some(cond) = condition {
-                                    self.compile_expr_with_locals(
+                                    compiler.compile_expr_with_locals(
                                         function,
                                         cond,
                                         locals,
@@ -6634,7 +6710,7 @@ impl<'a> ModuleCompiler<'a> {
                                 value,
                                 else_body,
                             } => {
-                                self.compile_guard_let_statement_with_locals(
+                                compiler.compile_guard_let_statement_with_locals(
                                     function,
                                     name,
                                     value,
@@ -6642,12 +6718,13 @@ impl<'a> ModuleCompiler<'a> {
                                     locals,
                                     locals_types,
                                 )?;
+                                compiler.apply_constant_statement_effect(stmt);
                             }
                             Statement::Guard {
                                 condition,
                                 else_body,
                             } => {
-                                self.compile_guard_statement_with_locals(
+                                compiler.compile_guard_statement_with_locals(
                                     function,
                                     condition,
                                     else_body,
@@ -6656,7 +6733,9 @@ impl<'a> ModuleCompiler<'a> {
                                 )?;
                             }
                         }
-                    }
+                        }
+                        Ok(())
+                    })?;
 
                     function.instruction(&Instruction::End); // end body block
 
@@ -7082,24 +7161,27 @@ impl<'a> ModuleCompiler<'a> {
                 function.instruction(&Instruction::LocalSet(elem_local));
 
                 // Compile body statements
-                for stmt in body {
-                    self.emit_debug_line_hook_for_statement(function, stmt);
-                    match stmt {
+                self.with_active_constant_locals(self.active_constant_locals.clone(), |compiler| {
+                    compiler.apply_constant_binding(&analysis.induction_variable, None);
+                    for stmt in body {
+                        compiler.emit_debug_line_hook_for_statement(function, stmt);
+                        match stmt {
                         Statement::Expr(e) => {
-                            self.compile_expr_with_locals(function, e, locals, locals_types)?;
+                            compiler.compile_expr_with_locals(function, e, locals, locals_types)?;
                             function.instruction(&Instruction::Drop);
                         }
                         Statement::Assign { name, value } => {
-                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                            compiler.compile_expr_with_locals(function, value, locals, locals_types)?;
                             if let Some(&idx) = locals.get(&name.name) {
                                 function.instruction(&Instruction::LocalSet(idx));
                             }
+                            compiler.apply_constant_statement_effect(stmt);
                         }
                         Statement::CompoundAssign { name, op, value } => {
                             if let Some(&idx) = locals.get(&name.name) {
                                 function.instruction(&Instruction::LocalGet(idx));
                             }
-                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                            compiler.compile_expr_with_locals(function, value, locals, locals_types)?;
                             match op {
                                 BinOp::Add => {
                                     function.instruction(&Instruction::I32Add);
@@ -7114,22 +7196,24 @@ impl<'a> ModuleCompiler<'a> {
                             if let Some(&idx) = locals.get(&name.name) {
                                 function.instruction(&Instruction::LocalSet(idx));
                             }
+                            compiler.apply_constant_statement_effect(stmt);
                         }
                         Statement::Let { name, value } => {
-                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                            compiler.compile_expr_with_locals(function, value, locals, locals_types)?;
                             if let Some(&idx) = locals.get(&name.name) {
                                 function.instruction(&Instruction::LocalSet(idx));
                             }
+                            compiler.apply_constant_statement_effect(stmt);
                         }
                         Statement::Return(opt_e) => {
                             if let Some(e) = opt_e {
-                                self.compile_expr_with_locals(function, e, locals, locals_types)?;
+                                compiler.compile_expr_with_locals(function, e, locals, locals_types)?;
                             }
                             function.instruction(&Instruction::Return);
                         }
                         Statement::Break { condition } => {
                             if let Some(cond) = condition {
-                                self.compile_expr_with_locals(
+                                compiler.compile_expr_with_locals(
                                     function,
                                     cond,
                                     locals,
@@ -7142,7 +7226,7 @@ impl<'a> ModuleCompiler<'a> {
                         }
                         Statement::Continue { condition } => {
                             if let Some(cond) = condition {
-                                self.compile_expr_with_locals(
+                                compiler.compile_expr_with_locals(
                                     function,
                                     cond,
                                     locals,
@@ -7159,7 +7243,7 @@ impl<'a> ModuleCompiler<'a> {
                             value,
                             else_body,
                         } => {
-                            self.compile_guard_let_statement_with_locals(
+                            compiler.compile_guard_let_statement_with_locals(
                                 function,
                                 name,
                                 value,
@@ -7167,12 +7251,13 @@ impl<'a> ModuleCompiler<'a> {
                                 locals,
                                 locals_types,
                             )?;
+                            compiler.apply_constant_statement_effect(stmt);
                         }
                         Statement::Guard {
                             condition,
                             else_body,
                         } => {
-                            self.compile_guard_statement_with_locals(
+                            compiler.compile_guard_statement_with_locals(
                                 function,
                                 condition,
                                 else_body,
@@ -7181,7 +7266,9 @@ impl<'a> ModuleCompiler<'a> {
                             )?;
                         }
                     }
-                }
+                    }
+                    Ok(())
+                })?;
 
                 // Increment index
                 function.instruction(&Instruction::LocalGet(idx_local));
@@ -7585,86 +7672,94 @@ impl<'a> ModuleCompiler<'a> {
 
                 // Compile body statements: last expression's v128 result stays on stack
                 let mut has_result = false;
-                for (i, stmt) in body.iter().enumerate() {
-                    self.emit_debug_line_hook_for_statement(function, stmt);
-                    match stmt {
-                        Statement::Expr(e) => {
-                            self.compile_expr_with_locals(function, e, locals, locals_types)?;
-                            if i < body.len() - 1 {
-                                function.instruction(&Instruction::Drop);
-                            } else {
-                                has_result = true;
-                            }
-                        }
-                        Statement::Assign { name, value } => {
-                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
-                            if let Some(&idx) = locals.get(&name.name) {
-                                function.instruction(&Instruction::LocalSet(idx));
-                            }
-                        }
-                        Statement::Let { name, value } => {
-                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
-                            if let Some(&idx) = locals.get(&name.name) {
-                                function.instruction(&Instruction::LocalSet(idx));
-                            }
-                        }
-                        Statement::CompoundAssign { name, op, value } => {
-                            if let Some(&idx) = locals.get(&name.name) {
-                                function.instruction(&Instruction::LocalGet(idx));
-                            }
-                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
-                            match op {
-                                BinOp::Add => {
-                                    function.instruction(&Instruction::I32Add);
-                                }
-                                BinOp::Sub => {
-                                    function.instruction(&Instruction::I32Sub);
-                                }
-                                _ => {
-                                    function.instruction(&Instruction::I32Add);
+                self.with_active_constant_locals(self.active_constant_locals.clone(), |compiler| {
+                    compiler.apply_constant_binding(&variable.name, None);
+                    for (i, stmt) in body.iter().enumerate() {
+                        compiler.emit_debug_line_hook_for_statement(function, stmt);
+                        match stmt {
+                            Statement::Expr(e) => {
+                                compiler.compile_expr_with_locals(function, e, locals, locals_types)?;
+                                if i < body.len() - 1 {
+                                    function.instruction(&Instruction::Drop);
+                                } else {
+                                    has_result = true;
                                 }
                             }
-                            if let Some(&idx) = locals.get(&name.name) {
-                                function.instruction(&Instruction::LocalSet(idx));
+                            Statement::Assign { name, value } => {
+                                compiler.compile_expr_with_locals(function, value, locals, locals_types)?;
+                                if let Some(&idx) = locals.get(&name.name) {
+                                    function.instruction(&Instruction::LocalSet(idx));
+                                }
+                                compiler.apply_constant_statement_effect(stmt);
                             }
-                        }
-                        Statement::Return(opt_e) => {
-                            if let Some(e) = opt_e {
-                                self.compile_expr_with_locals(function, e, locals, locals_types)?;
+                            Statement::Let { name, value } => {
+                                compiler.compile_expr_with_locals(function, value, locals, locals_types)?;
+                                if let Some(&idx) = locals.get(&name.name) {
+                                    function.instruction(&Instruction::LocalSet(idx));
+                                }
+                                compiler.apply_constant_statement_effect(stmt);
                             }
-                            function.instruction(&Instruction::Return);
-                        }
-                        Statement::Break { .. }
-                        | Statement::Continue { .. }
-                        | Statement::SharedLet { .. } => {}
-                        Statement::GuardLet {
-                            name,
-                            value,
-                            else_body,
-                        } => {
-                            self.compile_guard_let_statement_with_locals(
-                                function,
+                            Statement::CompoundAssign { name, op, value } => {
+                                if let Some(&idx) = locals.get(&name.name) {
+                                    function.instruction(&Instruction::LocalGet(idx));
+                                }
+                                compiler.compile_expr_with_locals(function, value, locals, locals_types)?;
+                                match op {
+                                    BinOp::Add => {
+                                        function.instruction(&Instruction::I32Add);
+                                    }
+                                    BinOp::Sub => {
+                                        function.instruction(&Instruction::I32Sub);
+                                    }
+                                    _ => {
+                                        function.instruction(&Instruction::I32Add);
+                                    }
+                                }
+                                if let Some(&idx) = locals.get(&name.name) {
+                                    function.instruction(&Instruction::LocalSet(idx));
+                                }
+                                compiler.apply_constant_statement_effect(stmt);
+                            }
+                            Statement::Return(opt_e) => {
+                                if let Some(e) = opt_e {
+                                    compiler.compile_expr_with_locals(function, e, locals, locals_types)?;
+                                }
+                                function.instruction(&Instruction::Return);
+                            }
+                            Statement::Break { .. }
+                            | Statement::Continue { .. }
+                            | Statement::SharedLet { .. } => {}
+                            Statement::GuardLet {
                                 name,
                                 value,
                                 else_body,
-                                locals,
-                                locals_types,
-                            )?;
-                        }
-                        Statement::Guard {
-                            condition,
-                            else_body,
-                        } => {
-                            self.compile_guard_statement_with_locals(
-                                function,
+                            } => {
+                                compiler.compile_guard_let_statement_with_locals(
+                                    function,
+                                    name,
+                                    value,
+                                    else_body,
+                                    locals,
+                                    locals_types,
+                                )?;
+                                compiler.apply_constant_statement_effect(stmt);
+                            }
+                            Statement::Guard {
                                 condition,
                                 else_body,
-                                locals,
-                                locals_types,
-                            )?;
+                            } => {
+                                compiler.compile_guard_statement_with_locals(
+                                    function,
+                                    condition,
+                                    else_body,
+                                    locals,
+                                    locals_types,
+                                )?;
+                            }
                         }
                     }
-                }
+                    Ok(())
+                })?;
 
                 if has_result {
                     // v128.store(list_ptr + 4 + idx*4, result)
@@ -8412,6 +8507,64 @@ impl<'a> ModuleCompiler<'a> {
         }
         Ok(())
     }
+
+    fn with_active_constant_locals<T>(
+        &mut self,
+        locals: Option<HashMap<String, i32>>,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = std::mem::replace(&mut self.active_constant_locals, locals);
+        let result = f(self);
+        self.active_constant_locals = previous;
+        result
+    }
+
+    fn apply_constant_binding(&mut self, name: &str, value: Option<i32>) {
+        if let Some(constants) = self.active_constant_locals.as_mut() {
+            if let Some(value) = value {
+                constants.insert(name.to_string(), value);
+            } else {
+                constants.remove(name);
+            }
+        }
+    }
+
+    fn constant_expr_value(&self, expr: &Expr) -> Option<i32> {
+        const_i32_expr_with_locals(expr, self.active_constant_locals.as_ref())
+    }
+
+    fn apply_constant_statement_effect(&mut self, stmt: &Statement) {
+        match stmt {
+            Statement::Let { name, value } | Statement::Assign { name, value } => {
+                let constant = self.constant_expr_value(value);
+                self.apply_constant_binding(&name.name, constant);
+            }
+            Statement::CompoundAssign { name, op, value } => {
+                let next = match (
+                    self.active_constant_locals
+                        .as_ref()
+                        .and_then(|constants| constants.get(&name.name).copied()),
+                    self.constant_expr_value(value),
+                ) {
+                    (Some(current), Some(rhs)) => match op {
+                        BinOp::Add => current.checked_add(rhs),
+                        BinOp::Sub => current.checked_sub(rhs),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                self.apply_constant_binding(&name.name, next);
+            }
+            Statement::SharedLet { name, .. } | Statement::GuardLet { name, .. } => {
+                self.apply_constant_binding(&name.name, None);
+            }
+            Statement::Expr(_)
+            | Statement::Return(_)
+            | Statement::Break { .. }
+            | Statement::Continue { .. }
+            | Statement::Guard { .. } => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8941,6 +9094,188 @@ mod tests {
                 element_stride_bytes: 4,
             }
         );
+    }
+
+    #[test]
+    fn test_analyze_range_loop_computed_bounds_and_step() {
+        let expr = parse_first_expr_statement(
+            r#"
+            package local:test;
+
+            interface loops {
+                inspect: func() {
+                    for i in (1 + 2) to (20 / 2) step (1 + 1) {
+                        i;
+                    };
+                }
+            }
+        "#,
+        );
+
+        let Expr::For {
+            variable, range, ..
+        } = expr
+        else {
+            panic!("expected for loop");
+        };
+
+        let analysis =
+            analyze_range_loop(&variable.name, range.as_ref()).expect("expected range facts");
+        assert_eq!(analysis.constant_step, Some(2));
+        assert_eq!(analysis.trip_count, Some(LoopTripCount::Constant(4)));
+    }
+
+    #[test]
+    fn test_analyze_range_loop_negative_computed_bounds() {
+        let expr = parse_first_expr_statement(
+            r#"
+            package local:test;
+
+            interface loops {
+                inspect: func() {
+                    for i in -(2 + 1) to 3 {
+                        i;
+                    };
+                }
+            }
+        "#,
+        );
+
+        let Expr::For {
+            variable, range, ..
+        } = expr
+        else {
+            panic!("expected for loop");
+        };
+
+        let analysis =
+            analyze_range_loop(&variable.name, range.as_ref()).expect("expected range facts");
+        assert_eq!(analysis.constant_step, Some(1));
+        assert_eq!(analysis.trip_count, Some(LoopTripCount::Constant(7)));
+    }
+
+    #[test]
+    fn test_analyze_range_loop_with_constant_local_bounds() {
+        let expr = parse_first_expr_statement(
+            r#"
+            package local:test;
+
+            interface loops {
+                inspect: func() {
+                    for i in start to end step stride {
+                        i;
+                    };
+                }
+            }
+        "#,
+        );
+
+        let Expr::For {
+            variable, range, ..
+        } = expr
+        else {
+            panic!("expected for loop");
+        };
+
+        let constants = HashMap::from([
+            ("start".to_string(), 2),
+            ("end".to_string(), 8),
+            ("stride".to_string(), 3),
+        ]);
+
+        let analysis = analyze_range_loop_with_locals(
+            &variable.name,
+            range.as_ref(),
+            Some(&constants),
+        )
+        .expect("expected range facts");
+        assert_eq!(analysis.constant_step, Some(3));
+        assert_eq!(analysis.trip_count, Some(LoopTripCount::Constant(3)));
+    }
+
+    #[test]
+    fn test_analyze_range_loop_non_constant_local_bounds_fall_back() {
+        let expr = parse_first_expr_statement(
+            r#"
+            package local:test;
+
+            interface loops {
+                inspect: func() {
+                    for i in start to end {
+                        i;
+                    };
+                }
+            }
+        "#,
+        );
+
+        let Expr::For {
+            variable, range, ..
+        } = expr
+        else {
+            panic!("expected for loop");
+        };
+
+        let constants = HashMap::from([("start".to_string(), 2)]);
+
+        let analysis = analyze_range_loop_with_locals(
+            &variable.name,
+            range.as_ref(),
+            Some(&constants),
+        )
+        .expect("expected range facts");
+        assert_eq!(analysis.constant_step, Some(1));
+        assert_eq!(analysis.trip_count, None);
+    }
+
+    #[test]
+    fn test_compile_zero_trip_for_loop_with_computed_bounds() {
+        let source = r#"
+            package local:test;
+
+            interface loops {
+                inspect: func() -> s32 {
+                    for i in (4 + 1) to (3 - 1) {
+                        i;
+                    };
+                    0;
+                }
+            }
+        "#;
+
+        let (ast, errors) = parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("Should parse");
+
+        let wasm = compile_module(&ast, &CompileOptions::default())
+            .expect("computed zero-trip loop should compile");
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_zero_trip_for_loop_with_constant_local_bounds() {
+        let source = r#"
+            package local:test;
+
+            interface loops {
+                inspect: func() -> s32 {
+                    let start = 4 + 1;
+                    let finish = 3 - 1;
+                    for i in start to finish {
+                        i;
+                    };
+                    0;
+                }
+            }
+        "#;
+
+        let (ast, errors) = parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("Should parse");
+
+        let wasm = compile_module(&ast, &CompileOptions::default())
+            .expect("constant-local zero-trip loop should compile");
+        assert!(!wasm.is_empty());
     }
 
     #[test]

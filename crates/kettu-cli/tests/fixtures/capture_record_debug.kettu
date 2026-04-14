@@ -1,0 +1,14 @@
+package local:capture-record-debug;
+
+interface tests {
+    @test
+    test-capture-record: func() -> bool {
+        let rec = { a: 1, b: 2 };
+        let add-rec = |n| n + rec.a + rec.b;
+        add-rec(3) == 6;
+    }
+}
+
+world tests {
+    export tests;
+}
