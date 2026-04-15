@@ -1,0 +1,19 @@
+package local:resource-debug;
+
+interface tests {
+    resource counter {
+        constructor(initial: s32) {
+            initial;
+        }
+
+        get: func() -> s32 {
+            self;
+        }
+    }
+
+    @test
+    test-resource-display: func() -> bool {
+        let c = counter(10);
+        return true;
+    }
+}

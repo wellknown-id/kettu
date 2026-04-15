@@ -454,6 +454,41 @@ impl Checker {
             match item {
                 InterfaceItem::TypeDef(typedef) => {
                     let name = self.collect_typedef(typedef, Some(&iface_name));
+                    if let TypeDefKind::Resource { methods, .. } = &typedef.kind {
+                        if let Some(ResourceMethod::Constructor { params, .. }) = methods
+                            .iter()
+                            .find(|method| matches!(method, ResourceMethod::Constructor { .. }))
+                        {
+                            function_returns.insert(name.clone(), CheckedType::Named(name.clone()));
+
+                            let param_names: Vec<String> =
+                                params.iter().map(|p| p.name.name.clone()).collect();
+                            if !param_names.is_empty() {
+                                function_params.insert(name.clone(), param_names);
+                            }
+
+                            let param_types: Vec<String> = params
+                                .iter()
+                                .map(|p| format!("{}: {}", p.name.name, self.fmt_ty(&p.ty)))
+                                .collect();
+                            if !param_types.is_empty() {
+                                function_param_types.insert(name.clone(), param_types);
+                            }
+
+                            let constraints: Vec<ParamConstraint> = params
+                                .iter()
+                                .filter_map(|p| {
+                                    p.constraint.as_ref().map(|c| ParamConstraint {
+                                        param_name: p.name.name.clone(),
+                                        constraint: c.clone(),
+                                    })
+                                })
+                                .collect();
+                            if !constraints.is_empty() {
+                                function_constraints.insert(name.clone(), constraints);
+                            }
+                        }
+                    }
                     types.push(name);
                 }
                 InterfaceItem::Func(func) => {

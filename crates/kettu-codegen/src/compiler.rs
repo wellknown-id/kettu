@@ -3083,6 +3083,9 @@ impl<'a> ModuleCompiler<'a> {
                                     // Register in functions map
                                     self.functions
                                         .insert(internal_name.clone(), (type_idx, func_idx, false));
+                                    self.functions
+                                        .entry(resource_name.clone())
+                                        .or_insert((type_idx, func_idx, false));
                                     let export_name = format!(
                                         "{}/{}#[constructor]{}",
                                         package_path, iface.name.name, resource_name

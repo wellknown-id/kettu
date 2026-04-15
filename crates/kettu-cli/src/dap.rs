@@ -96,7 +96,16 @@ enum SimpleValue {
     String(String),
     List(Vec<SimpleValue>),
     Record(BTreeMap<String, SimpleValue>),
+    Callable {
+        name: Option<String>,
+        params: Vec<String>,
+    },
+    Resource {
+        type_name: String,
+    },
     Result {
+        type_name: Option<String>,
+        case_name: String,
         discriminant: i32,
         payload: i32,
         payload_value: Option<Box<SimpleValue>>,
@@ -128,14 +137,29 @@ impl SimpleValue {
                     .join(", ");
                 format!("{{ {} }}", rendered)
             }
+            Self::Callable { name, params } => {
+                let params = params.join(", ");
+                match name {
+                    Some(name) if !name.is_empty() => format!("closure {}({})", name, params),
+                    _ => format!("closure({})", params),
+                }
+            }
+            Self::Resource { type_name } => format!("resource {}", type_name),
             Self::Result {
+                type_name,
+                case_name,
                 discriminant,
                 payload,
                 payload_value,
                 err_message,
             } => {
-                let case_name = variant_case_name(*discriminant);
+                let case_name = variant_display_name(
+                    type_name.as_deref(),
+                    Some(case_name.as_str()),
+                    *discriminant,
+                );
                 match variant_payload_value(
+                    Some(case_name.as_str()),
                     *discriminant,
                     *payload,
                     payload_value.as_deref(),
@@ -157,10 +181,88 @@ impl SimpleValue {
             Self::String(_) => "string",
             Self::List(_) => "list",
             Self::Record(_) => "record",
-            Self::Result { .. } => "result",
+            Self::Callable { .. } => "callable",
+            Self::Resource { .. } => "resource",
+            Self::Result {
+                type_name,
+                case_name,
+                ..
+            } => {
+                if type_name.is_some() || !matches!(case_name.as_str(), "ok" | "err" | "some" | "none") {
+                    "variant"
+                } else {
+                    "result"
+                }
+            }
             Self::Unknown(_) => "unknown",
         }
     }
+}
+
+fn callable_name_for_display(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.starts_with("closure#") || trimmed.starts_with("lambda#") {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn callable_value(name: Option<String>, params: Vec<String>) -> SimpleValue {
+    SimpleValue::Callable { name, params }
+}
+
+fn prefer_source_value_over_trace(source: &SimpleValue, trace: &SimpleValue) -> bool {
+    matches!(trace, SimpleValue::Unknown(_))
+        || matches!(trace, SimpleValue::Int(_))
+            && matches!(
+                source,
+                SimpleValue::String(_)
+                    | SimpleValue::List(_)
+                    | SimpleValue::Record(_)
+                    | SimpleValue::Callable { .. }
+                    | SimpleValue::Resource { .. }
+                    | SimpleValue::Result { .. }
+            )
+}
+
+fn resource_value(type_name: impl Into<String>) -> SimpleValue {
+    SimpleValue::Resource {
+        type_name: type_name.into(),
+    }
+}
+
+fn callable_value_from_closure(closure: &ClosureRange) -> SimpleValue {
+    callable_value(callable_name_for_display(&closure.name), closure.params.clone())
+}
+
+fn parse_lambda_literal(expr: &str, default_name: Option<&str>) -> Option<SimpleValue> {
+    let trimmed = expr.trim();
+    let rest = trimmed.strip_prefix('|')?;
+    let end = rest.find('|')?;
+    let params = split_top_level_arguments(&rest[..end])
+        .into_iter()
+        .map(|param| param.trim().to_string())
+        .filter(|param| !param.is_empty())
+        .collect::<Vec<_>>();
+    Some(callable_value(
+        default_name.and_then(callable_name_for_display),
+        params,
+    ))
+}
+
+fn parse_resource_constructor_call(
+    expr: &str,
+    resource_names: &BTreeSet<String>,
+) -> Option<SimpleValue> {
+    let trimmed = expr.trim();
+    let (callee, rest) = trimmed.split_once('(')?;
+    let _inner = rest.strip_suffix(')')?;
+    let callee = callee.trim();
+    if !resource_names.contains(callee) {
+        return None;
+    }
+    Some(resource_value(callee))
 }
 
 fn variant_discriminant(case_name: &str) -> i32 {
@@ -178,6 +280,22 @@ fn variant_case_name(discriminant: i32) -> String {
     format!("variant#{discriminant}")
 }
 
+fn variant_display_name(
+    type_name: Option<&str>,
+    case_name: Option<&str>,
+    discriminant: i32,
+) -> String {
+    let case_name = case_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| variant_case_name(discriminant));
+    match type_name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(type_name) => format!("{type_name}#{case_name}"),
+        None => case_name,
+    }
+}
+
 fn simple_value_to_i32(value: &SimpleValue) -> Option<i32> {
     match value {
         SimpleValue::Bool(value) => Some(if *value { 1 } else { 0 }),
@@ -187,6 +305,7 @@ fn simple_value_to_i32(value: &SimpleValue) -> Option<i32> {
 }
 
 fn variant_payload_value(
+    case_name: Option<&str>,
     discriminant: i32,
     payload: i32,
     payload_value: Option<&SimpleValue>,
@@ -196,7 +315,11 @@ fn variant_payload_value(
         return Some(value.clone());
     }
 
-    match variant_case_name(discriminant).as_str() {
+    let case_name = case_name
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| variant_case_name(discriminant));
+
+    match case_name.as_str() {
         "none" => None,
         "err" => err_message
             .cloned()
@@ -207,25 +330,37 @@ fn variant_payload_value(
 }
 
 fn result_child_variables(
+    type_name: Option<&str>,
+    case_name: &str,
     discriminant: i32,
     payload: i32,
     payload_value: Option<&SimpleValue>,
     err_message: Option<&String>,
 ) -> Vec<Variable> {
-    let case_name = variant_case_name(discriminant);
+    let display_name = variant_display_name(type_name, Some(case_name), discriminant);
     let mut vars = vec![Variable::from_value(
         "case",
-        SimpleValue::String(case_name.clone()),
+        SimpleValue::String(display_name),
     )];
 
-    if let Some(value) = variant_payload_value(discriminant, payload, payload_value, err_message) {
+    if let Some(value) = variant_payload_value(
+        Some(case_name),
+        discriminant,
+        payload,
+        payload_value,
+        err_message,
+    ) {
         vars.push(Variable::from_value("payload", value));
     }
 
     vars
 }
 
-fn simple_variant_value(case_name: &str, payload: Option<SimpleValue>) -> SimpleValue {
+fn simple_variant_value(
+    type_name: Option<&str>,
+    case_name: &str,
+    payload: Option<SimpleValue>,
+) -> SimpleValue {
     let discriminant = variant_discriminant(case_name);
     let payload_int = payload
         .as_ref()
@@ -241,6 +376,8 @@ fn simple_variant_value(case_name: &str, payload: Option<SimpleValue>) -> Simple
     };
 
     SimpleValue::Result {
+        type_name: type_name.map(ToOwned::to_owned),
+        case_name: case_name.to_string(),
         discriminant,
         payload: payload_int,
         payload_value: payload.map(Box::new),
@@ -251,11 +388,14 @@ fn simple_variant_value(case_name: &str, payload: Option<SimpleValue>) -> Simple
 fn variant_pattern_binding_value(value: &SimpleValue) -> Option<SimpleValue> {
     match value {
         SimpleValue::Result {
+            case_name,
             discriminant,
             payload,
             payload_value,
             err_message,
+            ..
         } => variant_payload_value(
+            Some(case_name.as_str()),
             *discriminant,
             *payload,
             payload_value.as_deref(),
@@ -695,6 +835,7 @@ struct ProgramState {
     source_lines: Vec<String>,
     tests: Vec<ListedTest>,
     closures: Vec<ClosureRange>,
+    resource_names: BTreeSet<String>,
     debug_symbols: DebugSymbols,
     runtime_debug_artifacts: RuntimeDebugArtifacts,
 }
@@ -706,6 +847,7 @@ struct DebugSession {
     source_lines: Vec<String>,
     tests: Vec<ListedTest>,
     closures: Vec<ClosureRange>,
+    resource_names: BTreeSet<String>,
     debug_symbols: DebugSymbols,
     stop_on_entry: bool,
     enable_evaluate: bool,
@@ -734,6 +876,7 @@ impl DebugSession {
             source_lines: Vec::new(),
             tests: Vec::new(),
             closures: Vec::new(),
+            resource_names: BTreeSet::new(),
             debug_symbols: DebugSymbols::default(),
             stop_on_entry: false,
             enable_evaluate: false,
@@ -1186,11 +1329,15 @@ impl DebugSession {
                 .map(|(name, value)| Variable::from_value(name.clone(), value.clone()))
                 .collect::<Vec<_>>(),
             SimpleValue::Result {
+                type_name,
+                case_name,
                 discriminant,
                 payload,
                 payload_value,
                 err_message,
             } => result_child_variables(
+                type_name.as_deref(),
+                case_name,
                 *discriminant,
                 *payload,
                 payload_value.as_deref(),
@@ -1611,6 +1758,7 @@ pub fn run_server() -> io::Result<()> {
                         session.source_lines = program_state.source_lines;
                         session.tests = program_state.tests;
                         session.closures = program_state.closures;
+                        session.resource_names = program_state.resource_names;
                         session.debug_symbols = program_state.debug_symbols;
                         session.runtime_debug_artifacts = Some(program_state.runtime_debug_artifacts);
                         session.stop_on_entry = stop_on_entry;
@@ -1946,6 +2094,7 @@ fn load_program_state(program: Option<PathBuf>) -> Result<ProgramState, String> 
 
     let mut tests = list_tests_from_ast(&ast, &source);
     let mut closures = collect_closures_from_ast(&ast, &source);
+    let resource_names = collect_resource_names_from_ast(&ast);
     let debug_symbols = build_debug_symbols(&program, &source, &ast)?;
     apply_debug_symbols(&mut tests, &mut closures, &debug_symbols);
     build_test_traces(&mut tests, &closures, &source);
@@ -1957,6 +2106,7 @@ fn load_program_state(program: Option<PathBuf>) -> Result<ProgramState, String> 
         source_lines: source.lines().map(ToString::to_string).collect(),
         tests,
         closures,
+        resource_names,
         debug_symbols,
         runtime_debug_artifacts,
     })
@@ -1975,7 +2125,7 @@ fn build_runtime_test_traces(
         }
 
         if let Some(first_line) = actual_events.first().map(|event| event.line) {
-            test.line = first_line;
+            test.line = test.line.min(first_line);
         }
         if let Some(max_line) = actual_events.iter().map(|event| event.line).max() {
             test.end_line = test.end_line.max(max_line);
@@ -2468,7 +2618,8 @@ fn evaluate_in_frame(
         }
     }
 
-    evaluate_expression(expression, &env).or_else(|_| Ok(infer_expr_value(expression, &env)))
+    evaluate_expression(expression, &env)
+        .or_else(|_| Ok(infer_expr_value_with_resources(expression, &env, &session.resource_names)))
 }
 
 fn parse_eval_expression(expression: &str) -> Result<kettu_parser::Expr, String> {
@@ -2549,6 +2700,32 @@ fn offset_to_position(source: &str, offset: usize) -> SourcePosition {
     SourcePosition::new(line as i64, column as i64)
 }
 
+fn statement_start_line(statement: &kettu_parser::Statement, source: &str) -> Option<i64> {
+    match statement {
+        kettu_parser::Statement::Expr(expr) => Some(expr_start_position(expr, source).line),
+        kettu_parser::Statement::Let { name, .. }
+        | kettu_parser::Statement::Assign { name, .. }
+        | kettu_parser::Statement::CompoundAssign { name, .. }
+        | kettu_parser::Statement::SharedLet { name, .. }
+        | kettu_parser::Statement::GuardLet { name, .. } => {
+            Some(offset_to_line(source, name.span.start) as i64)
+        }
+        kettu_parser::Statement::Return(Some(expr)) => return Some(expr_start_position(expr, source).line),
+        kettu_parser::Statement::Break {
+            condition: Some(expr),
+        }
+        | kettu_parser::Statement::Continue {
+            condition: Some(expr),
+        }
+        | kettu_parser::Statement::Guard {
+            condition: expr, ..
+        } => return Some(expr_start_position(expr, source).line),
+        kettu_parser::Statement::Return(None)
+        | kettu_parser::Statement::Break { condition: None }
+        | kettu_parser::Statement::Continue { condition: None } => None,
+    }
+}
+
 fn list_tests_from_ast(ast: &kettu_parser::WitFile, source: &str) -> Vec<ListedTest> {
     let mut listed = Vec::new();
 
@@ -2564,15 +2741,21 @@ fn list_tests_from_ast(ast: &kettu_parser::WitFile, source: &str) -> Vec<ListedT
                         continue;
                     }
 
+                    let body = func
+                        .body
+                        .as_ref()
+                        .map(|body| body.statements.clone())
+                        .unwrap_or_default();
+                    let line = body
+                        .first()
+                        .and_then(|statement| statement_start_line(statement, source))
+                        .unwrap_or_else(|| offset_to_line(source, func.span.start) as i64);
+
                     listed.push(ListedTest {
                         name: func.name.name.clone(),
-                        line: offset_to_line(source, func.span.start) as i64,
+                        line,
                         end_line: offset_to_line(source, func.span.end) as i64,
-                        body: func
-                            .body
-                            .as_ref()
-                            .map(|body| body.statements.clone())
-                            .unwrap_or_default(),
+                        body,
                         trace: Vec::new(),
                     });
                 }
@@ -2692,6 +2875,40 @@ fn collect_closures_from_ast(ast: &kettu_parser::WitFile, source: &str) -> Vec<C
 
     closures.sort_by_key(|closure| (closure.start_line, Reverse(closure.end_line)));
     closures
+}
+
+fn collect_resource_names_from_ast(ast: &kettu_parser::WitFile) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+
+    for item in &ast.items {
+        match item {
+            kettu_parser::TopLevelItem::Interface(interface) => {
+                for item in &interface.items {
+                    if let kettu_parser::InterfaceItem::TypeDef(kettu_parser::TypeDef {
+                        kind: kettu_parser::TypeDefKind::Resource { name, .. },
+                        ..
+                    }) = item
+                    {
+                        names.insert(name.name.clone());
+                    }
+                }
+            }
+            kettu_parser::TopLevelItem::World(world) => {
+                for item in &world.items {
+                    if let kettu_parser::WorldItem::TypeDef(kettu_parser::TypeDef {
+                        kind: kettu_parser::TypeDefKind::Resource { name, .. },
+                        ..
+                    }) = item
+                    {
+                        names.insert(name.name.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    names
 }
 
 fn collect_closures_from_statements(
@@ -3401,12 +3618,23 @@ fn runtime_value_to_simple(raw: i64, fallback: Option<&SimpleValue>) -> SimpleVa
         Some(SimpleValue::String(value)) => SimpleValue::String(value.clone()),
         Some(SimpleValue::List(values)) => SimpleValue::List(values.clone()),
         Some(SimpleValue::Record(fields)) => SimpleValue::Record(fields.clone()),
+        Some(SimpleValue::Callable { name, params }) => SimpleValue::Callable {
+            name: name.clone(),
+            params: params.clone(),
+        },
+        Some(SimpleValue::Resource { type_name }) => SimpleValue::Resource {
+            type_name: type_name.clone(),
+        },
         Some(SimpleValue::Result {
+            type_name,
+            case_name,
             discriminant,
             payload,
             payload_value,
             err_message,
         }) => SimpleValue::Result {
+            type_name: type_name.clone(),
+            case_name: case_name.clone(),
             discriminant: *discriminant,
             payload: *payload,
             payload_value: payload_value.clone(),
@@ -3482,7 +3710,20 @@ fn runtime_binding_values_for_target(
                             _ => None,
                         };
 
+                        let (type_name, case_name) = match fallback_value {
+                            Some(SimpleValue::Result {
+                                type_name,
+                                case_name,
+                                ..
+                            }) if variant_discriminant(case_name) == deref.discriminant => {
+                                (type_name.clone(), case_name.clone())
+                            }
+                            _ => (None, variant_case_name(deref.discriminant)),
+                        };
+
                         SimpleValue::Result {
+                            type_name,
+                            case_name,
                             discriminant: deref.discriminant,
                             payload: deref.payload,
                             payload_value,
@@ -3835,10 +4076,27 @@ fn evaluate_ast_expr(
         kettu_parser::Expr::Ident(id) => env
             .get(&id.name)
             .cloned()
+            .or_else(|| {
+                closures
+                    .iter()
+                    .rev()
+                    .find(|closure| closure.name == id.name)
+                    .map(callable_value_from_closure)
+            })
             .unwrap_or_else(|| SimpleValue::Unknown(id.name.clone())),
         kettu_parser::Expr::Integer(value, _) => SimpleValue::Int(*value),
         kettu_parser::Expr::String(value, _) => SimpleValue::String(value.clone()),
         kettu_parser::Expr::Bool(value, _) => SimpleValue::Bool(*value),
+        kettu_parser::Expr::Lambda { params, span, .. } => closures
+            .iter()
+            .find(|closure| closure.debug_key == span.start as i64)
+            .map(callable_value_from_closure)
+            .unwrap_or_else(|| {
+                callable_value(
+                    None,
+                    params.iter().map(|param| param.name.clone()).collect(),
+                )
+            }),
         kettu_parser::Expr::InterpolatedString(parts, _) => {
             let mut result = String::new();
             for part in parts {
@@ -3869,8 +4127,12 @@ fn evaluate_ast_expr(
                 .collect(),
         ),
         kettu_parser::Expr::VariantLiteral {
-            case_name, payload, ..
+            type_name,
+            case_name,
+            payload,
+            ..
         } => simple_variant_value(
+            type_name.as_ref().map(|name| name.name.as_str()),
             &case_name.name,
             payload
                 .as_ref()
@@ -3888,12 +4150,15 @@ fn evaluate_ast_expr(
         kettu_parser::Expr::OptionalChain { expr, field, .. } => {
             match evaluate_ast_expr(expr, closures, source, env) {
                 SimpleValue::Result {
+                    case_name,
                     discriminant,
                     payload,
                     payload_value,
                     err_message,
+                    ..
                 } if discriminant == variant_discriminant("some") => {
                     match variant_payload_value(
+                        Some(case_name.as_str()),
                         discriminant,
                         payload,
                         payload_value.as_deref(),
@@ -3902,29 +4167,32 @@ fn evaluate_ast_expr(
                         Some(SimpleValue::Record(fields)) => fields
                             .get(&field.name)
                             .cloned()
-                            .map(|value| simple_variant_value("some", Some(value)))
-                            .unwrap_or_else(|| simple_variant_value("none", None)),
-                        Some(value) => simple_variant_value("some", Some(value)),
-                        None => simple_variant_value("none", None),
+                            .map(|value| simple_variant_value(None, "some", Some(value)))
+                            .unwrap_or_else(|| simple_variant_value(None, "none", None)),
+                        Some(value) => simple_variant_value(None, "some", Some(value)),
+                        None => simple_variant_value(None, "none", None),
                     }
                 }
                 SimpleValue::Result { discriminant, .. }
                     if discriminant == variant_discriminant("none") =>
                 {
-                    simple_variant_value("none", None)
+                    simple_variant_value(None, "none", None)
                 }
                 _ => SimpleValue::Unknown("<optional-chain>".to_string()),
             }
         }
         kettu_parser::Expr::Try { expr, .. } => match evaluate_ast_expr(expr, closures, source, env) {
             SimpleValue::Result {
+                case_name,
                 discriminant,
                 payload,
                 payload_value,
                 err_message,
+                ..
             } if discriminant == variant_discriminant("some")
                 || discriminant == variant_discriminant("ok") => {
                 variant_payload_value(
+                    Some(case_name.as_str()),
                     discriminant,
                     payload,
                     payload_value.as_deref(),
@@ -4461,11 +4729,12 @@ fn find_invoked_closure(
             .unwrap_or(FrameTarget::Test);
         let call_env = frame_base_environment(session, parent_target);
         let capture_bindings = capture_values_for_closure(session, closure_index, &call_env);
-        let source_env = infer_values_in_range(
+        let source_env = infer_values_in_range_with_resources(
             &session.source_lines,
             1,
             current_line,
             &HashMap::new(),
+            &session.resource_names,
         );
         let param_bindings = build_inline_hof_param_bindings(closure, line, &call_env)
             .or_else(|| build_inline_hof_param_bindings(closure, line, &source_env))
@@ -4566,11 +4835,12 @@ fn frame_local_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable>
 
                 let mut seed_env = active.capture_bindings.clone();
                 seed_env.extend(param_bindings);
-                let inferred = infer_values_in_range(
+                let inferred = infer_values_in_range_with_resources(
                     &session.source_lines,
                     closure.start_line + 1,
                     session.current_line,
                     &seed_env,
+                    &session.resource_names,
                 );
                 for (name, value) in inferred {
                     if !capture_names.contains(&name) {
@@ -4583,11 +4853,12 @@ fn frame_local_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable>
                 }
 
                 let seed_env = frame_base_environment(session, FrameTarget::Closure(closure_index));
-                let inferred = infer_values_in_range(
+                let inferred = infer_values_in_range_with_resources(
                     &session.source_lines,
                     closure.start_line + 1,
                     session.current_line,
                     &seed_env,
+                    &session.resource_names,
                 );
                 for (name, value) in inferred {
                     if !capture_names.contains(&name) {
@@ -4637,7 +4908,7 @@ fn frame_local_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable>
                 }
             }
 
-            let inferred = infer_values_in_range(
+            let inferred = infer_values_in_range_with_resources(
                 &session.source_lines,
                 sp.map(|subprogram| subprogram.start_line)
                     .or_else(|| resolve_runtime_debug_frame(session, target).map(|frame| frame.start_line))
@@ -4645,6 +4916,7 @@ fn frame_local_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable>
                     + 1,
                 session.current_line,
                 &locals,
+                &session.resource_names,
             );
             for (name, value) in inferred {
                 locals.insert(name, value);
@@ -4735,10 +5007,7 @@ fn frame_environment(session: &DebugSession, frame_id: i64) -> HashMap<String, S
             };
 
             for variable in frame_local_variables(session, frame_id) {
-                env.insert(
-                    variable.name,
-                    parse_variable_display(&variable.value, &variable.var_type),
-                );
+                env.insert(variable.name, variable.raw_value);
             }
 
             env
@@ -4746,10 +5015,7 @@ fn frame_environment(session: &DebugSession, frame_id: i64) -> HashMap<String, S
         FrameTarget::Function(_) => {
             let mut env = HashMap::new();
             for variable in frame_local_variables(session, frame_id) {
-                env.insert(
-                    variable.name,
-                    parse_variable_display(&variable.value, &variable.var_type),
-                );
+                env.insert(variable.name, variable.raw_value);
             }
             env
         }
@@ -4789,6 +5055,38 @@ fn test_environment_for_line(session: &DebugSession, line: i64) -> HashMap<Strin
         return HashMap::new();
     };
 
+    let infer_source_env = || {
+        infer_values_in_range_with_resources(
+            &session.source_lines,
+            test.line,
+            line,
+            &HashMap::new(),
+            &session.resource_names,
+        )
+    };
+
+    let infer_source_env_before_line = || {
+        infer_values_in_range_with_resources(
+            &session.source_lines,
+            test.line,
+            line.saturating_sub(1),
+            &HashMap::new(),
+            &session.resource_names,
+        )
+    };
+
+    let merge_trace_env = |mut env: HashMap<String, SimpleValue>, trace_env: &HashMap<String, SimpleValue>| {
+        for (name, trace_value) in trace_env {
+            match env.get(name) {
+                Some(source_value) if prefer_source_value_over_trace(source_value, trace_value) => {}
+                _ => {
+                    env.insert(name.clone(), trace_value.clone());
+                }
+            }
+        }
+        env
+    };
+
     let overlay_runtime_locals = |mut env: HashMap<String, SimpleValue>, snapshot: &PausedRuntimeSnapshot| {
         let bindings = bindings_for_target(session, FrameTarget::Test);
         let start_line = resolve_runtime_debug_frame(session, FrameTarget::Test)
@@ -4821,10 +5119,8 @@ fn test_environment_for_line(session: &DebugSession, line: i64) -> HashMap<Strin
     if line == session.current_line {
         if let Some(snapshot) = paused_runtime_snapshot(session) {
             let base_env = current_trace_event(session)
-                .map(|entry| entry.env_before.clone())
-                .unwrap_or_else(|| {
-                    infer_values_in_range(&session.source_lines, test.line, line, &HashMap::new())
-                });
+                .map(|entry| merge_trace_env(infer_source_env_before_line(), &entry.env_before))
+                .unwrap_or_else(infer_source_env);
             return overlay_runtime_locals(base_env, &snapshot);
         }
     }
@@ -4839,7 +5135,10 @@ fn test_environment_for_line(session: &DebugSession, line: i64) -> HashMap<Strin
                         pointer_derefs: entry.runtime_pointer_derefs.clone(),
                         closure_keys: entry.runtime_closure_keys.clone(),
                     };
-                    return overlay_runtime_locals(entry.env_before.clone(), &snapshot);
+                    return overlay_runtime_locals(
+                        merge_trace_env(infer_source_env_before_line(), &entry.env_before),
+                        &snapshot,
+                    );
                 }
             }
         }
@@ -4851,11 +5150,14 @@ fn test_environment_for_line(session: &DebugSession, line: i64) -> HashMap<Strin
                 pointer_derefs: entry.runtime_pointer_derefs.clone(),
                 closure_keys: entry.runtime_closure_keys.clone(),
             };
-            return overlay_runtime_locals(entry.env_before.clone(), &snapshot);
+            return overlay_runtime_locals(
+                merge_trace_env(infer_source_env_before_line(), &entry.env_before),
+                &snapshot,
+            );
         }
     }
 
-    infer_values_in_range(&session.source_lines, test.line, line, &HashMap::new())
+    infer_source_env()
 }
 
 fn capture_values_for_closure(
@@ -4997,7 +5299,13 @@ fn inline_hof_call_environment(
     let mut env = session
         .active_test()
         .map(|test| {
-            infer_values_in_range(&session.source_lines, test.line, invocation_line, &HashMap::new())
+            infer_values_in_range_with_resources(
+                &session.source_lines,
+                test.line,
+                invocation_line,
+                &HashMap::new(),
+                &session.resource_names,
+            )
         })
         .unwrap_or_default();
 
@@ -5177,11 +5485,22 @@ fn split_top_level_arguments(input: &str) -> Vec<String> {
     args
 }
 
+#[cfg(test)]
 fn infer_values_in_range(
     source_lines: &[String],
     start_line: i64,
     end_line: i64,
     seed_env: &HashMap<String, SimpleValue>,
+) -> HashMap<String, SimpleValue> {
+    infer_values_in_range_with_resources(source_lines, start_line, end_line, seed_env, &BTreeSet::new())
+}
+
+fn infer_values_in_range_with_resources(
+    source_lines: &[String],
+    start_line: i64,
+    end_line: i64,
+    seed_env: &HashMap<String, SimpleValue>,
+    resource_names: &BTreeSet<String>,
 ) -> HashMap<String, SimpleValue> {
     let mut values = seed_env.clone();
     if end_line < start_line || end_line <= 0 {
@@ -5204,7 +5523,10 @@ fn infer_values_in_range(
         if let Some(rest) = trimmed.strip_prefix("shared let ") {
             if let Some((name, expr)) = split_assignment(rest) {
                 if is_identifier(name) {
-                    values.insert(name.to_string(), infer_expr_value(expr, &values));
+                    values.insert(
+                        name.to_string(),
+                        infer_assignment_expr_value_with_resources(name, expr, &values, resource_names),
+                    );
                 }
             }
             continue;
@@ -5213,7 +5535,10 @@ fn infer_values_in_range(
         if let Some(rest) = trimmed.strip_prefix("let ") {
             if let Some((name, expr)) = split_assignment(rest) {
                 if is_identifier(name) {
-                    values.insert(name.to_string(), infer_expr_value(expr, &values));
+                    values.insert(
+                        name.to_string(),
+                        infer_assignment_expr_value_with_resources(name, expr, &values, resource_names),
+                    );
                 }
             }
             continue;
@@ -5221,7 +5546,10 @@ fn infer_values_in_range(
 
         if let Some((name, expr)) = split_assignment(trimmed) {
             if is_identifier(name) {
-                values.insert(name.to_string(), infer_expr_value(expr, &values));
+                values.insert(
+                    name.to_string(),
+                    infer_assignment_expr_value_with_resources(name, expr, &values, resource_names),
+                );
             }
         }
     }
@@ -5239,12 +5567,45 @@ fn variables_from_env(values: &HashMap<String, SimpleValue>) -> Vec<Variable> {
 }
 
 fn infer_expr_value(expr: &str, env: &HashMap<String, SimpleValue>) -> SimpleValue {
+    infer_expr_value_with_resources(expr, env, &BTreeSet::new())
+}
+
+fn infer_expr_value_with_resources(
+    expr: &str,
+    env: &HashMap<String, SimpleValue>,
+    resource_names: &BTreeSet<String>,
+) -> SimpleValue {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
         return SimpleValue::Unknown("<unknown>".to_string());
     }
 
+    if let Some(callable) = parse_lambda_literal(trimmed, None) {
+        return callable;
+    }
+
+    if let Some(resource) = parse_resource_constructor_call(trimmed, resource_names) {
+        return resource;
+    }
+
+    if let Ok(parsed) = parse_eval_expression(trimmed) {
+        let value = evaluate_ast_expr(&parsed, &[], "", env);
+        if !is_placeholder_unknown(&value) {
+            return value;
+        }
+    }
+
     evaluate_expression(trimmed, env).unwrap_or_else(|_| parse_variant_or_literal(trimmed, env))
+}
+
+fn infer_assignment_expr_value_with_resources(
+    binding_name: &str,
+    expr: &str,
+    env: &HashMap<String, SimpleValue>,
+    resource_names: &BTreeSet<String>,
+) -> SimpleValue {
+    parse_lambda_literal(expr, Some(binding_name))
+        .unwrap_or_else(|| infer_expr_value_with_resources(expr, env, resource_names))
 }
 
 fn parse_variant_or_literal(expr: &str, env: &HashMap<String, SimpleValue>) -> SimpleValue {
@@ -5261,7 +5622,7 @@ fn parse_variant_or_literal(expr: &str, env: &HashMap<String, SimpleValue>) -> S
     }
 
     if trimmed == "none" {
-        return simple_variant_value("none", None);
+        return simple_variant_value(None, "none", None);
     }
 
     if let Some((constructor, rest)) = trimmed.split_once('(') {
@@ -5269,6 +5630,7 @@ fn parse_variant_or_literal(expr: &str, env: &HashMap<String, SimpleValue>) -> S
             match constructor.trim() {
                 "some" | "ok" | "err" => {
                     return simple_variant_value(
+                        None,
                         constructor.trim(),
                         Some(infer_expr_value(inner, env)),
                     );
@@ -5299,28 +5661,6 @@ fn parse_literal_or_unknown(expr: &str) -> SimpleValue {
         return SimpleValue::Float(value);
     }
     SimpleValue::Unknown(trimmed.to_string())
-}
-
-fn parse_variable_display(value: &str, var_type: &str) -> SimpleValue {
-    match var_type {
-        "bool" => SimpleValue::Bool(value == "true"),
-        "i64" => value
-            .parse::<i64>()
-            .map(SimpleValue::Int)
-            .unwrap_or_else(|_| SimpleValue::Unknown(value.to_string())),
-        "f64" => value
-            .parse::<f64>()
-            .map(SimpleValue::Float)
-            .unwrap_or_else(|_| SimpleValue::Unknown(value.to_string())),
-        "string" => {
-            if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-                SimpleValue::String(value[1..value.len() - 1].to_string())
-            } else {
-                SimpleValue::String(value.to_string())
-            }
-        }
-        _ => SimpleValue::Unknown(value.to_string()),
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -6215,7 +6555,6 @@ interface tests {
         };
     }
 }"#;
-
         let (ast, errors) = kettu_parser::parse_file(source);
         assert!(errors.is_empty(), "parse errors: {errors:?}");
         let ast = ast.expect("ast");
@@ -6255,6 +6594,15 @@ interface tests {
             other => panic!("expected return statement, got {other:?}"),
         };
         assert_eq!(match_value, super::SimpleValue::Bool(true));
+    }
+
+    #[test]
+    fn evaluate_ast_expr_preserves_qualified_variant_name() {
+        let expr = super::parse_eval_expression("my-result#ok(42)").expect("parse variant");
+        let value = super::evaluate_ast_expr(&expr, &[], "", &HashMap::new());
+
+        assert_eq!(value.type_name(), "variant");
+        assert_eq!(value.display(), "my-result#ok(42)");
     }
 
     #[test]
@@ -6313,6 +6661,199 @@ interface tests {
             .expect("parse optional-chain expression");
         let optional_value = super::evaluate_ast_expr(&optional_expr, &[], "", &HashMap::new());
         assert_eq!(optional_value.display(), "some(9)");
+    }
+
+    #[test]
+    fn evaluate_ast_expr_serializes_stored_lambda_as_callable() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let f = |x| x * 2;
+        return true;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let mut ast = ast.expect("ast");
+        super::annotate_closure_captures(&mut ast);
+        let closures = super::collect_closures_from_ast(&ast, source);
+        let func = ast
+            .items
+            .iter()
+            .find_map(|item| match item {
+                kettu_parser::TopLevelItem::Interface(interface) => interface
+                    .items
+                    .iter()
+                    .find_map(|item| match item {
+                        kettu_parser::InterfaceItem::Func(func) if func.name.name == "t" => {
+                            Some(func)
+                        }
+                        _ => None,
+                    }),
+                _ => None,
+            })
+            .expect("test function");
+        let body = func.body.as_ref().expect("function body");
+        let value = match &body.statements[0] {
+            kettu_parser::Statement::Let { value, .. } => {
+                super::evaluate_ast_expr(value, &closures, source, &HashMap::new())
+            }
+            other => panic!("expected let statement, got {other:?}"),
+        };
+
+        assert_eq!(value.type_name(), "callable");
+        assert_eq!(value.display(), "closure f(x)");
+    }
+
+    #[test]
+    fn runtime_value_to_simple_preserves_callable_fallback() {
+        let fallback = super::SimpleValue::Callable {
+            name: Some("f".to_string()),
+            params: vec!["x".to_string()],
+        };
+
+        assert_eq!(super::runtime_value_to_simple(264, Some(&fallback)), fallback);
+    }
+
+    #[test]
+    fn infer_values_in_range_names_stored_lambda_binding() {
+        let lines = vec![
+            "package local:test;".to_string(),
+            "interface tests {".to_string(),
+            "    @test".to_string(),
+            "    t: func() -> bool {".to_string(),
+            "        let f = |x| x * 2;".to_string(),
+            "        return true;".to_string(),
+            "    }".to_string(),
+            "}".to_string(),
+        ];
+
+        let env = super::infer_values_in_range(&lines, 1, 6, &HashMap::new());
+        let value = env.get("f").expect("f binding");
+
+        assert_eq!(value.type_name(), "callable");
+        assert_eq!(value.display(), "closure f(x)");
+    }
+
+    #[test]
+    fn infer_values_in_range_preserves_qualified_variant_binding() {
+        let lines = vec![
+            "package local:test;".to_string(),
+            "interface tests {".to_string(),
+            "    @test".to_string(),
+            "    t: func() -> bool {".to_string(),
+            "        let y = my-result#ok(42);".to_string(),
+            "        return true;".to_string(),
+            "    }".to_string(),
+            "}".to_string(),
+        ];
+
+        let env = super::infer_values_in_range(&lines, 1, 6, &HashMap::new());
+        let value = env.get("y").expect("y binding");
+
+        assert_eq!(value.type_name(), "variant");
+        assert_eq!(value.display(), "my-result#ok(42)");
+    }
+
+    #[test]
+    fn infer_values_in_range_preserves_resource_binding() {
+        let lines = vec![
+            "package local:test;".to_string(),
+            "interface tests {".to_string(),
+            "    resource counter {".to_string(),
+            "        constructor(initial: s32) { initial; }".to_string(),
+            "    }".to_string(),
+            "    @test".to_string(),
+            "    t: func() -> bool {".to_string(),
+            "        let c = counter(10);".to_string(),
+            "        return true;".to_string(),
+            "    }".to_string(),
+            "}".to_string(),
+        ];
+
+        let mut resource_names = BTreeSet::new();
+        resource_names.insert("counter".to_string());
+        let env = super::infer_values_in_range_with_resources(
+            &lines,
+            1,
+            9,
+            &HashMap::new(),
+            &resource_names,
+        );
+        let value = env.get("c").expect("c binding");
+
+        assert_eq!(value.type_name(), "resource");
+        assert_eq!(value.display(), "resource counter");
+    }
+
+    #[test]
+    fn runtime_value_to_simple_preserves_resource_fallback() {
+        let fallback = super::SimpleValue::Resource {
+            type_name: "counter".to_string(),
+        };
+
+        assert_eq!(super::runtime_value_to_simple(10, Some(&fallback)), fallback);
+    }
+
+    #[test]
+    fn load_program_state_collects_resource_names_for_fixture() {
+        let program = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/resource_debug.kettu");
+
+        let state = super::load_program_state(Some(program)).expect("load program state");
+
+        assert!(state.resource_names.contains("counter"));
+    }
+
+    #[test]
+    fn test_environment_for_line_merges_inferred_locals_with_runtime_trace_env() {
+        let lines = vec![
+            "package local:test;".to_string(),
+            "interface tests {".to_string(),
+            "    resource counter {".to_string(),
+            "        constructor(initial: s32) { initial; }".to_string(),
+            "    }".to_string(),
+            "    @test".to_string(),
+            "    t: func() -> bool {".to_string(),
+            "        let c = counter(10);".to_string(),
+            "        return true;".to_string(),
+            "    }".to_string(),
+            "}".to_string(),
+        ];
+
+        let mut resource_names = BTreeSet::new();
+        resource_names.insert("counter".to_string());
+
+        let mut session = DebugSession::new();
+        session.source_lines = lines;
+        session.resource_names = resource_names;
+        session.tests = vec![ListedTest {
+            name: "t".into(),
+            line: 7,
+            end_line: 9,
+            body: Vec::new(),
+            trace: vec![super::TraceEvent {
+                line: 9,
+                column: 1,
+                env_before: HashMap::new(),
+                runtime_subprogram_start_line: None,
+                runtime_locals: HashMap::new(),
+                runtime_pointer_derefs: HashMap::new(),
+                runtime_closure_keys: Vec::new(),
+            }],
+        }];
+        session.current_test = 0;
+        session.current_trace_index = Some(0);
+        session.current_line = 9;
+        session.current_column = 1;
+
+        let env = super::test_environment_for_line(&session, 9);
+        let value = env.get("c").expect("c binding");
+
+        assert_eq!(value.type_name(), "resource");
+        assert_eq!(value.display(), "resource counter");
     }
 
     #[test]
