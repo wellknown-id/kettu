@@ -11,8 +11,9 @@ use gimli::{
     SectionId,
 };
 use kettu_parser::{
-    BinOp, Expr, Func, FuncBody, Id, InterfaceItem, Param, Pattern, PrimitiveTy, ResourceMethod,
-    SimdLane, SimdOp, Statement, StringPart, TopLevelItem, Ty, TypeDef, TypeDefKind, WitFile,
+    BinOp, Expr, Func, FuncBody, Gate, Id, InterfaceItem, Param, Pattern, PrimitiveTy,
+    ResourceMethod, SimdLane, SimdOp, Statement, StringPart, TopLevelItem, Ty, TypeDef,
+    TypeDefKind, WitFile,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -54,8 +55,27 @@ struct FunctionDebugInfo {
 #[derive(Debug, Clone)]
 struct ActiveDebugHookContext {
     subprogram_start_line: i64,
-    bindings: Vec<DebugBinding>,
-    snapshottable_locals: std::collections::HashSet<u32>,
+    visible_bindings: Vec<DebugBinding>,
+    debug_resume_state_offset: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResumableTestContext {
+    state_global_idx: u32,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveResumableFunctionContext {
+    state_global_idx: u32,
+    allows_helper_calls: bool,
+    is_async: bool,
+    result_ty: Option<Ty>,
+    span: Range<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveResumableStatementContext {
+    statement_pc: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -64,7 +84,7 @@ struct DebugResumeFramePlan {
     name: String,
     start_line: i64,
     bindings: Vec<DebugBinding>,
-    state_offset: Option<u32>,
+    state_offset: u32,
 }
 
 const DEBUG_RESUME_HEADER_BYTES: u32 = 8;
@@ -237,6 +257,244 @@ fn line_for_span_or(span: &Range<usize>, source: &str, fallback: u64) -> u64 {
 
 fn debug_runtime_key_for_span(span: &Range<usize>) -> i32 {
     span.start.min(i32::MAX as usize) as i32
+}
+
+fn expr_contains_nested_resume_hazard(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { .. }
+        | Expr::Lambda { .. }
+        | Expr::Map { .. }
+        | Expr::Filter { .. }
+        | Expr::Reduce { .. }
+        | Expr::Await { .. }
+        | Expr::Spawn { .. } => true,
+        Expr::Binary { lhs, rhs, .. } | Expr::StrEq(lhs, rhs, _) | Expr::ListPush(lhs, rhs, _) => {
+            expr_contains_nested_resume_hazard(lhs) || expr_contains_nested_resume_hazard(rhs)
+        }
+        Expr::Field { expr, .. }
+        | Expr::OptionalChain { expr, .. }
+        | Expr::Try { expr, .. }
+        | Expr::Assert(expr, _)
+        | Expr::Not(expr, _)
+        | Expr::Neg(expr, _)
+        | Expr::StrLen(expr, _)
+        | Expr::ListLen(expr, _)
+        | Expr::AtomicLoad { addr: expr, .. }
+        | Expr::ThreadJoin { tid: expr, .. } => expr_contains_nested_resume_hazard(expr),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_contains_nested_resume_hazard(cond)
+                || then_branch
+                    .iter()
+                    .any(statement_contains_nested_resume_hazard)
+                || else_branch
+                    .iter()
+                    .flatten()
+                    .any(statement_contains_nested_resume_hazard)
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            expr_contains_nested_resume_hazard(scrutinee)
+                || arms
+                    .iter()
+                    .flat_map(|arm| arm.body.iter())
+                    .any(statement_contains_nested_resume_hazard)
+        }
+        Expr::While {
+            condition, body, ..
+        } => {
+            expr_contains_nested_resume_hazard(condition)
+                || body.iter().any(statement_contains_nested_resume_hazard)
+        }
+        Expr::For { range, body, .. } => {
+            expr_contains_nested_resume_hazard(range)
+                || body.iter().any(statement_contains_nested_resume_hazard)
+        }
+        Expr::ForEach {
+            collection, body, ..
+        }
+        | Expr::SimdForEach {
+            collection, body, ..
+        } => {
+            expr_contains_nested_resume_hazard(collection)
+                || body.iter().any(statement_contains_nested_resume_hazard)
+        }
+        Expr::Range {
+            start, end, step, ..
+        } => {
+            expr_contains_nested_resume_hazard(start)
+                || expr_contains_nested_resume_hazard(end)
+                || step
+                    .as_ref()
+                    .map(|expr| expr_contains_nested_resume_hazard(expr))
+                    .unwrap_or(false)
+        }
+        Expr::Slice {
+            expr,
+            start,
+            end,
+            ..
+        } => {
+            expr_contains_nested_resume_hazard(expr)
+                || expr_contains_nested_resume_hazard(start)
+                || expr_contains_nested_resume_hazard(end)
+        }
+        Expr::Index { expr, index, .. } => {
+            expr_contains_nested_resume_hazard(expr)
+                || expr_contains_nested_resume_hazard(index)
+        }
+        Expr::ListLiteral { elements, .. } | Expr::SimdOp { args: elements, .. } => {
+            elements.iter().any(expr_contains_nested_resume_hazard)
+        }
+        Expr::RecordLiteral { fields, .. } => fields
+            .iter()
+            .any(|(_, value)| expr_contains_nested_resume_hazard(value)),
+        Expr::VariantLiteral { payload, .. } => payload
+            .as_ref()
+            .map(|expr| expr_contains_nested_resume_hazard(expr))
+            .unwrap_or(false),
+        Expr::ListSet(list, index, value, _) => {
+            expr_contains_nested_resume_hazard(list)
+                || expr_contains_nested_resume_hazard(index)
+                || expr_contains_nested_resume_hazard(value)
+        }
+        Expr::AtomicStore { addr, value, .. }
+        | Expr::AtomicAdd { addr, value, .. }
+        | Expr::AtomicSub { addr, value, .. }
+        | Expr::AtomicNotify {
+            addr,
+            count: value,
+            ..
+        } => {
+            expr_contains_nested_resume_hazard(addr)
+                || expr_contains_nested_resume_hazard(value)
+        }
+        Expr::AtomicCmpxchg {
+            addr,
+            expected,
+            replacement,
+            ..
+        } => {
+            expr_contains_nested_resume_hazard(addr)
+                || expr_contains_nested_resume_hazard(expected)
+                || expr_contains_nested_resume_hazard(replacement)
+        }
+        Expr::AtomicWait {
+            addr,
+            expected,
+            timeout,
+            ..
+        } => {
+            expr_contains_nested_resume_hazard(addr)
+                || expr_contains_nested_resume_hazard(expected)
+                || expr_contains_nested_resume_hazard(timeout)
+        }
+        Expr::AtomicBlock { body, .. } => body.iter().any(statement_contains_nested_resume_hazard),
+        Expr::Integer(_, _)
+        | Expr::String(_, _)
+        | Expr::InterpolatedString(_, _)
+        | Expr::Bool(_, _)
+        | Expr::Ident(_) => false,
+    }
+}
+
+fn statement_contains_nested_resume_hazard(statement: &Statement) -> bool {
+    match statement {
+        Statement::Expr(expr)
+        | Statement::Return(Some(expr))
+        | Statement::Assign { value: expr, .. }
+        | Statement::CompoundAssign { value: expr, .. } => expr_contains_nested_resume_hazard(expr),
+        Statement::Let { value, .. } => expr_contains_nested_resume_hazard(value),
+        Statement::GuardLet {
+            value,
+            else_body,
+            ..
+        } => {
+            expr_contains_nested_resume_hazard(value)
+                || else_body.iter().any(statement_contains_nested_resume_hazard)
+        }
+        Statement::Guard {
+            condition,
+            else_body,
+        } => {
+            expr_contains_nested_resume_hazard(condition)
+                || else_body.iter().any(statement_contains_nested_resume_hazard)
+        }
+        Statement::Break { condition } | Statement::Continue { condition } => condition
+            .as_ref()
+            .map(|expr| expr_contains_nested_resume_hazard(expr))
+            .unwrap_or(false),
+        Statement::SharedLet { initial_value, .. } => {
+            expr_contains_nested_resume_hazard(initial_value)
+        }
+        Statement::Return(None) => false,
+    }
+}
+
+fn expr_is_restart_safe_for_resumable_helper_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Ident(_) | Expr::Integer(_, _) | Expr::String(_, _) | Expr::Bool(_, _) => true,
+        Expr::InterpolatedString(parts, _) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(expr) => expr_is_restart_safe_for_resumable_helper_call(expr),
+        }),
+        Expr::Binary { lhs, rhs, .. } | Expr::StrEq(lhs, rhs, _) | Expr::ListPush(lhs, rhs, _) => {
+            expr_is_restart_safe_for_resumable_helper_call(lhs)
+                && expr_is_restart_safe_for_resumable_helper_call(rhs)
+        }
+        Expr::Field { expr, .. }
+        | Expr::OptionalChain { expr, .. }
+        | Expr::Try { expr, .. }
+        | Expr::Assert(expr, _)
+        | Expr::Not(expr, _)
+        | Expr::Neg(expr, _)
+        | Expr::StrLen(expr, _)
+        | Expr::ListLen(expr, _)
+        | Expr::AtomicLoad { addr: expr, .. }
+        | Expr::ThreadJoin { tid: expr, .. } => expr_is_restart_safe_for_resumable_helper_call(expr),
+        Expr::Index { expr, index, .. } => {
+            expr_is_restart_safe_for_resumable_helper_call(expr)
+                && expr_is_restart_safe_for_resumable_helper_call(index)
+        }
+        Expr::Slice {
+            expr,
+            start,
+            end,
+            ..
+        } => {
+            expr_is_restart_safe_for_resumable_helper_call(expr)
+                && expr_is_restart_safe_for_resumable_helper_call(start)
+                && expr_is_restart_safe_for_resumable_helper_call(end)
+        }
+        Expr::ListLiteral { elements, .. } | Expr::SimdOp { args: elements, .. } => elements
+            .iter()
+            .all(expr_is_restart_safe_for_resumable_helper_call),
+        Expr::RecordLiteral { fields, .. } => fields
+            .iter()
+            .all(|(_, value)| expr_is_restart_safe_for_resumable_helper_call(value)),
+        Expr::VariantLiteral { payload, .. } => payload
+            .as_ref()
+            .map(|expr| expr_is_restart_safe_for_resumable_helper_call(expr))
+            .unwrap_or(true),
+        _ => false,
+    }
+}
+
+fn function_supports_resumable_helper(func: &Func) -> bool {
+    func.body
+        .as_ref()
+        .map(|body| {
+            !body
+                .statements
+                .iter()
+                .any(statement_contains_nested_resume_hazard)
+        })
+        .unwrap_or(false)
 }
 
 fn push_debug_binding(
@@ -771,6 +1029,8 @@ struct ModuleCompiler<'a> {
     debug_pause_probe_idx: Option<u32>,
     /// Index of the debugger pause hook import
     debug_pause_idx: Option<u32>,
+    /// Index of the debugger cooperative yield hook import
+    debug_yield_idx: Option<u32>,
     /// Index of the debugger local snapshot hook import
     debug_value_hook_idx: Option<u32>,
     /// Index of the debugger frame-enter hook import
@@ -779,6 +1039,12 @@ struct ModuleCompiler<'a> {
     debug_exit_hook_idx: Option<u32>,
     /// Reserved debug-resume frame slots for functions/lambdas compiled with debugger hooks.
     debug_resume_frames: Vec<DebugResumeFramePlan>,
+    /// Mutable globals storing resumable statement state for cooperative test pauses.
+    debug_resume_state_globals: HashMap<u32, u32>,
+    /// Active resumable function context while compiling a resumable test/helper body.
+    active_resumable_function_context: Option<ActiveResumableFunctionContext>,
+    /// Active resumable top-level statement context while compiling a resumable statement.
+    active_resumable_statement_context: Option<ActiveResumableStatementContext>,
     /// Active debug hook context while compiling a function/lambda body
     active_debug_hook_context: Option<ActiveDebugHookContext>,
     /// Compile-time constant i32 locals visible in the current function/lambda scope
@@ -842,10 +1108,14 @@ impl<'a> ModuleCompiler<'a> {
             debug_hook_idx: None,
             debug_pause_probe_idx: None,
             debug_pause_idx: None,
+            debug_yield_idx: None,
             debug_value_hook_idx: None,
             debug_enter_hook_idx: None,
             debug_exit_hook_idx: None,
             debug_resume_frames: Vec::new(),
+            debug_resume_state_globals: HashMap::new(),
+            active_resumable_function_context: None,
+            active_resumable_statement_context: None,
             active_debug_hook_context: None,
             active_constant_locals: None,
             task_return_types: HashMap::new(),
@@ -867,6 +1137,7 @@ impl<'a> ModuleCompiler<'a> {
             compiler.ensure_debug_hook_import();
             compiler.ensure_debug_pause_probe_import();
             compiler.ensure_debug_pause_import();
+            compiler.ensure_debug_yield_import();
             compiler.ensure_debug_value_hook_import();
             compiler.ensure_debug_enter_hook_import();
             compiler.ensure_debug_exit_hook_import();
@@ -944,6 +1215,30 @@ impl<'a> ModuleCompiler<'a> {
         func_idx
     }
 
+    fn ensure_debug_yield_import(&mut self) -> u32 {
+        if let Some(idx) = self.debug_yield_idx {
+            return idx;
+        }
+
+        let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
+        let func_idx = self.import_count;
+        self.import_count += 1;
+        self.functions
+            .insert("$debug_yield".to_string(), (type_idx, func_idx, true));
+        self.debug_yield_idx = Some(func_idx);
+        func_idx
+    }
+
+    fn ensure_debug_resume_state_global(&mut self, func_idx: u32) -> u32 {
+        if let Some(&global_idx) = self.debug_resume_state_globals.get(&func_idx) {
+            return global_idx;
+        }
+
+        let global_idx = 1 + self.debug_resume_state_globals.len() as u32;
+        self.debug_resume_state_globals.insert(func_idx, global_idx);
+        global_idx
+    }
+
     fn ensure_debug_exit_hook_import(&mut self) -> u32 {
         if let Some(idx) = self.debug_exit_hook_idx {
             return idx;
@@ -983,7 +1278,29 @@ impl<'a> ModuleCompiler<'a> {
         result
     }
 
-    fn emit_debug_line_hook(&mut self, function: &mut Function, line: i64) {
+    fn with_active_resumable_function_context<T>(
+        &mut self,
+        context: Option<ActiveResumableFunctionContext>,
+        build: impl FnOnce(&mut Self) -> Result<T, CompileError>,
+    ) -> Result<T, CompileError> {
+        let previous = std::mem::replace(&mut self.active_resumable_function_context, context);
+        let result = build(self);
+        self.active_resumable_function_context = previous;
+        result
+    }
+
+    fn with_active_resumable_statement_context<T>(
+        &mut self,
+        context: Option<ActiveResumableStatementContext>,
+        build: impl FnOnce(&mut Self) -> Result<T, CompileError>,
+    ) -> Result<T, CompileError> {
+        let previous = std::mem::replace(&mut self.active_resumable_statement_context, context);
+        let result = build(self);
+        self.active_resumable_statement_context = previous;
+        result
+    }
+
+    fn emit_debug_line_recording(&mut self, function: &mut Function, line: i64) {
         if !self.options.emit_debug_hooks || line <= 0 {
             return;
         }
@@ -992,17 +1309,46 @@ impl<'a> ModuleCompiler<'a> {
             return;
         };
 
-        if let (Some(debug_value_hook_idx), Some(context)) = (
-            self.debug_value_hook_idx,
-            self.active_debug_hook_context.as_ref(),
-        ) {
-            for binding in context.bindings.iter().filter(|binding| {
-                binding.decl_line <= line as u64
-                    && context.snapshottable_locals.contains(&binding.local_index)
-            }) {
+        if let (Some(debug_value_hook_idx), Some(context)) =
+            (self.debug_value_hook_idx, self.active_debug_hook_context.as_ref())
+        {
+            function.instruction(&Instruction::I32Const(context.debug_resume_state_offset as i32));
+            function.instruction(&Instruction::I32Const(line as i32));
+            function.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+            function.instruction(&Instruction::I32Const(
+                (context.debug_resume_state_offset + 4) as i32,
+            ));
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+
+            for (slot_index, binding) in context
+                .visible_bindings
+                .iter()
+                .filter(|binding| binding.decl_line <= line as u64)
+                .enumerate()
+            {
                 function.instruction(&Instruction::I32Const(binding.local_index as i32));
                 function.instruction(&Instruction::LocalGet(binding.local_index));
                 function.instruction(&Instruction::Call(debug_value_hook_idx));
+
+                let slot_offset = context.debug_resume_state_offset
+                    + DEBUG_RESUME_HEADER_BYTES
+                    + (slot_index as u32 * 4);
+                function.instruction(&Instruction::I32Const(slot_offset as i32));
+                function.instruction(&Instruction::LocalGet(binding.local_index));
+                function.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
             }
             function.instruction(&Instruction::I32Const(context.subprogram_start_line as i32));
         } else {
@@ -1010,6 +1356,140 @@ impl<'a> ModuleCompiler<'a> {
         }
         function.instruction(&Instruction::I32Const(line as i32));
         function.instruction(&Instruction::Call(debug_hook_idx));
+    }
+
+    fn emit_default_resume_return(
+        &mut self,
+        function: &mut Function,
+        func: &Func,
+    ) -> Result<(), CompileError> {
+        if func.is_async && self.options.wasip3 {
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::Return);
+            return Ok(());
+        }
+
+        if let Some(result_ty) = func.result.as_ref() {
+            match self.ty_to_valtype(result_ty)? {
+                ValType::I32 => {
+                    function.instruction(&Instruction::I32Const(0));
+                }
+                ValType::I64 => {
+                    function.instruction(&Instruction::I64Const(0));
+                }
+                other => {
+                    return Err(CompileError {
+                        message: format!(
+                            "cooperative debug resume does not support {:?} test returns yet",
+                            other
+                        ),
+                        span: Some(func.span.clone()),
+                    })
+                }
+            }
+        }
+        function.instruction(&Instruction::Return);
+        Ok(())
+    }
+
+    fn emit_default_resume_return_for_active_function(
+        &mut self,
+        function: &mut Function,
+    ) -> Result<(), CompileError> {
+        let Some(context) = self.active_resumable_function_context.clone() else {
+            return Ok(());
+        };
+
+        if context.is_async && self.options.wasip3 {
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::Return);
+            return Ok(());
+        }
+
+        if let Some(result_ty) = context.result_ty.as_ref() {
+            match self.ty_to_valtype(result_ty)? {
+                ValType::I32 => {
+                    function.instruction(&Instruction::I32Const(0));
+                }
+                ValType::I64 => {
+                    function.instruction(&Instruction::I64Const(0));
+                }
+                other => {
+                    return Err(CompileError {
+                        message: format!(
+                            "cooperative helper resume does not support {:?} caller returns yet",
+                            other
+                        ),
+                        span: Some(context.span),
+                    })
+                }
+            }
+        }
+
+        function.instruction(&Instruction::Return);
+        Ok(())
+    }
+
+    fn emit_restore_resumable_test_locals(
+        &mut self,
+        function: &mut Function,
+        state_global_idx: u32,
+    ) {
+        let Some(context) = self.active_debug_hook_context.as_ref() else {
+            return;
+        };
+
+        function.instruction(&Instruction::GlobalGet(state_global_idx));
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        for (slot_index, binding) in context.visible_bindings.iter().enumerate() {
+            let slot_offset = context.debug_resume_state_offset
+                + DEBUG_RESUME_HEADER_BYTES
+                + (slot_index as u32 * 4);
+            function.instruction(&Instruction::I32Const(slot_offset as i32));
+            function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+            function.instruction(&Instruction::LocalSet(binding.local_index));
+        }
+        function.instruction(&Instruction::End);
+    }
+
+    fn emit_resumable_test_statement_hook(
+        &mut self,
+        function: &mut Function,
+        func: &Func,
+        line: i64,
+        resumable_test: ResumableTestContext,
+        statement_pc: u32,
+    ) -> Result<(), CompileError> {
+        self.emit_debug_line_recording(function, line);
+
+        if let (Some(debug_pause_probe_idx), Some(debug_yield_idx)) =
+            (self.debug_pause_probe_idx, self.debug_yield_idx)
+        {
+            function.instruction(&Instruction::I32Const(line as i32));
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::Call(debug_pause_probe_idx));
+            function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            function.instruction(&Instruction::I32Const(statement_pc as i32));
+            function.instruction(&Instruction::GlobalSet(resumable_test.state_global_idx));
+            function.instruction(&Instruction::I32Const(line as i32));
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::Call(debug_yield_idx));
+            self.emit_default_resume_return(function, func)?;
+            function.instruction(&Instruction::End);
+        }
+
+        Ok(())
+    }
+
+    fn emit_debug_line_hook(&mut self, function: &mut Function, line: i64) {
+        if !self.options.emit_debug_hooks || line <= 0 {
+            return;
+        }
+        self.emit_debug_line_recording(function, line);
 
         if let (Some(debug_pause_probe_idx), Some(debug_pause_idx)) =
             (self.debug_pause_probe_idx, self.debug_pause_idx)
@@ -1061,6 +1541,308 @@ impl<'a> ModuleCompiler<'a> {
         function.instruction(&Instruction::Call(debug_exit_hook_idx));
     }
 
+    fn is_resumable_test_function(&self, func: &Func) -> bool {
+        self.options.emit_debug_hooks
+            && func.gates.iter().any(|gate| matches!(gate, Gate::Test))
+            && !func.is_async
+    }
+
+    fn is_resumable_helper_function(&self, func: &Func) -> bool {
+        self.options.emit_debug_hooks
+            && !func.gates.iter().any(|gate| matches!(gate, Gate::Test))
+            && !func.is_async
+            && function_supports_resumable_helper(func)
+    }
+
+    fn resumable_helper_state_global_for_call(
+        &mut self,
+        callee_name: &str,
+        callee_func_idx: u32,
+        callee_type_idx: u32,
+        args: &[Expr],
+    ) -> Option<u32> {
+        let active_function = self.active_resumable_function_context.as_ref()?;
+        let _active_statement = self.active_resumable_statement_context.as_ref()?;
+        if !active_function.allows_helper_calls {
+            return None;
+        }
+
+        if !args
+            .iter()
+            .all(expr_is_restart_safe_for_resumable_helper_call)
+        {
+            return None;
+        }
+
+        let (_, results) = self.types.get(callee_type_idx as usize)?;
+        if !matches!(results.as_slice(), [] | [ValType::I32]) {
+            return None;
+        }
+
+        let func = self
+            .func_bodies
+            .iter()
+            .find_map(|(_, func)| (func.name.name == callee_name).then_some(func))?;
+        if !self.is_resumable_helper_function(func) {
+            return None;
+        }
+
+        Some(self.ensure_debug_resume_state_global(callee_func_idx))
+    }
+
+    fn emit_resumable_helper_call_boundary(
+        &mut self,
+        function: &mut Function,
+        helper_state_global_idx: u32,
+        result_local_idx: Option<u32>,
+    ) -> Result<(), CompileError> {
+        let Some(active_function) = self.active_resumable_function_context.as_ref() else {
+            return Ok(());
+        };
+        let Some(active_statement) = self.active_resumable_statement_context else {
+            return Ok(());
+        };
+
+        if let Some(result_local_idx) = result_local_idx {
+            function.instruction(&Instruction::LocalSet(result_local_idx));
+        }
+
+        function.instruction(&Instruction::GlobalGet(helper_state_global_idx));
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        function.instruction(&Instruction::I32Const(active_statement.statement_pc as i32));
+        function.instruction(&Instruction::GlobalSet(active_function.state_global_idx));
+        self.emit_default_resume_return_for_active_function(function)?;
+        function.instruction(&Instruction::End);
+
+        if let Some(result_local_idx) = result_local_idx {
+            function.instruction(&Instruction::LocalGet(result_local_idx));
+        }
+
+        Ok(())
+    }
+
+    fn emit_resumable_statement_guard(
+        &mut self,
+        function: &mut Function,
+        resumable_test: ResumableTestContext,
+        statement_pc: u32,
+    ) {
+        function.instruction(&Instruction::GlobalGet(resumable_test.state_global_idx));
+        function.instruction(&Instruction::I32Const(statement_pc as i32));
+        function.instruction(&Instruction::I32LeU);
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    }
+
+    fn emit_resumable_pause_if_needed(
+        &mut self,
+        function: &mut Function,
+        func: &Func,
+        line: i64,
+        resumable_test: ResumableTestContext,
+        statement_pc: u32,
+    ) -> Result<(), CompileError> {
+        function.instruction(&Instruction::GlobalGet(resumable_test.state_global_idx));
+        function.instruction(&Instruction::I32Const(statement_pc as i32));
+        function.instruction(&Instruction::I32Ne);
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        self.emit_resumable_test_statement_hook(
+            function,
+            func,
+            line,
+            resumable_test,
+            statement_pc,
+        )?;
+        function.instruction(&Instruction::End);
+        Ok(())
+    }
+
+    fn compile_top_level_statement_with_resume(
+        &mut self,
+        function: &mut Function,
+        func: &Func,
+        stmt: &Statement,
+        statement_pc: u32,
+        resumable_test: Option<ResumableTestContext>,
+        locals: &HashMap<String, u32>,
+        locals_types: &mut HashMap<String, RecordTypeInfo>,
+    ) -> Result<(), CompileError> {
+        if let Some(resumable_test) = resumable_test {
+            let Some(source) = self.options.debug_source.as_deref() else {
+                return self.compile_statement_with_locals(function, stmt, locals, locals_types);
+            };
+            self.emit_resumable_statement_guard(function, resumable_test, statement_pc);
+            self.emit_resumable_pause_if_needed(
+                function,
+                func,
+                statement_start_line(stmt, source),
+                resumable_test,
+                statement_pc,
+            )?;
+            self.compile_statement_with_locals_inner(function, stmt, locals, locals_types, false)?;
+            function.instruction(&Instruction::End);
+            return Ok(());
+        }
+
+        self.compile_statement_with_locals(function, stmt, locals, locals_types)
+    }
+
+    fn compile_function_last_statement(
+        &mut self,
+        function: &mut Function,
+        func: &Func,
+        stmt: &Statement,
+        statement_pc: u32,
+        resumable_test: Option<ResumableTestContext>,
+        locals: &HashMap<String, u32>,
+        locals_types: &mut HashMap<String, RecordTypeInfo>,
+    ) -> Result<(), CompileError> {
+        if let Some(resumable_test) = resumable_test {
+            if let Some(source) = self.options.debug_source.as_deref() {
+                self.emit_resumable_pause_if_needed(
+                    function,
+                    func,
+                    statement_start_line(stmt, source),
+                    resumable_test,
+                    statement_pc,
+                )?;
+            }
+        } else {
+            self.emit_debug_line_hook_for_statement(function, stmt);
+        }
+
+        match stmt {
+            Statement::CompoundAssign { name, op, value } => {
+                if let Some(&idx) = locals.get(&name.name) {
+                    function.instruction(&Instruction::LocalGet(idx));
+                }
+                self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                match op {
+                    BinOp::Add => function.instruction(&Instruction::I32Add),
+                    BinOp::Sub => function.instruction(&Instruction::I32Sub),
+                    _ => function.instruction(&Instruction::I32Add),
+                };
+                if let Some(&idx) = locals.get(&name.name) {
+                    function.instruction(&Instruction::LocalSet(idx));
+                }
+                function.instruction(&Instruction::I32Const(0));
+            }
+            Statement::Expr(expr) => {
+                self.compile_expr_with_locals(function, expr, locals, locals_types)?;
+
+                if func.is_async && self.options.wasip3 {
+                    if let Some(ref result_ty) = func.result {
+                        let result_valtype = self.ty_to_valtype(result_ty)?;
+                        let task_return_idx = self.ensure_task_return_import(&[result_valtype]);
+                        function.instruction(&Instruction::Call(task_return_idx));
+                    }
+                    function.instruction(&Instruction::I32Const(0));
+                }
+            }
+            Statement::Return(Some(expr)) => {
+                self.compile_expr_with_locals(function, expr, locals, locals_types)?;
+
+                if let Some(resumable_test) = resumable_test {
+                    function.instruction(&Instruction::I32Const(0));
+                    function.instruction(&Instruction::GlobalSet(resumable_test.state_global_idx));
+                }
+
+                if func.is_async && self.options.wasip3 {
+                    if let Some(ref result_ty) = func.result {
+                        let result_valtype = self.ty_to_valtype(result_ty)?;
+                        let task_return_idx = self.ensure_task_return_import(&[result_valtype]);
+                        function.instruction(&Instruction::Call(task_return_idx));
+                    }
+                    function.instruction(&Instruction::I32Const(0));
+                    function.instruction(&Instruction::Return);
+                } else {
+                    function.instruction(&Instruction::Return);
+                }
+            }
+            Statement::Return(None) => {
+                if let Some(resumable_test) = resumable_test {
+                    function.instruction(&Instruction::I32Const(0));
+                    function.instruction(&Instruction::GlobalSet(resumable_test.state_global_idx));
+                }
+                if func.is_async && self.options.wasip3 {
+                    let task_return_idx = self.ensure_task_return_import(&[]);
+                    function.instruction(&Instruction::Call(task_return_idx));
+                    function.instruction(&Instruction::I32Const(0));
+                }
+                function.instruction(&Instruction::Return);
+            }
+            Statement::Let { name, value } => {
+                if let Expr::RecordLiteral { fields, .. } = value {
+                    let field_info: Vec<_> = fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (field_name, _))| (field_name.name.clone(), i * 4))
+                        .collect();
+                    locals_types.insert(name.name.clone(), RecordTypeInfo::from_fields(&field_info));
+                }
+                self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                if let Some(&idx) = locals.get(&name.name) {
+                    function.instruction(&Instruction::LocalSet(idx));
+                }
+                if (func.is_async && self.options.wasip3) || func.result.is_some() {
+                    function.instruction(&Instruction::I32Const(0));
+                }
+            }
+            Statement::Assign { name, value } => {
+                self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                if let Some(&idx) = locals.get(&name.name) {
+                    function.instruction(&Instruction::LocalSet(idx));
+                }
+                if (func.is_async && self.options.wasip3) || func.result.is_some() {
+                    function.instruction(&Instruction::I32Const(0));
+                }
+            }
+            Statement::Break { .. } | Statement::Continue { .. } => {
+                if (func.is_async && self.options.wasip3) || func.result.is_some() {
+                    function.instruction(&Instruction::I32Const(0));
+                }
+            }
+            Statement::SharedLet { .. } => {
+                if (func.is_async && self.options.wasip3) || func.result.is_some() {
+                    function.instruction(&Instruction::I32Const(0));
+                }
+            }
+            Statement::GuardLet {
+                name,
+                value,
+                else_body,
+            } => {
+                self.compile_guard_let_statement_with_locals(
+                    function,
+                    name,
+                    value,
+                    else_body,
+                    locals,
+                    locals_types,
+                )?;
+                if (func.is_async && self.options.wasip3) || func.result.is_some() {
+                    function.instruction(&Instruction::I32Const(0));
+                }
+            }
+            Statement::Guard {
+                condition,
+                else_body,
+            } => {
+                self.compile_guard_statement_with_locals(
+                    function,
+                    condition,
+                    else_body,
+                    locals,
+                    locals_types,
+                )?;
+                if (func.is_async && self.options.wasip3) || func.result.is_some() {
+                    function.instruction(&Instruction::I32Const(0));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn function_snapshottable_locals(
         &self,
         func: &Func,
@@ -1082,8 +1864,29 @@ impl<'a> ModuleCompiler<'a> {
         Ok(indices)
     }
 
-    fn active_debug_hook_context_for_function(
+    fn persisted_debug_bindings(
         &self,
+        bindings: &[DebugBinding],
+        snapshottable_locals: &std::collections::HashSet<u32>,
+    ) -> Vec<DebugBinding> {
+        let mut persisted = bindings
+            .iter()
+            .filter(|binding| snapshottable_locals.contains(&binding.local_index))
+            .cloned()
+            .collect::<Vec<_>>();
+        persisted.sort_by_key(|binding| binding.local_index);
+        persisted
+    }
+
+    fn alloc_debug_resume_state(&mut self, binding_count: u32) -> u32 {
+        let state_offset = self.string_offset;
+        self.string_offset += DEBUG_RESUME_HEADER_BYTES + (binding_count * 4);
+        state_offset
+    }
+
+    fn active_debug_hook_context_for_function(
+        &mut self,
+        func_idx: u32,
         func: &Func,
         debug_info: &FunctionDebugInfo,
         locals: &HashMap<String, u32>,
@@ -1093,15 +1896,27 @@ impl<'a> ModuleCompiler<'a> {
             return Ok(None);
         };
 
+        let snapshottable_locals = self.function_snapshottable_locals(func, locals, v128_locals)?;
+        let visible_bindings =
+            self.persisted_debug_bindings(&debug_info.bindings, &snapshottable_locals);
+        let Some(debug_resume_state_offset) = self.register_debug_resume_frame(
+            func_idx,
+            func.name.name.clone(),
+            offset_to_line(source, func.span.start) as i64,
+            visible_bindings.clone(),
+        ) else {
+            return Ok(None);
+        };
+
         Ok(Some(ActiveDebugHookContext {
             subprogram_start_line: offset_to_line(source, func.span.start) as i64,
-            bindings: debug_info.bindings.clone(),
-            snapshottable_locals: self.function_snapshottable_locals(func, locals, v128_locals)?,
+            visible_bindings,
+            debug_resume_state_offset,
         }))
     }
 
     fn active_debug_hook_context_for_lambda(
-        &self,
+        &mut self,
         func_idx: u32,
         body: &Expr,
         debug_info: &FunctionDebugInfo,
@@ -1113,15 +1928,27 @@ impl<'a> ModuleCompiler<'a> {
             .find(|(idx, _)| *idx == func_idx)
             .map(|(_, span)| offset_to_line(source, span.start) as i64)
             .unwrap_or_else(|| expr_start_line(body, source));
+        let snapshottable_locals = debug_info
+            .bindings
+            .iter()
+            .map(|binding| binding.local_index)
+            .collect::<std::collections::HashSet<_>>();
+        let visible_bindings =
+            self.persisted_debug_bindings(&debug_info.bindings, &snapshottable_locals);
+        let debug_resume_state_offset = self.register_debug_resume_frame(
+            func_idx,
+            self.func_debug_names
+                .get(&func_idx)
+                .cloned()
+                .unwrap_or_else(|| format!("lambda#{}", func_idx)),
+            subprogram_start_line,
+            visible_bindings.clone(),
+        )?;
 
         Some(ActiveDebugHookContext {
             subprogram_start_line,
-            bindings: debug_info.bindings.clone(),
-            snapshottable_locals: debug_info
-                .bindings
-                .iter()
-                .map(|binding| binding.local_index)
-                .collect(),
+            visible_bindings,
+            debug_resume_state_offset,
         })
     }
 
@@ -1130,38 +1957,29 @@ impl<'a> ModuleCompiler<'a> {
         func_idx: u32,
         name: String,
         start_line: i64,
-        debug_info: &FunctionDebugInfo,
-    ) {
-        if !self.options.emit_debug_hooks || debug_info.bindings.is_empty() {
-            return;
+        bindings: Vec<DebugBinding>,
+    ) -> Option<u32> {
+        if !self.options.emit_debug_hooks || bindings.is_empty() {
+            return None;
         }
 
-        if self
+        if let Some(frame) = self
             .debug_resume_frames
             .iter()
-            .any(|frame| frame.func_idx == func_idx)
+            .find(|frame| frame.func_idx == func_idx)
         {
-            return;
+            return Some(frame.state_offset);
         }
 
-        let mut bindings = debug_info.bindings.clone();
-        bindings.sort_by_key(|binding| binding.local_index);
+        let state_offset = self.alloc_debug_resume_state(bindings.len() as u32);
         self.debug_resume_frames.push(DebugResumeFramePlan {
             func_idx,
             name,
             start_line,
             bindings,
-            state_offset: None,
+            state_offset,
         });
-    }
-
-    fn finalize_debug_resume_frames(&mut self) {
-        let mut next_offset = self.string_offset;
-        for frame in &mut self.debug_resume_frames {
-            frame.state_offset = Some(next_offset);
-            next_offset += DEBUG_RESUME_HEADER_BYTES + (frame.bindings.len() as u32 * 4);
-        }
-        self.string_offset = next_offset;
+        Some(state_offset)
     }
 
     fn emit_debug_resume_section(&self, module: &mut Module) {
@@ -1178,7 +1996,7 @@ impl<'a> ModuleCompiler<'a> {
                 json.push(',');
             }
 
-            let state_offset = frame.state_offset.unwrap_or(0);
+            let state_offset = frame.state_offset;
             let byte_size = DEBUG_RESUME_HEADER_BYTES + (frame.bindings.len() as u32 * 4);
             json.push_str(&format!(
                 "{{\"funcIndex\":{},\"name\":\"{}\",\"startLine\":{},\"stateOffset\":{},\"byteSize\":{},\"slotCount\":{},\"bindings\":[",
@@ -1713,17 +2531,6 @@ impl<'a> ModuleCompiler<'a> {
                         fallback_decl_line,
                     );
                     self.func_debug_info.insert(*func_idx, debug_info.clone());
-                    let lambda_name = self
-                        .func_debug_names
-                        .get(func_idx)
-                        .cloned()
-                        .unwrap_or_else(|| format!("lambda#{}", func_idx));
-                    self.register_debug_resume_frame(
-                        *func_idx,
-                        lambda_name,
-                        fallback_decl_line as i64,
-                        &debug_info,
-                    );
                     self.active_debug_hook_context_for_lambda(*func_idx, body, &debug_info)
                 } else {
                     None
@@ -1850,6 +2657,10 @@ impl<'a> ModuleCompiler<'a> {
         if self.debug_pause_idx.is_some() {
             let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
             imports.import("kettu:debug", "pause", EntityType::Function(type_idx));
+        }
+        if self.debug_yield_idx.is_some() {
+            let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
+            imports.import("kettu:debug", "yield", EntityType::Function(type_idx));
         }
         if self.debug_value_hook_idx.is_some() {
             let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
@@ -2037,8 +2848,6 @@ impl<'a> ModuleCompiler<'a> {
         });
         module.section(&memories);
 
-        self.finalize_debug_resume_frames();
-
         // 6. Global section
         let mut globals = GlobalSection::new();
         globals.global(
@@ -2049,6 +2858,16 @@ impl<'a> ModuleCompiler<'a> {
             },
             &wasm_encoder::ConstExpr::i32_const(self.string_offset as i32),
         );
+        for _ in 0..self.debug_resume_state_globals.len() {
+            globals.global(
+                GlobalType {
+                    val_type: ValType::I32,
+                    mutable: true,
+                    shared: false,
+                },
+                &wasm_encoder::ConstExpr::i32_const(0),
+            );
+        }
         module.section(&globals);
 
         // 7. Export section
@@ -3520,16 +4339,32 @@ impl<'a> ModuleCompiler<'a> {
         let debug_context = if let Some(source) = self.options.debug_source.as_deref() {
             let debug_info = build_function_debug_info(func, &locals, source);
             self.func_debug_info.insert(func_idx, debug_info.clone());
-            self.register_debug_resume_frame(
+            self.active_debug_hook_context_for_function(
                 func_idx,
-                func.name.name.clone(),
-                offset_to_line(source, func.span.start) as i64,
+                func,
                 &debug_info,
-            );
-            self.active_debug_hook_context_for_function(func, &debug_info, &locals, &v128_locals)?
+                &locals,
+                &v128_locals,
+            )?
         } else {
             None
         };
+        let resumable_test = if debug_context.is_some()
+            && (self.is_resumable_test_function(func) || self.is_resumable_helper_function(func))
+        {
+            Some(ResumableTestContext {
+                state_global_idx: self.ensure_debug_resume_state_global(func_idx),
+            })
+        } else {
+            None
+        };
+        let resumable_function_context = resumable_test.map(|context| ActiveResumableFunctionContext {
+            state_global_idx: context.state_global_idx,
+            allows_helper_calls: self.is_resumable_test_function(func),
+            is_async: func.is_async,
+            result_ty: func.result.clone(),
+            span: func.span.clone(),
+        });
 
         // Declare locals with correct types (v128 for SIMD, i32 for everything else)
         // +1 for temp record pointer
@@ -3615,189 +4450,73 @@ impl<'a> ModuleCompiler<'a> {
 
         self.with_active_debug_hook_context(debug_context, |compiler| {
             compiler.with_active_constant_locals(Some(HashMap::new()), |compiler| {
-                if let Some(ref body) = func.body {
-                    let stmts = &body.statements;
-                    if !stmts.is_empty() {
-                        for stmt in &stmts[..stmts.len() - 1] {
-                            compiler.compile_statement_with_locals(
+                compiler.with_active_resumable_function_context(
+                    resumable_function_context,
+                    |compiler| {
+                        if let Some(resumable_test) = resumable_test {
+                            compiler.emit_restore_resumable_test_locals(
                                 &mut function,
-                                stmt,
-                                &locals,
-                                &mut locals_types,
-                            )?;
+                                resumable_test.state_global_idx,
+                            );
                         }
+                        if let Some(ref body) = func.body {
+                            let stmts = &body.statements;
+                            if !stmts.is_empty() {
+                                for (statement_index, stmt) in
+                                    stmts[..stmts.len() - 1].iter().enumerate()
+                                {
+                                    let statement_pc = (statement_index + 1) as u32;
+                                    compiler.with_active_resumable_statement_context(
+                                        resumable_test.map(|_| ActiveResumableStatementContext {
+                                            statement_pc,
+                                        }),
+                                        |compiler| {
+                                            compiler.compile_top_level_statement_with_resume(
+                                                &mut function,
+                                                func,
+                                                stmt,
+                                                statement_pc,
+                                                resumable_test,
+                                                &locals,
+                                                &mut locals_types,
+                                            )
+                                        },
+                                    )?;
+                                }
 
-                        let last = &stmts[stmts.len() - 1];
-                        compiler.emit_debug_line_hook_for_statement(&mut function, last);
-                        match last {
-                            Statement::CompoundAssign { name, op, value } => {
-                                if let Some(&idx) = locals.get(&name.name) {
-                                    function.instruction(&Instruction::LocalGet(idx));
-                                }
-                                compiler.compile_expr_with_locals(
-                                    &mut function,
-                                    value,
-                                    &locals,
-                                    &locals_types,
+                                let last = &stmts[stmts.len() - 1];
+                                let statement_pc = stmts.len() as u32;
+                                compiler.with_active_resumable_statement_context(
+                                    resumable_test.map(|_| ActiveResumableStatementContext {
+                                        statement_pc,
+                                    }),
+                                    |compiler| {
+                                        compiler.compile_function_last_statement(
+                                            &mut function,
+                                            func,
+                                            last,
+                                            statement_pc,
+                                            resumable_test,
+                                            &locals,
+                                            &mut locals_types,
+                                        )
+                                    },
                                 )?;
-                                match op {
-                                    BinOp::Add => function.instruction(&Instruction::I32Add),
-                                    BinOp::Sub => function.instruction(&Instruction::I32Sub),
-                                    _ => function.instruction(&Instruction::I32Add),
-                                };
-                                if let Some(&idx) = locals.get(&name.name) {
-                                    function.instruction(&Instruction::LocalSet(idx));
-                                }
-                                function.instruction(&Instruction::I32Const(0));
                             }
-                            Statement::Expr(expr) => {
-                                compiler.compile_expr_with_locals(
-                                    &mut function,
-                                    expr,
-                                    &locals,
-                                    &locals_types,
-                                )?;
-
-                                if func.is_async && compiler.options.wasip3 {
-                                    if let Some(ref result_ty) = func.result {
-                                        let result_valtype = compiler.ty_to_valtype(result_ty)?;
-                                        let task_return_idx =
-                                            compiler.ensure_task_return_import(&[result_valtype]);
-                                        function.instruction(&Instruction::Call(task_return_idx));
-                                    }
-                                    function.instruction(&Instruction::I32Const(0));
-                                }
-                            }
-                            Statement::Return(Some(expr)) => {
-                                compiler.compile_expr_with_locals(
-                                    &mut function,
-                                    expr,
-                                    &locals,
-                                    &locals_types,
-                                )?;
-
-                                if func.is_async && compiler.options.wasip3 {
-                                    if let Some(ref result_ty) = func.result {
-                                        let result_valtype = compiler.ty_to_valtype(result_ty)?;
-                                        let task_return_idx =
-                                            compiler.ensure_task_return_import(&[result_valtype]);
-                                        function.instruction(&Instruction::Call(task_return_idx));
-                                    }
-                                    function.instruction(&Instruction::I32Const(0));
-                                    function.instruction(&Instruction::Return);
-                                } else {
-                                    function.instruction(&Instruction::Return);
-                                }
-                            }
-                            Statement::Return(None) => {
-                                if func.is_async && compiler.options.wasip3 {
-                                    let task_return_idx = compiler.ensure_task_return_import(&[]);
-                                    function.instruction(&Instruction::Call(task_return_idx));
-                                    function.instruction(&Instruction::I32Const(0));
-                                }
-                                function.instruction(&Instruction::Return);
-                            }
-                            Statement::Let { name, value } => {
-                                if let Expr::RecordLiteral { fields, .. } = value {
-                                    let field_info: Vec<_> = fields
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(i, (field_name, _))| {
-                                            (field_name.name.clone(), i * 4)
-                                        })
-                                        .collect();
-                                    locals_types.insert(
-                                        name.name.clone(),
-                                        RecordTypeInfo::from_fields(&field_info),
-                                    );
-                                }
-                                compiler.compile_expr_with_locals(
-                                    &mut function,
-                                    value,
-                                    &locals,
-                                    &locals_types,
-                                )?;
-                                if let Some(&idx) = locals.get(&name.name) {
-                                    function.instruction(&Instruction::LocalSet(idx));
-                                }
-                                if (func.is_async && compiler.options.wasip3)
-                                    || func.result.is_some()
-                                {
-                                    function.instruction(&Instruction::I32Const(0));
-                                }
-                            }
-                            Statement::Assign { name, value } => {
-                                compiler.compile_expr_with_locals(
-                                    &mut function,
-                                    value,
-                                    &locals,
-                                    &locals_types,
-                                )?;
-                                if let Some(&idx) = locals.get(&name.name) {
-                                    function.instruction(&Instruction::LocalSet(idx));
-                                }
-                                if (func.is_async && compiler.options.wasip3)
-                                    || func.result.is_some()
-                                {
-                                    function.instruction(&Instruction::I32Const(0));
-                                }
-                            }
-                            Statement::Break { .. } | Statement::Continue { .. } => {
-                                if (func.is_async && compiler.options.wasip3)
-                                    || func.result.is_some()
-                                {
-                                    function.instruction(&Instruction::I32Const(0));
-                                }
-                            }
-                            Statement::SharedLet { .. } => {
-                                if (func.is_async && compiler.options.wasip3)
-                                    || func.result.is_some()
-                                {
-                                    function.instruction(&Instruction::I32Const(0));
-                                }
-                            }
-                            Statement::GuardLet {
-                                name,
-                                value,
-                                else_body,
-                            } => {
-                                compiler.compile_guard_let_statement_with_locals(
-                                    &mut function,
-                                    name,
-                                    value,
-                                    else_body,
-                                    &locals,
-                                    &mut locals_types,
-                                )?;
-                                if (func.is_async && compiler.options.wasip3)
-                                    || func.result.is_some()
-                                {
-                                    function.instruction(&Instruction::I32Const(0));
-                                }
-                            }
-                            Statement::Guard {
-                                condition,
-                                else_body,
-                            } => {
-                                compiler.compile_guard_statement_with_locals(
-                                    &mut function,
-                                    condition,
-                                    else_body,
-                                    &locals,
-                                    &mut locals_types,
-                                )?;
-                                if (func.is_async && compiler.options.wasip3)
-                                    || func.result.is_some()
-                                {
-                                    function.instruction(&Instruction::I32Const(0));
-                                }
-                            }
+                        } else if (func.is_async && compiler.options.wasip3)
+                            || func.result.is_some()
+                        {
+                            function.instruction(&Instruction::I32Const(0));
                         }
-                    }
-                } else if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
-                    function.instruction(&Instruction::I32Const(0));
-                }
-                Ok(())
+                        if let Some(resumable_test) = resumable_test {
+                            function.instruction(&Instruction::I32Const(0));
+                            function.instruction(&Instruction::GlobalSet(
+                                resumable_test.state_global_idx,
+                            ));
+                        }
+                        Ok(())
+                    },
+                )
             })
         })?;
 
@@ -4424,7 +5143,20 @@ impl<'a> ModuleCompiler<'a> {
         locals: &HashMap<String, u32>,
         locals_types: &mut HashMap<String, RecordTypeInfo>,
     ) -> Result<(), CompileError> {
-        self.emit_debug_line_hook_for_statement(function, stmt);
+        self.compile_statement_with_locals_inner(function, stmt, locals, locals_types, true)
+    }
+
+    fn compile_statement_with_locals_inner(
+        &mut self,
+        function: &mut Function,
+        stmt: &Statement,
+        locals: &HashMap<String, u32>,
+        locals_types: &mut HashMap<String, RecordTypeInfo>,
+        emit_debug_hook: bool,
+    ) -> Result<(), CompileError> {
+        if emit_debug_hook {
+            self.emit_debug_line_hook_for_statement(function, stmt);
+        }
         match stmt {
             Statement::Expr(expr) => {
                 self.compile_expr_with_locals(function, expr, locals, locals_types)?;
@@ -5824,9 +6556,23 @@ impl<'a> ModuleCompiler<'a> {
                     self.compile_expr_with_locals(function, arg, locals, locals_types)?;
                 }
                 if let Expr::Ident(id) = callee.as_ref() {
-                    if let Some(&(_, func_idx, _)) = self.functions.get(&id.name) {
+                    if let Some((type_idx, func_idx, _)) = self.functions.get(&id.name).copied() {
+                        let resumable_helper_state_global_idx = self
+                            .resumable_helper_state_global_for_call(&id.name, func_idx, type_idx, args);
+                        let helper_result_local_idx = resumable_helper_state_global_idx.and_then(|_| {
+                            self.types
+                                .get(type_idx as usize)
+                                .and_then(|(_, results)| (!results.is_empty()).then_some(locals.len() as u32))
+                        });
                         // Direct function call
                         function.instruction(&Instruction::Call(func_idx));
+                        if let Some(helper_state_global_idx) = resumable_helper_state_global_idx {
+                            self.emit_resumable_helper_call_boundary(
+                                function,
+                                helper_state_global_idx,
+                                helper_result_local_idx,
+                            )?;
+                        }
                     } else if let Some(&local_idx) = locals.get(&id.name) {
                         // Local variable holding a closure cell pointer
                         // Check if we know captures for this variable at compile time

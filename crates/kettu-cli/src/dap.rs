@@ -344,6 +344,13 @@ struct RuntimeTraceState {
     active_closure_keys: Vec<i64>,
     pause_mode: RuntimePauseMode,
     pause_event: Option<RuntimePauseEvent>,
+    pause_kind: Option<RuntimePauseKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimePauseKind {
+    Trap,
+    Yield,
 }
 
 #[derive(Clone, Debug)]
@@ -570,9 +577,7 @@ impl RuntimeDebugSession {
     }
 
     fn run_to_completion(&mut self) -> Result<(), String> {
-        self.store.data_mut().pause_mode = RuntimePauseMode::ContinueToEnd;
-        self.store.data_mut().pause_event = None;
-        match self.execute_test() {
+        match self.run_with_pause_mode(RuntimePauseMode::ContinueToEnd) {
             RuntimeExecutionOutcome::Completed => Ok(()),
             RuntimeExecutionOutcome::Paused(pause) => Err(format!(
                 "Runtime unexpectedly paused at {}:{} while collecting trace",
@@ -587,14 +592,18 @@ impl RuntimeDebugSession {
         &mut self,
         breakpoints: BTreeSet<BreakpointLocation>,
     ) -> Result<Option<RuntimePauseEvent>, String> {
-        self.store.data_mut().pause_mode = RuntimePauseMode::Breakpoints(breakpoints);
-        self.store.data_mut().pause_event = None;
-
-        match self.execute_test() {
+        match self.run_with_pause_mode(RuntimePauseMode::Breakpoints(breakpoints)) {
             RuntimeExecutionOutcome::Completed => Ok(None),
             RuntimeExecutionOutcome::Paused(pause) => Ok(Some(pause)),
             RuntimeExecutionOutcome::Fault(err) => Err(err),
         }
+    }
+
+    fn run_with_pause_mode(&mut self, pause_mode: RuntimePauseMode) -> RuntimeExecutionOutcome {
+        self.store.data_mut().pause_mode = pause_mode;
+        self.store.data_mut().pause_event = None;
+        self.store.data_mut().pause_kind = None;
+        self.execute_test()
     }
 
     fn execute_test(&mut self) -> RuntimeExecutionOutcome {
@@ -611,9 +620,17 @@ impl RuntimeDebugSession {
         let ty = test_func.ty(&self.store);
         let mut results = vec![wasmtime::Val::I32(0); ty.results().len()];
         match test_func.call(&mut self.store, &[], &mut results) {
-            Ok(()) => RuntimeExecutionOutcome::Completed,
+            Ok(()) => self.classify_runtime_completion(),
             Err(err) => self.classify_runtime_trap(err),
         }
+    }
+
+    fn classify_runtime_completion(&self) -> RuntimeExecutionOutcome {
+        if let Some(pause) = self.store.data().pause_event.clone() {
+            return RuntimeExecutionOutcome::Paused(pause);
+        }
+
+        RuntimeExecutionOutcome::Completed
     }
 
     fn classify_runtime_trap(&self, err: wasmtime::Error) -> RuntimeExecutionOutcome {
@@ -640,6 +657,10 @@ impl RuntimeDebugSession {
 
     fn latest_event(&self) -> Option<&RuntimeTraceEvent> {
         self.store.data().events.last()
+    }
+
+    fn is_resumable_pause(&self) -> bool {
+        matches!(self.store.data().pause_kind, Some(RuntimePauseKind::Yield))
     }
 }
 
@@ -775,6 +796,13 @@ impl DebugSession {
 
     fn run_active_runtime_until_pause(&mut self) -> Result<Option<RuntimePauseEvent>, String> {
         let breakpoints = self.current_file_breakpoints();
+        self.run_active_runtime_until_pause_with_breakpoints(breakpoints)
+    }
+
+    fn run_active_runtime_until_pause_with_breakpoints(
+        &mut self,
+        breakpoints: BTreeSet<BreakpointLocation>,
+    ) -> Result<Option<RuntimePauseEvent>, String> {
         let Some(runtime_session) = self.active_runtime_session.as_mut() else {
             return Ok(None);
         };
@@ -802,14 +830,124 @@ impl DebugSession {
     }
 
     fn can_continue_with_runtime(&self) -> bool {
+        if self.current_file_has_column_breakpoints() {
+            return false;
+        }
+
+        if self.runtime_pause_event.is_some()
+            && self
+                .active_runtime_session
+                .as_ref()
+                .map(|session| session.is_resumable_pause())
+                .unwrap_or(false)
+        {
+            return true;
+        }
+
         self.tests
             .get(self.current_test)
             .map(|test| {
                 self.current_trace_index.is_none()
                     && self.current_line < test.line
-                    && !self.current_file_has_column_breakpoints()
             })
             .unwrap_or(false)
+    }
+
+    fn paused_runtime_is_top_level_test_frame(&self) -> bool {
+        let Some(snapshot) = paused_runtime_snapshot(self) else {
+            return false;
+        };
+        let Some(test_frame) = resolve_runtime_debug_frame(self, FrameTarget::Test) else {
+            return false;
+        };
+
+        snapshot.subprogram_start_line == Some(test_frame.start_line)
+    }
+
+    fn can_step_with_runtime(&self, action: &str) -> bool {
+        matches!(action, "next" | "stepIn" | "stepOut")
+            && !self.current_file_has_column_breakpoints()
+            && self.active_closures.is_empty()
+            && (action != "stepIn" || find_invoked_closure(self, self.current_line).is_none())
+            && self.runtime_pause_event.is_some()
+            && self.paused_runtime_is_top_level_test_frame()
+            && self
+                .active_runtime_session
+                .as_ref()
+                .map(|session| session.is_resumable_pause())
+                .unwrap_or(false)
+    }
+
+    fn next_runtime_step_line(&self) -> Option<i64> {
+        let test = self.tests.get(self.current_test)?;
+        let trace = &test.trace;
+        let current_index = self.current_trace_index?;
+        let current_line = self.current_line;
+
+        trace.iter()
+            .skip(current_index + 1)
+            .find(|entry| entry.line != current_line)
+            .map(|entry| entry.line)
+    }
+
+    fn runtime_pause_reason(
+        &self,
+        pause: &RuntimePauseEvent,
+        step_target_line: Option<i64>,
+    ) -> &'static str {
+        let position = SourcePosition::new(pause.line, pause.column);
+        if self
+            .current_file_breakpoints()
+            .iter()
+            .any(|breakpoint| breakpoint.matches(&position))
+        {
+            "breakpoint"
+        } else if step_target_line == Some(pause.line) {
+            "step"
+        } else {
+            "breakpoint"
+        }
+    }
+
+    fn run_live_runtime_step_or_end(&mut self, action: &str) -> Option<StopOutcome> {
+        if !self.can_step_with_runtime(action) {
+            return None;
+        }
+
+        if action == "stepOut" {
+            return self.run_live_runtime_until_breakpoint_or_end();
+        }
+
+        let step_target_line = self.next_runtime_step_line();
+        let Some(step_target_line) = step_target_line else {
+            self.reset_runtime_pause_state();
+            self.current_trace_index = None;
+            self.active_closures.clear();
+            return Some(StopOutcome::Terminated);
+        };
+
+        let mut breakpoints = self.current_file_breakpoints();
+        breakpoints.insert(BreakpointLocation::new(step_target_line, None));
+
+        match self.run_active_runtime_until_pause_with_breakpoints(breakpoints) {
+            Ok(Some(pause)) => {
+                self.sync_trace_cursor_to_current_position();
+                Some(StopOutcome::Stopped(self.runtime_pause_reason(
+                    &pause,
+                    Some(step_target_line),
+                )))
+            }
+            Ok(None) => {
+                self.reset_runtime_pause_state();
+                self.current_trace_index = None;
+                self.active_closures.clear();
+                Some(StopOutcome::Terminated)
+            }
+            Err(_) => {
+                self.reset_runtime_pause_state();
+                None
+            }
+        }
     }
 
     fn sync_trace_cursor_to_current_position(&mut self) {
@@ -1569,10 +1707,16 @@ pub fn run_server() -> io::Result<()> {
                 }
 
                 session.reset_child_variables();
-                session.reset_runtime_pause_state();
                 session.clear_paused_frames();
 
-                match session.step_once_or_end(command) {
+                let outcome = if let Some(outcome) = session.run_live_runtime_step_or_end(command) {
+                    outcome
+                } else {
+                    session.reset_runtime_pause_state();
+                    session.step_once_or_end(command)
+                };
+
+                match outcome {
                     StopOutcome::Stopped(reason) => {
                         session.capture_paused_frames();
                         send_stopped_event(&mut writer, reason)?
@@ -1742,11 +1886,30 @@ fn wire_runtime_debug_imports(linker: &mut Linker<RuntimeTraceState>) -> Result<
                         column: position.column,
                         reason: "breakpoint",
                     });
+                    state.pause_kind = Some(RuntimePauseKind::Trap);
                 }
                 Err(wasmtime::Error::msg(DEBUG_PAUSE_TRAP_MESSAGE))
             },
         )
         .map_err(|err| format!("Failed to wire debug pause hook: {}", err))?;
+    linker
+        .func_wrap(
+            "kettu:debug",
+            "yield",
+            |mut caller: wasmtime::Caller<'_, RuntimeTraceState>, line: i32, column: i32| {
+                if line > 0 {
+                    let position = SourcePosition::new(line as i64, column as i64);
+                    let state = caller.data_mut();
+                    state.pause_event = Some(RuntimePauseEvent {
+                        line: position.line,
+                        column: position.column,
+                        reason: "breakpoint",
+                    });
+                    state.pause_kind = Some(RuntimePauseKind::Yield);
+                }
+            },
+        )
+        .map_err(|err| format!("Failed to wire debug yield hook: {}", err))?;
     linker
         .func_wrap(
             "kettu:debug",
@@ -5345,12 +5508,186 @@ fn read_dap_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
 mod tests {
     use super::{
         infer_locals, parse_closures, parse_debug_symbols, DebugSession, DwarfBindingKind,
-        ListedTest,
+        ListedTest, RuntimeDebugSession, RuntimeTraceState,
     };
     use kettu_codegen::CompileOptions;
     use serde_json::json;
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
+    use wasm_encoder::{
+        CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
+        GlobalSection, GlobalType, ImportSection, Instruction, Module as WasmModule, TypeSection,
+        ValType,
+    };
+    use wasmtime::{Engine, Linker, Module, Store};
+
+    fn custom_runtime_session(
+        engine: &Engine,
+        wasm: &[u8],
+        export_name: &str,
+        wire_extra_imports: impl FnOnce(&mut Linker<RuntimeTraceState>),
+    ) -> RuntimeDebugSession {
+        let module = Module::new(engine, wasm).expect("module");
+        let mut linker = Linker::new(engine);
+        super::wire_runtime_debug_imports(&mut linker).expect("wire runtime debug imports");
+        wire_extra_imports(&mut linker);
+
+        let mut store = Store::new(engine, RuntimeTraceState::default());
+        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        RuntimeDebugSession {
+            store,
+            instance,
+            export_name: export_name.to_string(),
+        }
+    }
+
+    fn build_trap_pause_test_module() -> Vec<u8> {
+        let mut module = WasmModule::new();
+
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I32, ValType::I32], []);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I32]);
+        types.ty().function([], []);
+        module.section(&types);
+
+        let mut imports = ImportSection::new();
+        imports.import("kettu:debug", "line", EntityType::Function(0));
+        imports.import("kettu:debug", "should_pause", EntityType::Function(1));
+        imports.import("kettu:debug", "pause", EntityType::Function(0));
+        module.section(&imports);
+
+        let mut functions = FunctionSection::new();
+        functions.function(2);
+        module.section(&functions);
+
+        let mut exports = ExportSection::new();
+        exports.export("resume_demo", ExportKind::Func, 3);
+        module.section(&exports);
+
+        let mut code = CodeSection::new();
+        let mut function = Function::new(Vec::new());
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::I32Const(10));
+        function.instruction(&Instruction::Call(0));
+        function.instruction(&Instruction::I32Const(10));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::Call(1));
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        function.instruction(&Instruction::I32Const(10));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::Call(2));
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::I32Const(20));
+        function.instruction(&Instruction::Call(0));
+        function.instruction(&Instruction::End);
+        code.function(&function);
+        module.section(&code);
+
+        module.finish()
+    }
+
+    fn build_cooperative_resume_test_module() -> Vec<u8> {
+        let mut module = WasmModule::new();
+
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I32, ValType::I32], []);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I32]);
+        types.ty().function([], []);
+        module.section(&types);
+
+        let mut imports = ImportSection::new();
+        imports.import("kettu:debug", "line", EntityType::Function(0));
+        imports.import("kettu:debug", "should_pause", EntityType::Function(1));
+        imports.import("kettu:debug", "yield", EntityType::Function(0));
+        module.section(&imports);
+
+        let mut functions = FunctionSection::new();
+        functions.function(2);
+        module.section(&functions);
+
+        let mut globals = GlobalSection::new();
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &wasm_encoder::ConstExpr::i32_const(0),
+        );
+        module.section(&globals);
+
+        let mut exports = ExportSection::new();
+        exports.export("resume_demo", ExportKind::Func, 3);
+        module.section(&exports);
+
+        let mut code = CodeSection::new();
+        let mut function = Function::new(Vec::new());
+
+        function.instruction(&Instruction::GlobalGet(0));
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::I32Const(10));
+        function.instruction(&Instruction::Call(0));
+        function.instruction(&Instruction::I32Const(10));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::Call(1));
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::GlobalSet(0));
+        function.instruction(&Instruction::I32Const(10));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::Call(2));
+        function.instruction(&Instruction::Return);
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::GlobalSet(0));
+        function.instruction(&Instruction::End);
+
+        function.instruction(&Instruction::GlobalGet(0));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::I32Const(20));
+        function.instruction(&Instruction::Call(0));
+        function.instruction(&Instruction::I32Const(20));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::Call(1));
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        function.instruction(&Instruction::I32Const(2));
+        function.instruction(&Instruction::GlobalSet(0));
+        function.instruction(&Instruction::I32Const(20));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::Call(2));
+        function.instruction(&Instruction::Return);
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::I32Const(2));
+        function.instruction(&Instruction::GlobalSet(0));
+        function.instruction(&Instruction::End);
+
+        function.instruction(&Instruction::GlobalGet(0));
+        function.instruction(&Instruction::I32Const(2));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::I32Const(30));
+        function.instruction(&Instruction::Call(0));
+        function.instruction(&Instruction::I32Const(3));
+        function.instruction(&Instruction::GlobalSet(0));
+        function.instruction(&Instruction::End);
+
+        function.instruction(&Instruction::End);
+        code.function(&function);
+        module.section(&code);
+
+        module.finish()
+    }
 
     #[test]
     fn closure_ranges_are_detected() {
@@ -5388,6 +5725,82 @@ mod tests {
         let closures = parse_closures(&source);
         assert_eq!(closures.len(), 1);
         assert_eq!(closures[0].captures, vec!["x"]);
+    }
+
+    #[test]
+    fn trap_based_pause_restarts_export_from_the_beginning() {
+        let engine = Engine::default();
+        let mut session = custom_runtime_session(
+            &engine,
+            &build_trap_pause_test_module(),
+            "resume_demo",
+            |_| {},
+        );
+
+        let first_pause = session
+            .run_until_pause(BTreeSet::from([super::BreakpointLocation::new(10, None)]))
+            .expect("first pause run")
+            .expect("expected pause");
+
+        assert_eq!(
+            (first_pause.line, first_pause.column),
+            (10, 1)
+        );
+        assert_eq!(
+            session.events().iter().map(|event| event.line).collect::<Vec<_>>(),
+            vec![10]
+        );
+
+        session.run_to_completion().expect("completion run");
+
+        assert_eq!(
+            session.events().iter().map(|event| event.line).collect::<Vec<_>>(),
+            vec![10, 10, 20]
+        );
+    }
+
+    #[test]
+    fn cooperative_state_machine_can_resume_on_same_store_and_instance() {
+        let engine = Engine::default();
+        let mut session = custom_runtime_session(
+            &engine,
+            &build_cooperative_resume_test_module(),
+            "resume_demo",
+            |_| {},
+        );
+
+        let first_pause = session
+            .run_until_pause(BTreeSet::from([super::BreakpointLocation::new(10, None)]))
+            .expect("first yield run")
+            .expect("expected first pause");
+        assert_eq!(
+            (first_pause.line, first_pause.column),
+            (10, 1)
+        );
+        assert_eq!(
+            session.events().iter().map(|event| event.line).collect::<Vec<_>>(),
+            vec![10]
+        );
+
+        let second_pause = session
+            .run_until_pause(BTreeSet::from([super::BreakpointLocation::new(20, None)]))
+            .expect("second yield run")
+            .expect("expected second pause");
+        assert_eq!(
+            (second_pause.line, second_pause.column),
+            (20, 1)
+        );
+        assert_eq!(
+            session.events().iter().map(|event| event.line).collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+
+        session.run_to_completion().expect("completion run");
+        assert!(session.store.data().pause_event.is_none());
+        assert_eq!(
+            session.events().iter().map(|event| event.line).collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
     }
 
     #[test]
@@ -5819,6 +6232,74 @@ interface tests {
     }
 
     #[test]
+    fn runtime_debug_session_persists_paused_locals_in_memory() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let x = 1;
+        let y = x + 2;
+        return y == 3;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_memory_test.kettu");
+
+        let artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+        let test_frame = artifacts
+            .debug_resume_frames
+            .iter()
+            .find(|frame| frame.name == "t")
+            .expect("expected test frame metadata")
+            .clone();
+        let mut session = artifacts.start_test("t").expect("start runtime session");
+
+        let pause = session
+            .run_until_pause(BTreeSet::from([super::BreakpointLocation::new(7, None)]))
+            .expect("run until pause")
+            .expect("pause event");
+
+        assert_eq!(pause.line, 7);
+        assert_eq!(pause.column, 1);
+
+        let memory = session
+            .instance
+            .get_memory(&mut session.store, "memory")
+            .expect("expected exported memory");
+        let mut frame_bytes = vec![0; test_frame.byte_size as usize];
+        memory
+            .read(&session.store, test_frame.state_offset as usize, &mut frame_bytes)
+            .expect("read paused frame memory");
+
+        let read_i32 = |offset: usize| -> i32 {
+            let bytes = [
+                frame_bytes[offset],
+                frame_bytes[offset + 1],
+                frame_bytes[offset + 2],
+                frame_bytes[offset + 3],
+            ];
+            i32::from_le_bytes(bytes)
+        };
+        let slot_offset = |name: &str| -> usize {
+            let slot_index = test_frame
+                .bindings
+                .iter()
+                .position(|binding| binding.name == name)
+                .expect("expected binding in frame metadata");
+            8 + (slot_index * 4)
+        };
+
+        assert_eq!(read_i32(0), 7);
+        assert_eq!(read_i32(4), 1);
+        assert_eq!(read_i32(slot_offset("x")), 1);
+        assert_eq!(read_i32(slot_offset("y")), 3);
+    }
+
+    #[test]
     fn runtime_debug_session_surfaces_real_runtime_faults() {
         let source = r#"package local:test;
 interface tests {
@@ -5948,6 +6429,362 @@ interface tests {
         assert!(session.current_trace_index.is_some());
         assert!(session.active_runtime_session.is_some());
         assert!(session.runtime_pause_event.is_some());
+    }
+
+    #[test]
+    fn runtime_continue_resumes_resumable_test_session() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let x = 1;
+        let y = x + 2;
+        let z = y + 3;
+        return z == 6;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_resumable_continue_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 4,
+            end_line: 9,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.tests = tests;
+        session.current_line = 3;
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session.breakpoints.insert(
+            super::normalize_path_key(&program.display().to_string()),
+            BTreeSet::from([
+                super::BreakpointLocation::new(5, None),
+                super::BreakpointLocation::new(6, None),
+            ]),
+        );
+
+        let first = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("first runtime-backed continue outcome");
+        assert!(matches!(first, super::StopOutcome::Stopped("breakpoint")));
+        assert_eq!(session.current_line, 5);
+        assert!(session.active_runtime_session.is_some());
+        assert!(session
+            .active_runtime_session
+            .as_ref()
+            .map(|runtime| runtime.is_resumable_pause())
+            .unwrap_or(false));
+
+        let second = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("second runtime-backed continue outcome");
+        assert!(matches!(second, super::StopOutcome::Stopped("breakpoint")));
+        assert_eq!(session.current_line, 6);
+        assert!(session.active_runtime_session.is_some());
+        assert!(session.runtime_pause_event.is_some());
+    }
+
+    #[test]
+    fn runtime_continue_resumes_direct_helper_pause_session() {
+        let source = r#"package local:test;
+interface tests {
+    helper: func(a: s32) -> s32 {
+        let inc = a + 1;
+        let sum = inc + 2;
+        return sum;
+    }
+
+    @test
+    t: func() -> bool {
+        let value = helper(2);
+        let total = value + 3;
+        return total == 8;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_resumable_helper_continue_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+        let debug_symbols = super::build_debug_symbols(&program, source, &ast)
+            .expect("build debug symbols");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 9,
+            end_line: 13,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.source_lines = source.lines().map(str::to_string).collect();
+        session.tests = tests;
+        session.debug_symbols = debug_symbols;
+        session.current_line = 8;
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session.breakpoints.insert(
+            super::normalize_path_key(&program.display().to_string()),
+            BTreeSet::from([
+                super::BreakpointLocation::new(4, None),
+                super::BreakpointLocation::new(12, None),
+            ]),
+        );
+
+        let first = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("first runtime-backed continue outcome");
+        assert!(matches!(first, super::StopOutcome::Stopped("breakpoint")));
+        assert_eq!(session.current_line, 4);
+        assert!(session.active_runtime_session.is_some());
+        assert!(session.runtime_pause_event.is_some());
+
+        session.capture_paused_frames();
+        assert!(session
+            .current_frame_descriptors()
+            .iter()
+            .any(|frame| frame.name == "helper" || frame.name.ends_with("#helper")));
+
+        let second = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("second runtime-backed continue outcome");
+        assert!(matches!(second, super::StopOutcome::Stopped("breakpoint")));
+        assert_eq!(session.current_line, 12);
+        assert!(session.active_runtime_session.is_some());
+        assert!(session.runtime_pause_event.is_some());
+    }
+
+    #[test]
+    fn runtime_step_falls_back_for_helper_pause_session() {
+        let source = r#"package local:test;
+interface tests {
+    helper: func(a: s32) -> s32 {
+        let inc = a + 1;
+        let sum = inc + 2;
+        return sum;
+    }
+
+    @test
+    t: func() -> bool {
+        let value = helper(2);
+        let total = value + 3;
+        return total == 8;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_resumable_helper_step_gate_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 9,
+            end_line: 13,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.tests = tests;
+        session.current_line = 8;
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session.breakpoints.insert(
+            super::normalize_path_key(&program.display().to_string()),
+            BTreeSet::from([super::BreakpointLocation::new(4, None)]),
+        );
+
+        let first = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("first runtime-backed continue outcome");
+        assert!(matches!(first, super::StopOutcome::Stopped("breakpoint")));
+        assert_eq!(session.current_line, 4);
+        assert!(!session.can_step_with_runtime("next"));
+        assert!(session.run_live_runtime_step_or_end("next").is_none());
+    }
+
+    #[test]
+    fn runtime_next_steps_resumable_test_session() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let x = 1;
+        let y = x + 2;
+        let z = y + 3;
+        return z == 6;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_resumable_next_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 4,
+            end_line: 9,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.tests = tests;
+        session.current_line = 3;
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session.breakpoints.insert(
+            super::normalize_path_key(&program.display().to_string()),
+            BTreeSet::from([super::BreakpointLocation::new(5, None)]),
+        );
+
+        let first = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("first runtime-backed continue outcome");
+        assert!(matches!(first, super::StopOutcome::Stopped("breakpoint")));
+        assert_eq!(session.current_line, 5);
+
+        let next_outcome = session
+            .run_live_runtime_step_or_end("next")
+            .expect("runtime next outcome");
+        assert!(matches!(next_outcome, super::StopOutcome::Stopped("step")));
+        assert_eq!(session.current_line, 6);
+        assert!(session.active_runtime_session.is_some());
+        assert!(session.runtime_pause_event.is_some());
+    }
+
+    #[test]
+    fn runtime_step_in_steps_resumable_test_session() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let x = 1;
+        let y = x + 2;
+        let z = y + 3;
+        return z == 6;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_resumable_stepin_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 4,
+            end_line: 9,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.tests = tests;
+        session.current_line = 3;
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session.breakpoints.insert(
+            super::normalize_path_key(&program.display().to_string()),
+            BTreeSet::from([super::BreakpointLocation::new(5, None)]),
+        );
+
+        let first = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("first runtime-backed continue outcome");
+        assert!(matches!(first, super::StopOutcome::Stopped("breakpoint")));
+        assert_eq!(session.current_line, 5);
+
+        let step_in_outcome = session
+            .run_live_runtime_step_or_end("stepIn")
+            .expect("runtime stepIn outcome");
+        assert!(matches!(step_in_outcome, super::StopOutcome::Stopped("step")));
+        assert_eq!(session.current_line, 6);
+        assert!(session.active_runtime_session.is_some());
+        assert!(session.runtime_pause_event.is_some());
+    }
+
+    #[test]
+    fn runtime_step_out_terminates_top_level_resumable_test() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let x = 1;
+        let y = x + 2;
+        return y == 3;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_resumable_stepout_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 4,
+            end_line: 8,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.tests = tests;
+        session.current_line = 3;
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session.breakpoints.insert(
+            super::normalize_path_key(&program.display().to_string()),
+            BTreeSet::from([super::BreakpointLocation::new(5, None)]),
+        );
+
+        let first = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("first runtime-backed continue outcome");
+        assert!(matches!(first, super::StopOutcome::Stopped("breakpoint")));
+        assert_eq!(session.current_line, 5);
+
+        let step_out_outcome = session
+            .run_live_runtime_step_or_end("stepOut")
+            .expect("runtime stepOut outcome");
+        assert!(matches!(step_out_outcome, super::StopOutcome::Terminated));
+        assert!(session.active_runtime_session.is_none());
+        assert!(session.runtime_pause_event.is_none());
     }
 
     #[test]

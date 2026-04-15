@@ -24,3 +24,4 @@ walkdir = "2"
 
 [dev-dependencies]
 tempfile = "3"
+wasm-encoder = { workspace = true }
