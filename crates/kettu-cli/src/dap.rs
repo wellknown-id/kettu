@@ -864,13 +864,55 @@ impl DebugSession {
         snapshot.subprogram_start_line == Some(test_frame.start_line)
     }
 
+    fn paused_runtime_helper_frame(&self) -> Option<&DebugResumeFrameMetadata> {
+        let snapshot = paused_runtime_snapshot(self)?;
+        let active = active_runtime_debug_frame(self, &snapshot)?;
+        let test_frame = resolve_runtime_debug_frame(self, FrameTarget::Test)?;
+        if active.start_line == test_frame.start_line || active.name.starts_with("lambda#") {
+            return None;
+        }
+        Some(active)
+    }
+
+    fn paused_runtime_helper_supports_step(&self) -> bool {
+        let Some(helper_frame) = self.paused_runtime_helper_frame() else {
+            return false;
+        };
+
+        let Some(test_frame) = resolve_runtime_debug_frame(self, FrameTarget::Test) else {
+            return false;
+        };
+        let Some(runtime_session) = self.active_runtime_session.as_ref() else {
+            return false;
+        };
+
+        let helper_start_line = helper_frame.start_line;
+        let mut seen_helper_frame = false;
+        let caller_is_test = runtime_session
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|event| match event.subprogram_start_line {
+                Some(start_line) if start_line == helper_start_line => {
+                    seen_helper_frame = true;
+                    None
+                }
+                Some(start_line) if seen_helper_frame => Some(start_line == test_frame.start_line),
+                _ => None,
+            })
+            .unwrap_or(false);
+
+        caller_is_test && !helper_frame.name.starts_with("lambda#")
+    }
+
     fn can_step_with_runtime(&self, action: &str) -> bool {
         matches!(action, "next" | "stepIn" | "stepOut")
             && !self.current_file_has_column_breakpoints()
             && self.active_closures.is_empty()
             && (action != "stepIn" || find_invoked_closure(self, self.current_line).is_none())
             && self.runtime_pause_event.is_some()
-            && self.paused_runtime_is_top_level_test_frame()
+            && (self.paused_runtime_is_top_level_test_frame()
+                || self.paused_runtime_helper_supports_step())
             && self
                 .active_runtime_session
                 .as_ref()
@@ -895,6 +937,18 @@ impl DebugSession {
         pause: &RuntimePauseEvent,
         step_target_line: Option<i64>,
     ) -> &'static str {
+        let mut step_lines = BTreeSet::new();
+        if let Some(line) = step_target_line {
+            step_lines.insert(line);
+        }
+        self.runtime_pause_reason_for_lines(pause, &step_lines)
+    }
+
+    fn runtime_pause_reason_for_lines(
+        &self,
+        pause: &RuntimePauseEvent,
+        step_target_lines: &BTreeSet<i64>,
+    ) -> &'static str {
         let position = SourcePosition::new(pause.line, pause.column);
         if self
             .current_file_breakpoints()
@@ -902,16 +956,109 @@ impl DebugSession {
             .any(|breakpoint| breakpoint.matches(&position))
         {
             "breakpoint"
-        } else if step_target_line == Some(pause.line) {
+        } else if step_target_lines.contains(&pause.line) {
             "step"
         } else {
             "breakpoint"
         }
     }
 
+    fn helper_runtime_caller_line(&self) -> Option<i64> {
+        let test_frame = resolve_runtime_debug_frame(self, FrameTarget::Test)?;
+        let events = self.active_runtime_session.as_ref()?.events();
+        events
+            .iter()
+            .rev()
+            .find(|event| event.subprogram_start_line == Some(test_frame.start_line))
+            .map(|event| event.line)
+    }
+
+    fn helper_runtime_step_lines_after_caller(&self, caller_line: i64) -> BTreeSet<i64> {
+        self.tests
+            .get(self.current_test)
+            .map(|test| {
+                test.trace
+                    .iter()
+                    .filter(|entry| entry.line > caller_line)
+                    .map(|entry| entry.line)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn helper_runtime_step_lines_in_helper(&self, helper_frame: &DebugResumeFrameMetadata) -> BTreeSet<i64> {
+        let helper_end_line = self
+            .debug_symbols
+            .subprograms
+            .iter()
+            .find(|subprogram| {
+                subprogram.start_line == helper_frame.start_line
+                    && (subprogram.name == helper_frame.name
+                        || subprogram.name.ends_with(&format!("#{}", helper_frame.name)))
+            })
+            .map(|subprogram| subprogram.end_line)
+            .unwrap_or(self.current_line + 1);
+
+        ((self.current_line + 1)..=helper_end_line)
+            .filter(|line| *line > self.current_line)
+            .collect()
+    }
+
+    fn run_live_runtime_helper_step_or_end(&mut self, action: &str) -> Option<StopOutcome> {
+        let helper_frame = self.paused_runtime_helper_frame()?.clone();
+        let caller_line = self.helper_runtime_caller_line()?;
+
+        let step_lines = if action == "stepOut" {
+            self.helper_runtime_step_lines_after_caller(caller_line)
+        } else {
+            let mut lines = self.helper_runtime_step_lines_in_helper(&helper_frame);
+            lines.extend(self.helper_runtime_step_lines_after_caller(caller_line));
+            lines
+        };
+
+        if step_lines.is_empty() {
+            self.reset_runtime_pause_state();
+            self.current_trace_index = None;
+            self.active_closures.clear();
+            return Some(StopOutcome::Terminated);
+        }
+
+        let mut breakpoints = self.current_file_breakpoints();
+        breakpoints.extend(
+            step_lines
+                .iter()
+                .copied()
+                .map(|line| BreakpointLocation::new(line, None)),
+        );
+
+        match self.run_active_runtime_until_pause_with_breakpoints(breakpoints) {
+            Ok(Some(pause)) => {
+                self.sync_trace_cursor_to_current_position();
+                Some(StopOutcome::Stopped(self.runtime_pause_reason_for_lines(
+                    &pause,
+                    &step_lines,
+                )))
+            }
+            Ok(None) => {
+                self.reset_runtime_pause_state();
+                self.current_trace_index = None;
+                self.active_closures.clear();
+                Some(StopOutcome::Terminated)
+            }
+            Err(_) => {
+                self.reset_runtime_pause_state();
+                None
+            }
+        }
+    }
+
     fn run_live_runtime_step_or_end(&mut self, action: &str) -> Option<StopOutcome> {
         if !self.can_step_with_runtime(action) {
             return None;
+        }
+
+        if self.paused_runtime_helper_supports_step() {
+            return self.run_live_runtime_helper_step_or_end(action);
         }
 
         if action == "stepOut" {
@@ -6571,7 +6718,7 @@ interface tests {
     }
 
     #[test]
-    fn runtime_step_falls_back_for_helper_pause_session() {
+    fn runtime_next_steps_direct_helper_pause_session() {
         let source = r#"package local:test;
 interface tests {
     helper: func(a: s32) -> s32 {
@@ -6607,6 +6754,7 @@ interface tests {
 
         let mut session = DebugSession::new();
         session.program = Some(program.clone());
+        session.source_lines = source.lines().map(str::to_string).collect();
         session.tests = tests;
         session.current_line = 8;
         session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
@@ -6620,6 +6768,197 @@ interface tests {
             .expect("first runtime-backed continue outcome");
         assert!(matches!(first, super::StopOutcome::Stopped("breakpoint")));
         assert_eq!(session.current_line, 4);
+
+        let next = session
+            .run_live_runtime_step_or_end("next")
+            .expect("helper next outcome");
+        assert!(matches!(next, super::StopOutcome::Stopped("step")));
+        assert_eq!(session.current_line, 5);
+        assert!(session.active_runtime_session.is_some());
+        assert!(session.runtime_pause_event.is_some());
+    }
+
+    #[test]
+    fn runtime_step_in_steps_direct_helper_pause_session() {
+        let source = r#"package local:test;
+interface tests {
+    helper: func(a: s32) -> s32 {
+        let inc = a + 1;
+        let sum = inc + 2;
+        return sum;
+    }
+
+    @test
+    t: func() -> bool {
+        let value = helper(2);
+        let total = value + 3;
+        return total == 8;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_resumable_helper_stepin_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 9,
+            end_line: 13,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.source_lines = source.lines().map(str::to_string).collect();
+        session.tests = tests;
+        session.current_line = 8;
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session.breakpoints.insert(
+            super::normalize_path_key(&program.display().to_string()),
+            BTreeSet::from([super::BreakpointLocation::new(4, None)]),
+        );
+
+        let first = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("first runtime-backed continue outcome");
+        assert!(matches!(first, super::StopOutcome::Stopped("breakpoint")));
+        assert_eq!(session.current_line, 4);
+
+        let step_in = session
+            .run_live_runtime_step_or_end("stepIn")
+            .expect("helper stepIn outcome");
+        assert!(matches!(step_in, super::StopOutcome::Stopped("step")));
+        assert_eq!(session.current_line, 5);
+        assert!(session.active_runtime_session.is_some());
+        assert!(session.runtime_pause_event.is_some());
+    }
+
+    #[test]
+    fn runtime_step_out_resumes_direct_helper_pause_session() {
+        let source = r#"package local:test;
+interface tests {
+    helper: func(a: s32) -> s32 {
+        let inc = a + 1;
+        let sum = inc + 2;
+        return sum;
+    }
+
+    @test
+    t: func() -> bool {
+        let value = helper(2);
+        let total = value + 3;
+        return total == 8;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_resumable_helper_stepout_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 9,
+            end_line: 13,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.source_lines = source.lines().map(str::to_string).collect();
+        session.tests = tests;
+        session.current_line = 8;
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session.breakpoints.insert(
+            super::normalize_path_key(&program.display().to_string()),
+            BTreeSet::from([super::BreakpointLocation::new(4, None)]),
+        );
+
+        let first = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("first runtime-backed continue outcome");
+        assert!(matches!(first, super::StopOutcome::Stopped("breakpoint")));
+        assert_eq!(session.current_line, 4);
+
+        let step_out = session
+            .run_live_runtime_step_or_end("stepOut")
+            .expect("helper stepOut outcome");
+        assert!(matches!(step_out, super::StopOutcome::Stopped("step")));
+        assert_eq!(session.current_line, 12);
+        assert!(session.active_runtime_session.is_some());
+        assert!(session.runtime_pause_event.is_some());
+    }
+
+    #[test]
+    fn runtime_step_falls_back_for_helper_pause_with_column_breakpoints() {
+        let source = r#"package local:test;
+interface tests {
+    helper: func(a: s32) -> s32 {
+        let inc = a + 1;
+        let sum = inc + 2;
+        return sum;
+    }
+
+    @test
+    t: func() -> bool {
+        let value = helper(2);
+        let total = value + 3;
+        return total == 8;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("runtime_debug_helper_closure_step_gate_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 8,
+            end_line: 12,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program.clone());
+        session.tests = tests;
+        session.current_line = 7;
+        session.runtime_debug_artifacts = Some(runtime_debug_artifacts);
+        session.breakpoints.insert(
+            super::normalize_path_key(&program.display().to_string()),
+            BTreeSet::from([super::BreakpointLocation::new(4, None)]),
+        );
+
+        let first = session
+            .run_live_runtime_until_breakpoint_or_end()
+            .expect("first runtime-backed continue outcome");
+        assert!(matches!(first, super::StopOutcome::Stopped("breakpoint")));
+        assert_eq!(session.current_line, 4);
+
+        session.breakpoints.insert(
+            super::normalize_path_key(&program.display().to_string()),
+            BTreeSet::from([
+                super::BreakpointLocation::new(4, None),
+                super::BreakpointLocation::new(12, Some(1)),
+            ]),
+        );
+
         assert!(!session.can_step_with_runtime("next"));
         assert!(session.run_live_runtime_step_or_end("next").is_none());
     }
