@@ -1421,6 +1421,20 @@ impl DebugSession {
                 find_invoked_closure(self, self.current_line)
             {
                 let closure = &self.closures[closure_index];
+                let reentering_current_inline_closure = self
+                    .active_closures
+                    .last()
+                    .map(|active| active.closure_index == closure_index)
+                    .unwrap_or(false);
+                if reentering_current_inline_closure {
+                    if self.advance_one_line() {
+                        if self.breakpoint_hit(&self.current_position()) {
+                            return StopOutcome::Stopped("breakpoint");
+                        }
+                        return StopOutcome::Stopped("step");
+                    }
+                    return StopOutcome::Terminated;
+                }
                 let enter_in_place = self.current_line >= closure.start_line
                     && self.current_line <= closure.end_line;
                 self.active_closures.push(ActiveClosure {
@@ -3409,7 +3423,13 @@ fn runtime_binding_values_for_target(
 ) -> Option<HashMap<String, SimpleValue>> {
     let snapshot = paused_runtime_snapshot(session)?;
     let bindings = if let Some(frame) = resolve_runtime_debug_frame(session, target) {
-        if snapshot.subprogram_start_line != Some(frame.start_line) {
+        let closure_is_active = match target {
+            FrameTarget::Closure(closure_index) => snapshot
+                .closure_keys
+                .contains(&session.closures[closure_index].debug_key),
+            _ => false,
+        };
+        if !closure_is_active && snapshot.subprogram_start_line != Some(frame.start_line) {
             return None;
         }
         frame
@@ -3424,7 +3444,13 @@ fn runtime_binding_values_for_target(
             .collect::<Vec<_>>()
     } else {
         let subprogram = resolve_dwarf_subprogram(session, target)?;
-        if snapshot.subprogram_start_line != Some(subprogram.start_line) {
+        let closure_is_active = match target {
+            FrameTarget::Closure(closure_index) => snapshot
+                .closure_keys
+                .contains(&session.closures[closure_index].debug_key),
+            _ => false,
+        };
+        if !closure_is_active && snapshot.subprogram_start_line != Some(subprogram.start_line) {
             return None;
         }
         subprogram.bindings.clone()
@@ -4533,12 +4559,13 @@ fn frame_local_variables(session: &DebugSession, frame_id: i64) -> Vec<Variable>
             let mut locals = HashMap::new();
 
             if let Some(active) = session.find_active_closure_state(closure_index) {
-                for (name, value) in &active.param_bindings {
+                let param_bindings = current_closure_param_bindings(session, closure_index, active);
+                for (name, value) in &param_bindings {
                     locals.insert(name.clone(), value.clone());
                 }
 
                 let mut seed_env = active.capture_bindings.clone();
-                seed_env.extend(active.param_bindings.clone());
+                seed_env.extend(param_bindings);
                 let inferred = infer_values_in_range(
                     &session.source_lines,
                     closure.start_line + 1,
@@ -4871,11 +4898,142 @@ fn build_param_bindings(
         .collect()
 }
 
+fn nth_list_element(value: SimpleValue, index: usize) -> Option<SimpleValue> {
+    match value {
+        SimpleValue::List(values) => values.into_iter().nth(index),
+        _ => None,
+    }
+}
+
 fn first_list_element(value: SimpleValue) -> Option<SimpleValue> {
     match value {
         SimpleValue::List(values) => values.into_iter().next(),
         _ => None,
     }
+}
+
+fn build_inline_hof_param_bindings_for_invocation(
+    session: &DebugSession,
+    closure_index: usize,
+    env: &HashMap<String, SimpleValue>,
+    invocation_index: usize,
+) -> Option<HashMap<String, SimpleValue>> {
+    let closure = session.closures.get(closure_index)?;
+    let line_index = usize::try_from(closure.inline_invocation_line?.saturating_sub(1)).ok()?;
+    let line = session.source_lines.get(line_index)?;
+    let call_name = extract_call_name(line)?;
+    let args = extract_call_arguments(line)?;
+
+    match call_name.as_str() {
+        "map" | "filter" if closure.params.len() == 1 => {
+            let element = args
+                .first()
+                .map(|arg| infer_expr_value(arg, env))
+                .and_then(|value| nth_list_element(value, invocation_index))?;
+            Some(HashMap::from([(closure.params[0].clone(), element)]))
+        }
+        "reduce" if closure.params.len() >= 2 && args.len() >= 2 => {
+            let list = infer_expr_value(&args[0], env);
+            let element = nth_list_element(list.clone(), invocation_index)?;
+            let mut acc = infer_expr_value(&args[1], env);
+            let source = session.source_lines.join("\n");
+
+            for prior_index in 0..invocation_index {
+                let prior_element = nth_list_element(list.clone(), prior_index)?;
+                let mut iteration_env = env.clone();
+                iteration_env.insert(closure.params[0].clone(), acc.clone());
+                iteration_env.insert(closure.params[1].clone(), prior_element);
+                for param in closure.params.iter().skip(2) {
+                    iteration_env.insert(
+                        param.clone(),
+                        SimpleValue::Unknown("<param>".to_string()),
+                    );
+                }
+                acc = evaluate_ast_expr(&closure.body, &session.closures, &source, &iteration_env);
+            }
+
+            let mut bindings = HashMap::new();
+            bindings.insert(closure.params[0].clone(), acc);
+            bindings.insert(closure.params[1].clone(), element);
+            for param in closure.params.iter().skip(2) {
+                bindings.insert(param.clone(), SimpleValue::Unknown("<param>".to_string()));
+            }
+            Some(bindings)
+        }
+        _ => None,
+    }
+}
+
+fn current_inline_hof_invocation_index(
+    session: &DebugSession,
+    closure_index: usize,
+) -> Option<usize> {
+    let closure = session.closures.get(closure_index)?;
+    let invocation_line = closure.inline_invocation_line?;
+    let trace_index = session.current_trace_index?;
+    let trace = &session.active_test()?.trace;
+    let current = trace.get(trace_index)?;
+    if !current.runtime_closure_keys.contains(&closure.debug_key) {
+        return None;
+    }
+
+    trace
+        .iter()
+        .take(trace_index + 1)
+        .filter(|entry| {
+            entry.line == invocation_line && entry.runtime_closure_keys.contains(&closure.debug_key)
+        })
+        .count()
+        .checked_sub(1)
+}
+
+fn inline_hof_call_environment(
+    session: &DebugSession,
+    closure_index: usize,
+) -> HashMap<String, SimpleValue> {
+    let invocation_line = session.closures[closure_index]
+        .inline_invocation_line
+        .unwrap_or(session.current_line);
+    let mut env = session
+        .active_test()
+        .map(|test| {
+            infer_values_in_range(&session.source_lines, test.line, invocation_line, &HashMap::new())
+        })
+        .unwrap_or_default();
+
+    for active in &session.active_closures {
+        for (name, value) in &active.capture_bindings {
+            env.insert(name.clone(), value.clone());
+        }
+        for (name, value) in &active.param_bindings {
+            env.insert(name.clone(), value.clone());
+        }
+        if active.closure_index == closure_index {
+            break;
+        }
+    }
+
+    env
+}
+
+fn current_closure_param_bindings(
+    session: &DebugSession,
+    closure_index: usize,
+    active: &ActiveClosure,
+) -> HashMap<String, SimpleValue> {
+    let mut bindings = active.param_bindings.clone();
+    let base_env = inline_hof_call_environment(session, closure_index);
+    if let Some(invocation_index) = current_inline_hof_invocation_index(session, closure_index) {
+        if let Some(updated) = build_inline_hof_param_bindings_for_invocation(
+            session,
+            closure_index,
+            &base_env,
+            invocation_index,
+        ) {
+            bindings.extend(updated);
+        }
+    }
+    bindings
 }
 
 fn build_inline_hof_param_bindings(
@@ -7178,6 +7336,138 @@ interface tests {
         assert!(matches!(step_outcome, super::StopOutcome::Stopped("step")));
         assert!(session.active_runtime_session.is_none());
         assert!(!session.can_continue_with_runtime());
+    }
+
+    #[test]
+    fn repeated_step_in_on_inline_hof_closure_advances_trace_instead_of_reentering() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let arr = [1, 10, 2, 20, 3, 30];
+        let big = filter(arr, |x| x > 5);
+        list-len(big) == 3;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("inline_hof_repeated_stepin_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 4,
+            end_line: 8,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let filter_index = tests[0]
+            .trace
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.line == 6 && entry.runtime_closure_keys.is_empty())
+            .map(|(index, _)| index)
+            .expect("filter call trace index");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program);
+        session.source_lines = source.lines().map(str::to_string).collect();
+        session.tests = tests;
+        session.closures = super::parse_closures(&session.source_lines);
+        session.current_test = 0;
+        session.current_trace_index = Some(filter_index);
+        session.current_line = session.tests[0].trace[filter_index].line;
+        session.current_column = session.tests[0].trace[filter_index].column;
+
+        let first_step = session.step_once_or_end("stepIn");
+        assert!(matches!(first_step, super::StopOutcome::Stopped("step")));
+        assert_eq!(session.active_closures.len(), 1);
+        let first_trace_index = session.current_trace_index;
+        let first_closure_index = session.active_closures[0].closure_index;
+
+        let second_step = session.step_once_or_end("stepIn");
+        assert!(matches!(second_step, super::StopOutcome::Stopped("step")));
+        assert_eq!(session.active_closures.len(), 1);
+        assert_eq!(session.active_closures[0].closure_index, first_closure_index);
+        assert!(session.current_trace_index > first_trace_index);
+    }
+
+    #[test]
+    fn repeated_step_in_on_inline_hof_closure_refreshes_visible_x_value() {
+        let source = r#"package local:test;
+interface tests {
+    @test
+    t: func() -> bool {
+        let arr = [1, 10, 2, 20, 3, 30];
+        let big = filter(arr, |x| x > 5);
+        list-len(big) == 3;
+    }
+}"#;
+
+        let (ast, errors) = kettu_parser::parse_file(source);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let ast = ast.expect("ast");
+        let program = PathBuf::from("inline_hof_visible_x_refresh_test.kettu");
+        let runtime_debug_artifacts = super::RuntimeDebugArtifacts::compile(&program, source, &ast)
+            .expect("compile runtime debug artifacts");
+
+        let mut tests = vec![ListedTest {
+            name: "t".into(),
+            line: 4,
+            end_line: 8,
+            body: Vec::new(),
+            trace: Vec::new(),
+        }];
+        super::build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)
+            .expect("build runtime test traces");
+
+        let filter_index = tests[0]
+            .trace
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.line == 6 && entry.runtime_closure_keys.is_empty())
+            .map(|(index, _)| index)
+            .expect("filter call trace index");
+
+        let mut session = DebugSession::new();
+        session.program = Some(program);
+        session.source_lines = source.lines().map(str::to_string).collect();
+        session.tests = tests;
+        session.closures = super::parse_closures(&session.source_lines);
+        session.current_test = 0;
+        session.current_trace_index = Some(filter_index);
+        session.current_line = session.tests[0].trace[filter_index].line;
+        session.current_column = session.tests[0].trace[filter_index].column;
+
+        let mut seen_x = Vec::new();
+        for _ in 0..6 {
+            let outcome = session.step_once_or_end("stepIn");
+            assert!(matches!(outcome, super::StopOutcome::Stopped("step")));
+
+            let closure_frame = super::build_stack_frames(&session)
+                .into_iter()
+                .next()
+                .expect("closure frame");
+            let frame_id = closure_frame["id"].as_i64().expect("closure frame id");
+            let locals = super::frame_local_variables(&session, frame_id);
+            let x = locals
+                .iter()
+                .find(|var| var.name == "x")
+                .map(|var| var.value.clone())
+                .expect("x local");
+            seen_x.push(x);
+        }
+
+        assert!(
+            seen_x.iter().any(|value| value != "1"),
+            "repeated stepIn never refreshed x beyond the first invocation: {seen_x:?}"
+        );
     }
 
     #[test]
