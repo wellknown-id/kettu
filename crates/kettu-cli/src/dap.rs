@@ -594,6 +594,57 @@ impl RuntimeDebugArtifacts {
         session.run_to_completion()?;
         Ok(session.events())
     }
+
+    fn from_wasm(wasm: &[u8]) -> Result<Option<Self>, String> {
+        let debug_resume_frames = parse_debug_resume_frames(wasm)?;
+        if debug_resume_frames.is_empty() {
+            return Ok(None);
+        }
+
+        let engine = Engine::default();
+        let module = Module::new(&engine, wasm)
+            .map_err(|err| format!("Failed to load debug runtime wasm: {}", err))?;
+
+        Ok(Some(Self {
+            engine,
+            module,
+            debug_resume_frames,
+        }))
+    }
+}
+
+struct EmbeddedDebugSource {
+    path: PathBuf,
+    source: String,
+}
+
+fn parse_utf8_custom_section(wasm: &[u8], section_name: &str) -> Result<Option<String>, String> {
+    for payload in Parser::new(0).parse_all(wasm) {
+        match payload.map_err(|err| format!("Invalid debug wasm payload: {}", err))? {
+            Payload::CustomSection(section) if section.name() == section_name => {
+                let text = String::from_utf8(section.data().to_vec()).map_err(|err| {
+                    format!("Invalid UTF-8 in custom section '{}': {}", section_name, err)
+                })?;
+                return Ok(Some(text));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(None)
+}
+
+fn parse_embedded_debug_source(
+    wasm: &[u8],
+    artifact_path: &PathBuf,
+) -> Result<EmbeddedDebugSource, String> {
+    let source = parse_utf8_custom_section(wasm, "kettu-debug-source")?
+        .ok_or_else(|| format!("Missing embedded debug source in '{}'", artifact_path.display()))?;
+    let path = parse_utf8_custom_section(wasm, "kettu-debug-path")?
+        .map(PathBuf::from)
+        .unwrap_or_else(|| artifact_path.with_extension("kettu"));
+
+    Ok(EmbeddedDebugSource { path, source })
 }
 
 fn parse_debug_resume_frames(wasm: &[u8]) -> Result<Vec<DebugResumeFrameMetadata>, String> {
@@ -831,13 +882,14 @@ struct FrameDescriptor {
 }
 
 struct ProgramState {
+    source_path: PathBuf,
     source_text: String,
     source_lines: Vec<String>,
     tests: Vec<ListedTest>,
     closures: Vec<ClosureRange>,
     resource_names: BTreeSet<String>,
     debug_symbols: DebugSymbols,
-    runtime_debug_artifacts: RuntimeDebugArtifacts,
+    runtime_debug_artifacts: Option<RuntimeDebugArtifacts>,
 }
 
 struct DebugSession {
@@ -1752,7 +1804,7 @@ pub fn run_server() -> io::Result<()> {
 
                 match load_program_state(program.clone()) {
                     Ok(program_state) => {
-                        session.program = program;
+                        session.program = Some(program_state.source_path);
                         session.cwd = cwd;
                         session.source_text = program_state.source_text;
                         session.source_lines = program_state.source_lines;
@@ -1760,7 +1812,7 @@ pub fn run_server() -> io::Result<()> {
                         session.closures = program_state.closures;
                         session.resource_names = program_state.resource_names;
                         session.debug_symbols = program_state.debug_symbols;
-                        session.runtime_debug_artifacts = Some(program_state.runtime_debug_artifacts);
+                        session.runtime_debug_artifacts = program_state.runtime_debug_artifacts;
                         session.stop_on_entry = stop_on_entry;
                         session.enable_evaluate = enable_evaluate;
                         session.configured = false;
@@ -2077,6 +2129,10 @@ fn load_program_state(program: Option<PathBuf>) -> Result<ProgramState, String> 
         return Err("Missing launch argument: program".to_string());
     };
 
+    if program.extension().and_then(|ext| ext.to_str()) == Some("wasm") {
+        return load_program_state_from_wasm(&program);
+    }
+
     let source = fs::read_to_string(&program)
         .map_err(|e| format!("Failed to read source file '{}': {}", program.display(), e))?;
     let (ast, parse_errors) = kettu_parser::parse_file(&source);
@@ -2098,12 +2154,57 @@ fn load_program_state(program: Option<PathBuf>) -> Result<ProgramState, String> 
     let debug_symbols = build_debug_symbols(&program, &source, &ast)?;
     apply_debug_symbols(&mut tests, &mut closures, &debug_symbols);
     build_test_traces(&mut tests, &closures, &source);
-    let runtime_debug_artifacts = RuntimeDebugArtifacts::compile(&program, &source, &ast)?;
-    build_runtime_test_traces(&runtime_debug_artifacts, &mut tests)?;
+    let runtime_debug_artifacts = Some(RuntimeDebugArtifacts::compile(&program, &source, &ast)?);
+    if let Some(runtime_debug_artifacts) = runtime_debug_artifacts.as_ref() {
+        build_runtime_test_traces(runtime_debug_artifacts, &mut tests)?;
+    }
 
     Ok(ProgramState {
+        source_path: program,
         source_text: source.clone(),
         source_lines: source.lines().map(ToString::to_string).collect(),
+        tests,
+        closures,
+        resource_names,
+        debug_symbols,
+        runtime_debug_artifacts,
+    })
+}
+
+fn load_program_state_from_wasm(program: &PathBuf) -> Result<ProgramState, String> {
+    let wasm = fs::read(program)
+        .map_err(|e| format!("Failed to read wasm file '{}': {}", program.display(), e))?;
+    let embedded = parse_embedded_debug_source(&wasm, program)?;
+
+    let (ast, parse_errors) = kettu_parser::parse_file(&embedded.source);
+    if !parse_errors.is_empty() {
+        let all = parse_errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("Parse error(s) in embedded debug source: {}", all));
+    }
+
+    let mut ast = ast.ok_or_else(|| "Failed to parse embedded debug source".to_string())?;
+    annotate_closure_captures(&mut ast);
+
+    let mut tests = list_tests_from_ast(&ast, &embedded.source);
+    let mut closures = collect_closures_from_ast(&ast, &embedded.source);
+    let resource_names = collect_resource_names_from_ast(&ast);
+    let debug_symbols = parse_debug_symbols(&wasm)?;
+    apply_debug_symbols(&mut tests, &mut closures, &debug_symbols);
+    build_test_traces(&mut tests, &closures, &embedded.source);
+
+    let runtime_debug_artifacts = RuntimeDebugArtifacts::from_wasm(&wasm)?;
+    if let Some(runtime_debug_artifacts) = runtime_debug_artifacts.as_ref() {
+        build_runtime_test_traces(runtime_debug_artifacts, &mut tests)?;
+    }
+
+    Ok(ProgramState {
+        source_path: embedded.path,
+        source_text: embedded.source.clone(),
+        source_lines: embedded.source.lines().map(ToString::to_string).collect(),
         tests,
         closures,
         resource_names,

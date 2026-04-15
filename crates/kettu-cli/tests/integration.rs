@@ -97,6 +97,10 @@ fn inspect_debug_output(wasm: &[u8]) -> Result<DebugOutput, String> {
     })
 }
 
+fn resource_debug_fixture() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/resource_debug.kettu")
+}
+
 fn parse_real_dwarf_sections(sections: &HashMap<String, Vec<u8>>) -> Result<ParsedDwarf, String> {
     for required in [".debug_abbrev", ".debug_info", ".debug_line"] {
         if !sections.contains_key(required) {
@@ -319,6 +323,38 @@ fn assert_dwarf_binding(
         binding.wasm_local,
         Some(wasm_local),
         "unexpected wasm local for binding {name:?}: {:?}",
+        binding
+    );
+}
+
+fn assert_dwarf_binding_exists(
+    dwarf: &ParsedDwarf,
+    owner: &str,
+    name: &str,
+    kind: DwarfBindingKind,
+    decl_line: u64,
+) {
+    let binding = dwarf
+        .bindings
+        .iter()
+        .find(|binding| {
+            binding.owner.contains(owner) && binding.name == name && binding.kind == kind
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected DWARF binding {name:?} ({kind:?}) under {owner:?}, got {:?}",
+                dwarf.bindings
+            )
+        });
+
+    assert_eq!(
+        binding.decl_line, decl_line,
+        "unexpected decl line for binding {name:?}: {:?}",
+        binding
+    );
+    assert!(
+        binding.wasm_local.is_some(),
+        "expected binding {name:?} to carry a wasm local location: {:?}",
         binding
     );
 }
@@ -693,6 +729,51 @@ fn test_build_debug_sections_are_readable_by_llvm_dwarfdump() {
     assert!(
         stdout.contains("DW_OP_WASM_location"),
         "expected llvm-dwarfdump to show Wasm local locations: {stdout}"
+    );
+}
+
+#[test]
+fn test_build_debug_resource_fixture_carries_dwarf_symbols() {
+    let fixture = resource_debug_fixture();
+    let output_file = NamedTempFile::new().unwrap();
+
+    let output = kettu_cmd()
+        .args([
+            "build",
+            "--core",
+            "--debug",
+            fixture.to_str().unwrap(),
+            "-o",
+            output_file.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run kettu build --debug for resource fixture");
+
+    assert!(
+        output.status.success(),
+        "Resource fixture debug build should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let wasm = std::fs::read(output_file.path()).unwrap();
+    let debug_output = inspect_debug_output(&wasm).expect("inspect debug output");
+
+    assert!(
+        debug_output.has_name,
+        "resource fixture debug build should retain the name section"
+    );
+    assert_real_dwarf_for_function(
+        &debug_output.dwarf,
+        "resource_debug.kettu",
+        "test-resource-display",
+        14..=18,
+    );
+    assert_dwarf_binding_exists(
+        &debug_output.dwarf,
+        "test-resource-display",
+        "c",
+        DwarfBindingKind::Variable,
+        16,
     );
 }
 

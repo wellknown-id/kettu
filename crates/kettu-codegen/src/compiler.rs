@@ -2036,6 +2036,30 @@ impl<'a> ModuleCompiler<'a> {
         module.section(&section);
     }
 
+    fn emit_embedded_debug_source_sections(&self, module: &mut Module) {
+        if !self.options.emit_dwarf {
+            return;
+        }
+
+        let Some(source) = self.options.debug_source.as_deref() else {
+            return;
+        };
+
+        let source_section = CustomSection {
+            name: "kettu-debug-source".into(),
+            data: Cow::Owned(source.as_bytes().to_vec()),
+        };
+        module.section(&source_section);
+
+        if let Some(path) = self.options.debug_path.as_deref() {
+            let path_section = CustomSection {
+                name: "kettu-debug-path".into(),
+                data: Cow::Owned(path.as_bytes().to_vec()),
+            };
+            module.section(&path_section);
+        }
+    }
+
     fn emit_contracts_section(&self, module: &mut Module, file: &WitFile) {
         let mut json = String::from("{\"version\":1,\"functions\":{");
 
@@ -2954,6 +2978,9 @@ impl<'a> ModuleCompiler<'a> {
 
         // 13. Debug-resume metadata custom section
         self.emit_debug_resume_section(&mut module);
+
+        // 14. Embedded debug source/path sections for artifact-first DAP launches
+        self.emit_embedded_debug_source_sections(&mut module);
 
         if self.options.emit_dwarf {
             let mut wasm = module.finish();

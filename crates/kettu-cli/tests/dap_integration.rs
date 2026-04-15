@@ -1,9 +1,11 @@
 use serde_json::{json, Value};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use tempfile::tempdir;
 
 fn write_dap_message(stdin: &mut impl Write, payload: &Value) {
     let body = payload.to_string();
@@ -3599,6 +3601,248 @@ fn dap_breakpoint_in_resource_test_shows_opaque_resource_summary() {
     assert_eq!(resource["type"], json!("resource"));
     assert_eq!(resource["value"], json!("resource counter"));
     assert_eq!(resource["variablesReference"], json!(0));
+
+    write_dap_message(
+        &mut stdin,
+        &json!({
+            "type": "request",
+            "seq": 8,
+            "command": "evaluate",
+            "arguments": {
+                "expression": "c",
+                "frameId": frame_id,
+                "context": "repl"
+            }
+        }),
+    );
+    let evaluate_resp = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("evaluate"))
+        },
+        Duration::from_secs(2),
+    );
+    assert_eq!(evaluate_resp.pointer("/body/result"), Some(&json!("resource counter")));
+    assert_eq!(evaluate_resp.pointer("/body/type"), Some(&json!("resource")));
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 99, "command": "disconnect", "arguments": {}}),
+    );
+    let _disc_resp = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("disconnect"))
+        },
+        Duration::from_secs(2),
+    );
+
+    let status = child.wait().expect("wait for dap process");
+    assert!(status.success());
+}
+
+#[test]
+fn dap_can_launch_prebuilt_wasm_with_embedded_debug_source() {
+    let temp_dir = tempdir().expect("temp dir");
+    let source_path = temp_dir.path().join("artifact_resource_debug.kettu");
+    let wasm_path = temp_dir.path().join("artifact_resource_debug.wasm");
+
+    fs::write(
+        &source_path,
+        r#"package local:artifact-resource-debug;
+
+interface tests {
+    resource counter {
+        constructor(initial: s32) {
+            initial;
+        }
+
+        get: func() -> s32 {
+            self;
+        }
+    }
+
+    @test
+    test-resource-display: func() -> bool {
+        let c = counter(10);
+        return true;
+    }
+}
+"#,
+    )
+    .expect("write resource source");
+
+    let build = Command::new(env!("CARGO_BIN_EXE_kettu"))
+        .args([
+            "build",
+            "--core",
+            "--debug",
+            source_path.to_str().expect("source path"),
+            "-o",
+            wasm_path.to_str().expect("wasm path"),
+        ])
+        .output()
+        .expect("build debug wasm");
+    assert!(
+        build.status.success(),
+        "build debug wasm should succeed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    fs::remove_file(&source_path).expect("remove source file after build");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kettu"))
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn kettu dap");
+
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let stdout = child.stdout.take().expect("child stdout");
+
+    let (tx, rx) = mpsc::channel::<Value>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Some(msg) = read_dap_message(&mut reader) {
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
+    let cwd = temp_dir.path().to_string_lossy().to_string();
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 1, "command": "initialize", "arguments": {}}),
+    );
+    let _init_resp = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("initialize"))
+        },
+        Duration::from_secs(2),
+    );
+
+    write_dap_message(
+        &mut stdin,
+        &json!({
+            "type": "request",
+            "seq": 2,
+            "command": "launch",
+            "arguments": {
+                "program": wasm_path.to_string_lossy(),
+                "cwd": cwd,
+                "stopOnEntry": false,
+                "enableEvaluate": true
+            }
+        }),
+    );
+    let _launch_resp = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("launch")),
+        Duration::from_secs(3),
+    );
+    let _initialized_event = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("initialized")),
+        Duration::from_secs(2),
+    );
+
+    write_dap_message(
+        &mut stdin,
+        &json!({
+            "type": "request",
+            "seq": 3,
+            "command": "setBreakpoints",
+            "arguments": {
+                "source": { "path": source_path.to_string_lossy() },
+                "breakpoints": [{ "line": 17 }]
+            }
+        }),
+    );
+    let _bp_resp = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("setBreakpoints"))
+        },
+        Duration::from_secs(2),
+    );
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 4, "command": "configurationDone", "arguments": {}}),
+    );
+    let stop = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("event")) && m.get("event") == Some(&json!("stopped")),
+        Duration::from_secs(4),
+    );
+    assert_eq!(stop.pointer("/body/reason"), Some(&json!("breakpoint")));
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 5, "command": "stackTrace", "arguments": {"threadId": 1}}),
+    );
+    let stack = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("stackTrace"))
+        },
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        stack.pointer("/body/stackFrames/0/source/path"),
+        Some(&json!(source_path.to_string_lossy().to_string()))
+    );
+    let frame_id = stack
+        .pointer("/body/stackFrames/0/id")
+        .and_then(Value::as_i64)
+        .expect("frame id");
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 6, "command": "scopes", "arguments": {"frameId": frame_id}}),
+    );
+    let scopes = wait_for_message(
+        &rx,
+        |m| m.get("type") == Some(&json!("response")) && m.get("command") == Some(&json!("scopes")),
+        Duration::from_secs(2),
+    );
+    let locals_ref = scopes
+        .pointer("/body/scopes/0/variablesReference")
+        .and_then(Value::as_i64)
+        .expect("locals variablesReference");
+
+    write_dap_message(
+        &mut stdin,
+        &json!({"type": "request", "seq": 7, "command": "variables", "arguments": {"variablesReference": locals_ref}}),
+    );
+    let vars_resp = wait_for_message(
+        &rx,
+        |m| {
+            m.get("type") == Some(&json!("response"))
+                && m.get("command") == Some(&json!("variables"))
+        },
+        Duration::from_secs(2),
+    );
+    let vars = vars_resp
+        .pointer("/body/variables")
+        .and_then(Value::as_array)
+        .expect("variables");
+    let resource = vars
+        .iter()
+        .find(|value| value["name"] == json!("c"))
+        .expect("resource local c");
+    assert_eq!(resource["type"], json!("resource"));
+    assert_eq!(resource["value"], json!("resource counter"));
 
     write_dap_message(
         &mut stdin,
