@@ -343,6 +343,9 @@ fn strip_comments_preserve_layout(
     let mut bytes = source.as_bytes().to_vec();
 
     for range in comment_ranges {
+        // We replace comment bytes with spaces to preserve lines/columns
+        // without keeping the comment text. We only do this for characters
+        // that are not newlines.
         for byte in &mut bytes[range.start..range.end] {
             if *byte != b'\n' {
                 *byte = b' ';
@@ -350,7 +353,11 @@ fn strip_comments_preserve_layout(
         }
     }
 
-    String::from_utf8(bytes).unwrap_or_else(|_| source.to_string())
+    // Since we only overwrite bytes with b' ' (which is valid ASCII and
+    // therefore valid UTF-8), and the original string was valid UTF-8,
+    // the resulting byte array is guaranteed to be valid UTF-8.
+    // Using from_utf8_unchecked avoids the O(N) validation pass.
+    unsafe { String::from_utf8_unchecked(bytes) }
 }
 
 /// Detect whether parse errors are purely comment-induced noise.
@@ -2177,9 +2184,9 @@ mod tests {
         let source = "// line comment\ncode\n/// doc comment\n/* block */";
         let ranges = find_comment_ranges(source);
         assert_eq!(ranges.len(), 3);
-        assert_eq!(&source[ranges[0].clone()], "// line comment");
-        assert_eq!(&source[ranges[1].clone()], "/// doc comment");
-        assert_eq!(&source[ranges[2].clone()], "/* block */");
+        assert_eq!(&source[ranges[0].start..ranges[0].end], "// line comment");
+        assert_eq!(&source[ranges[1].start..ranges[1].end], "/// doc comment");
+        assert_eq!(&source[ranges[2].start..ranges[2].end], "/* block */");
     }
 
     #[test]
