@@ -79,12 +79,16 @@ pub fn analyze_captures(expr: &mut Expr, scope: &HashSet<String>) {
             scrutinee, arms, ..
         } => {
             analyze_captures(scrutinee, scope);
+            let mut shared_scope = scope.clone();
             for arm in arms {
                 // Patterns may bind new variables
-                let mut arm_scope = scope.clone();
-                collect_pattern_bindings(&arm.pattern, &mut arm_scope);
+                let added = collect_pattern_bindings(&arm.pattern, &mut shared_scope);
                 for stmt in &mut arm.body {
-                    analyze_statement(stmt, &arm_scope);
+                    analyze_statement(stmt, &shared_scope);
+                }
+                // Revert bindings from this arm to reuse the scope cleanly
+                for bound_name in added {
+                    shared_scope.remove(&bound_name);
                 }
             }
         }
@@ -359,11 +363,14 @@ fn collect_free_variables(expr: &Expr, bound: &HashSet<String>, free: &mut HashS
             scrutinee, arms, ..
         } => {
             collect_free_variables(scrutinee, bound, free);
+            let mut shared_bound = bound.clone();
             for arm in arms {
-                let mut arm_bound = bound.clone();
-                collect_pattern_bindings(&arm.pattern, &mut arm_bound);
+                let added = collect_pattern_bindings(&arm.pattern, &mut shared_bound);
                 for stmt in &arm.body {
-                    collect_free_in_statement(stmt, &arm_bound, free);
+                    collect_free_in_statement(stmt, &shared_bound, free);
+                }
+                for bound_name in added {
+                    shared_bound.remove(&bound_name);
                 }
             }
         }
@@ -583,16 +590,20 @@ fn collect_free_in_statement(
     }
 }
 
-fn collect_pattern_bindings(pattern: &Pattern, bindings: &mut HashSet<String>) {
+fn collect_pattern_bindings(pattern: &Pattern, bindings: &mut HashSet<String>) -> Vec<String> {
+    let mut added = Vec::new();
     match pattern {
         Pattern::Variant { binding, .. } => {
             if let Some(id) = binding {
-                bindings.insert(id.name.clone());
+                if bindings.insert(id.name.clone()) {
+                    added.push(id.name.clone());
+                }
             }
         }
         Pattern::Wildcard(_) => {}
         Pattern::Literal(_) => {}
     }
+    added
 }
 
 #[cfg(test)]
