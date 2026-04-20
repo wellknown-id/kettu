@@ -789,3 +789,28 @@ pub struct NestedPackage {
     pub items: Vec<TopLevelItem>,
     pub span: Span,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_spanned_new() {
+        let span = 10..20;
+        let spanned = Spanned::new("test", span.clone());
+
+        assert_eq!(spanned.value, "test");
+        assert_eq!(spanned.span, span);
+    }
+
+    #[test]
+    fn test_id_new() {
+        let span = 5..10;
+        let id1 = Id::new("my-id", span.clone());
+        let id2 = Id::new(String::from("my-id"), span.clone());
+
+        assert_eq!(id1.name, "my-id");
+        assert_eq!(id1.span, span);
+        assert_eq!(id1, id2);
+    }
+}
