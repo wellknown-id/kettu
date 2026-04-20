@@ -96,3 +96,87 @@ pub fn parse(source: &str) -> (Option<ast::WitFile>, Vec<ParseError>) {
 pub fn parse_file(source: &str) -> (Option<ast::WitFile>, Vec<ParseError>) {
     parse(source)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_valid_kettu() {
+        let src = "interface i { f: func() -> s32; }";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "expected no errors");
+        assert!(ast.is_some(), "expected parsed ast");
+    }
+
+    #[test]
+    fn test_parse_invalid_kettu() {
+        let src = "interface i { f: func( -> s32; }"; // missing closing parenthesis
+        let (ast, errors) = parse(src);
+        assert!(!errors.is_empty(), "expected errors");
+        assert!(ast.is_some(), "expected partial ast even with errors");
+    }
+
+    #[test]
+    fn test_parse_with_comments() {
+        let src = "
+        // This is a comment
+        interface i {
+            /* Block comment */
+            f: func() -> s32;
+        }";
+        let (ast, errors) = parse(src);
+        assert!(errors.is_empty(), "expected no errors");
+        assert!(ast.is_some(), "expected parsed ast");
+    }
+
+    #[test]
+    fn test_parse_empty() {
+        let src = "";
+        let (ast, errors) = parse(src);
+        let _ = ast;
+        let _ = errors;
+    }
+
+    #[test]
+    fn test_parse_file() {
+        let src = "interface i { f: func() -> s32; }";
+        let (ast, errors) = parse_file(src);
+        assert!(errors.is_empty(), "expected no errors");
+        assert!(ast.is_some(), "expected parsed ast");
+    }
+
+    #[test]
+    fn test_find_comment_ranges() {
+        let src = "
+        let x = 1; // single line comment
+        let y = /* block comment */ 2;
+        let z = \"string // not a comment\";
+        ";
+        let ranges = find_comment_ranges(src);
+        assert_eq!(ranges.len(), 2);
+
+        let src_unclosed = "let x = 1; /* unclosed block comment";
+        let ranges_unclosed = find_comment_ranges(src_unclosed);
+        assert_eq!(ranges_unclosed.len(), 1);
+    }
+
+    #[test]
+    fn test_strip_comments_preserve_layout() {
+        let src = "let x = 1; // comment\nlet y = 2;";
+        let stripped = strip_comments_preserve_layout(src);
+        assert_eq!(stripped, "let x = 1;           \nlet y = 2;");
+
+        let src_block = "let x = /* comment */ 1;";
+        let stripped_block = strip_comments_preserve_layout(src_block);
+        assert_eq!(stripped_block, "let x =               1;");
+
+        let src_string = "let x = \"// not a comment\";";
+        let stripped_string = strip_comments_preserve_layout(src_string);
+        assert_eq!(stripped_string, src_string);
+
+        let src_multiline = "let x = /* multi\nline\ncomment */ 1;";
+        let stripped_multiline = strip_comments_preserve_layout(src_multiline);
+        assert_eq!(stripped_multiline, "let x =         \n    \n           1;");
+    }
+}
