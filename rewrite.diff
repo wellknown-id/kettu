@@ -1,0 +1,72 @@
+--- crates/kettu-codegen/src/compiler.rs
++++ crates/kettu-codegen/src/compiler.rs
+@@ -1313,12 +1313,13 @@
+         self.ensure_arena_reset_func();
+
+         // Phase 3: Pre-compile all function bodies (discovers lambdas)
+-        let bodies = self.func_bodies.clone();
++        let bodies = std::mem::take(&mut self.func_bodies);
+         let mut compiled_funcs: Vec<Function> = Vec::new();
+         for (_, func) in &bodies {
+             let function = self.compile_function(func)?;
+             compiled_funcs.push(function);
+         }
++        self.func_bodies = bodies;
+         let initial_heap_offset = self.string_offset;
+
+         // Phase 4: Compile lambda bodies
+@@ -1390,9 +1391,9 @@
+         let has_lambdas = !compiled_lambdas.is_empty();
+
+         // Phase 4b: Compile async callback bodies
+-        let callback_bodies_clone = self.callback_bodies.clone();
++        let callback_bodies = std::mem::take(&mut self.callback_bodies);
+         let mut compiled_callbacks: Vec<Function> = Vec::new();
+-        for (func_name, _original_func, num_locals) in &callback_bodies_clone {
++        for (func_name, _original_func, num_locals) in &callback_bodies {
+             // Callback signature: (event: i32, p1: i32, p2: i32) -> i32
+             // For now, callbacks just return DONE status
+             // Full implementation would restore state and resume execution
+@@ -1409,6 +1410,7 @@
+             callback.instruction(&Instruction::End);
+             compiled_callbacks.push(callback);
+         }
++        self.callback_bodies = callback_bodies;
+         let _has_callbacks = !compiled_callbacks.is_empty();
+
+         // Phase 4c: Compile spawn bodies
+@@ -1614,7 +1616,7 @@
+         // Callback signature: (event: i32, p1: i32, p2: i32) -> i32
+         let callback_type_idx =
+             self.get_or_create_type(&[ValType::I32, ValType::I32, ValType::I32], &[ValType::I32]);
+-        for _ in &callback_bodies_clone {
++        for _ in &self.callback_bodies {
+             funcs.function(callback_type_idx);
+         }
+         // Spawn body function types
+@@ -1628,7 +1630,7 @@
+         }
+         if self.local_func_count > 0
+             || has_lambdas
+-            || !callback_bodies_clone.is_empty()
++            || !self.callback_bodies.is_empty()
+             || has_spawns
+         {
+             module.section(&funcs);
+@@ -1681,7 +1683,7 @@
+             let wts_idx = self.import_count
+                 + self.local_func_count
+                 + self.lambda_bodies.len() as u32
+-                + callback_bodies_clone.len() as u32
++                + self.callback_bodies.len() as u32
+                 + self.spawn_bodies.len() as u32;
+             exports.export("wasi_thread_start", ExportKind::Func, wts_idx);
+         }
+@@ -1728,7 +1730,7 @@
+         for func in compiled_callbacks {
+             code.function(&func);
+         }
+-        if self.local_func_count > 0 || has_lambdas || !callback_bodies_clone.is_empty() {
++        if self.local_func_count > 0 || has_lambdas || !self.callback_bodies.is_empty() {
+             module.section(&code);
+         }

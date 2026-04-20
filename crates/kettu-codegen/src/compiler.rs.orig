@@ -7,13 +7,12 @@ use gimli::write::{
     LineString, Sections,
 };
 use gimli::{
-    constants, Encoding as DwarfEncoding, Format as DwarfFormat, LineEncoding, LittleEndian,
-    SectionId,
+    Encoding as DwarfEncoding, Format as DwarfFormat, LineEncoding, LittleEndian, SectionId,
+    constants,
 };
 use kettu_parser::{
-    BinOp, Expr, Func, FuncBody, Gate, Id, InterfaceItem, Param, Pattern, PrimitiveTy,
-    ResourceMethod, SimdLane, SimdOp, Statement, StringPart, TopLevelItem, Ty, TypeDef,
-    TypeDefKind, WitFile,
+    BinOp, Expr, Func, FuncBody, Id, InterfaceItem, Param, Pattern, PrimitiveTy, ResourceMethod,
+    SimdLane, SimdOp, Statement, StringPart, TopLevelItem, Ty, TypeDef, TypeDefKind, WitFile,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -55,39 +54,9 @@ struct FunctionDebugInfo {
 #[derive(Debug, Clone)]
 struct ActiveDebugHookContext {
     subprogram_start_line: i64,
-    visible_bindings: Vec<DebugBinding>,
-    debug_resume_state_offset: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ResumableTestContext {
-    state_global_idx: u32,
-}
-
-#[derive(Debug, Clone)]
-struct ActiveResumableFunctionContext {
-    state_global_idx: u32,
-    allows_helper_calls: bool,
-    is_async: bool,
-    result_ty: Option<Ty>,
-    span: Range<usize>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ActiveResumableStatementContext {
-    statement_pc: u32,
-}
-
-#[derive(Debug, Clone)]
-struct DebugResumeFramePlan {
-    func_idx: u32,
-    name: String,
-    start_line: i64,
     bindings: Vec<DebugBinding>,
-    state_offset: u32,
+    snapshottable_locals: std::collections::HashSet<u32>,
 }
-
-const DEBUG_RESUME_HEADER_BYTES: u32 = 8;
 
 impl RecordTypeInfo {
     fn from_fields(field_names: &[(String, usize)]) -> Self {
@@ -257,244 +226,6 @@ fn line_for_span_or(span: &Range<usize>, source: &str, fallback: u64) -> u64 {
 
 fn debug_runtime_key_for_span(span: &Range<usize>) -> i32 {
     span.start.min(i32::MAX as usize) as i32
-}
-
-fn expr_contains_nested_resume_hazard(expr: &Expr) -> bool {
-    match expr {
-        Expr::Call { .. }
-        | Expr::Lambda { .. }
-        | Expr::Map { .. }
-        | Expr::Filter { .. }
-        | Expr::Reduce { .. }
-        | Expr::Await { .. }
-        | Expr::Spawn { .. } => true,
-        Expr::Binary { lhs, rhs, .. } | Expr::StrEq(lhs, rhs, _) | Expr::ListPush(lhs, rhs, _) => {
-            expr_contains_nested_resume_hazard(lhs) || expr_contains_nested_resume_hazard(rhs)
-        }
-        Expr::Field { expr, .. }
-        | Expr::OptionalChain { expr, .. }
-        | Expr::Try { expr, .. }
-        | Expr::Assert(expr, _)
-        | Expr::Not(expr, _)
-        | Expr::Neg(expr, _)
-        | Expr::StrLen(expr, _)
-        | Expr::ListLen(expr, _)
-        | Expr::AtomicLoad { addr: expr, .. }
-        | Expr::ThreadJoin { tid: expr, .. } => expr_contains_nested_resume_hazard(expr),
-        Expr::If {
-            cond,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            expr_contains_nested_resume_hazard(cond)
-                || then_branch
-                    .iter()
-                    .any(statement_contains_nested_resume_hazard)
-                || else_branch
-                    .iter()
-                    .flatten()
-                    .any(statement_contains_nested_resume_hazard)
-        }
-        Expr::Match {
-            scrutinee, arms, ..
-        } => {
-            expr_contains_nested_resume_hazard(scrutinee)
-                || arms
-                    .iter()
-                    .flat_map(|arm| arm.body.iter())
-                    .any(statement_contains_nested_resume_hazard)
-        }
-        Expr::While {
-            condition, body, ..
-        } => {
-            expr_contains_nested_resume_hazard(condition)
-                || body.iter().any(statement_contains_nested_resume_hazard)
-        }
-        Expr::For { range, body, .. } => {
-            expr_contains_nested_resume_hazard(range)
-                || body.iter().any(statement_contains_nested_resume_hazard)
-        }
-        Expr::ForEach {
-            collection, body, ..
-        }
-        | Expr::SimdForEach {
-            collection, body, ..
-        } => {
-            expr_contains_nested_resume_hazard(collection)
-                || body.iter().any(statement_contains_nested_resume_hazard)
-        }
-        Expr::Range {
-            start, end, step, ..
-        } => {
-            expr_contains_nested_resume_hazard(start)
-                || expr_contains_nested_resume_hazard(end)
-                || step
-                    .as_ref()
-                    .map(|expr| expr_contains_nested_resume_hazard(expr))
-                    .unwrap_or(false)
-        }
-        Expr::Slice {
-            expr,
-            start,
-            end,
-            ..
-        } => {
-            expr_contains_nested_resume_hazard(expr)
-                || expr_contains_nested_resume_hazard(start)
-                || expr_contains_nested_resume_hazard(end)
-        }
-        Expr::Index { expr, index, .. } => {
-            expr_contains_nested_resume_hazard(expr)
-                || expr_contains_nested_resume_hazard(index)
-        }
-        Expr::ListLiteral { elements, .. } | Expr::SimdOp { args: elements, .. } => {
-            elements.iter().any(expr_contains_nested_resume_hazard)
-        }
-        Expr::RecordLiteral { fields, .. } => fields
-            .iter()
-            .any(|(_, value)| expr_contains_nested_resume_hazard(value)),
-        Expr::VariantLiteral { payload, .. } => payload
-            .as_ref()
-            .map(|expr| expr_contains_nested_resume_hazard(expr))
-            .unwrap_or(false),
-        Expr::ListSet(list, index, value, _) => {
-            expr_contains_nested_resume_hazard(list)
-                || expr_contains_nested_resume_hazard(index)
-                || expr_contains_nested_resume_hazard(value)
-        }
-        Expr::AtomicStore { addr, value, .. }
-        | Expr::AtomicAdd { addr, value, .. }
-        | Expr::AtomicSub { addr, value, .. }
-        | Expr::AtomicNotify {
-            addr,
-            count: value,
-            ..
-        } => {
-            expr_contains_nested_resume_hazard(addr)
-                || expr_contains_nested_resume_hazard(value)
-        }
-        Expr::AtomicCmpxchg {
-            addr,
-            expected,
-            replacement,
-            ..
-        } => {
-            expr_contains_nested_resume_hazard(addr)
-                || expr_contains_nested_resume_hazard(expected)
-                || expr_contains_nested_resume_hazard(replacement)
-        }
-        Expr::AtomicWait {
-            addr,
-            expected,
-            timeout,
-            ..
-        } => {
-            expr_contains_nested_resume_hazard(addr)
-                || expr_contains_nested_resume_hazard(expected)
-                || expr_contains_nested_resume_hazard(timeout)
-        }
-        Expr::AtomicBlock { body, .. } => body.iter().any(statement_contains_nested_resume_hazard),
-        Expr::Integer(_, _)
-        | Expr::String(_, _)
-        | Expr::InterpolatedString(_, _)
-        | Expr::Bool(_, _)
-        | Expr::Ident(_) => false,
-    }
-}
-
-fn statement_contains_nested_resume_hazard(statement: &Statement) -> bool {
-    match statement {
-        Statement::Expr(expr)
-        | Statement::Return(Some(expr))
-        | Statement::Assign { value: expr, .. }
-        | Statement::CompoundAssign { value: expr, .. } => expr_contains_nested_resume_hazard(expr),
-        Statement::Let { value, .. } => expr_contains_nested_resume_hazard(value),
-        Statement::GuardLet {
-            value,
-            else_body,
-            ..
-        } => {
-            expr_contains_nested_resume_hazard(value)
-                || else_body.iter().any(statement_contains_nested_resume_hazard)
-        }
-        Statement::Guard {
-            condition,
-            else_body,
-        } => {
-            expr_contains_nested_resume_hazard(condition)
-                || else_body.iter().any(statement_contains_nested_resume_hazard)
-        }
-        Statement::Break { condition } | Statement::Continue { condition } => condition
-            .as_ref()
-            .map(|expr| expr_contains_nested_resume_hazard(expr))
-            .unwrap_or(false),
-        Statement::SharedLet { initial_value, .. } => {
-            expr_contains_nested_resume_hazard(initial_value)
-        }
-        Statement::Return(None) => false,
-    }
-}
-
-fn expr_is_restart_safe_for_resumable_helper_call(expr: &Expr) -> bool {
-    match expr {
-        Expr::Ident(_) | Expr::Integer(_, _) | Expr::String(_, _) | Expr::Bool(_, _) => true,
-        Expr::InterpolatedString(parts, _) => parts.iter().all(|part| match part {
-            StringPart::Literal(_) => true,
-            StringPart::Expr(expr) => expr_is_restart_safe_for_resumable_helper_call(expr),
-        }),
-        Expr::Binary { lhs, rhs, .. } | Expr::StrEq(lhs, rhs, _) | Expr::ListPush(lhs, rhs, _) => {
-            expr_is_restart_safe_for_resumable_helper_call(lhs)
-                && expr_is_restart_safe_for_resumable_helper_call(rhs)
-        }
-        Expr::Field { expr, .. }
-        | Expr::OptionalChain { expr, .. }
-        | Expr::Try { expr, .. }
-        | Expr::Assert(expr, _)
-        | Expr::Not(expr, _)
-        | Expr::Neg(expr, _)
-        | Expr::StrLen(expr, _)
-        | Expr::ListLen(expr, _)
-        | Expr::AtomicLoad { addr: expr, .. }
-        | Expr::ThreadJoin { tid: expr, .. } => expr_is_restart_safe_for_resumable_helper_call(expr),
-        Expr::Index { expr, index, .. } => {
-            expr_is_restart_safe_for_resumable_helper_call(expr)
-                && expr_is_restart_safe_for_resumable_helper_call(index)
-        }
-        Expr::Slice {
-            expr,
-            start,
-            end,
-            ..
-        } => {
-            expr_is_restart_safe_for_resumable_helper_call(expr)
-                && expr_is_restart_safe_for_resumable_helper_call(start)
-                && expr_is_restart_safe_for_resumable_helper_call(end)
-        }
-        Expr::ListLiteral { elements, .. } | Expr::SimdOp { args: elements, .. } => elements
-            .iter()
-            .all(expr_is_restart_safe_for_resumable_helper_call),
-        Expr::RecordLiteral { fields, .. } => fields
-            .iter()
-            .all(|(_, value)| expr_is_restart_safe_for_resumable_helper_call(value)),
-        Expr::VariantLiteral { payload, .. } => payload
-            .as_ref()
-            .map(|expr| expr_is_restart_safe_for_resumable_helper_call(expr))
-            .unwrap_or(true),
-        _ => false,
-    }
-}
-
-fn function_supports_resumable_helper(func: &Func) -> bool {
-    func.body
-        .as_ref()
-        .map(|body| {
-            !body
-                .statements
-                .iter()
-                .any(statement_contains_nested_resume_hazard)
-        })
-        .unwrap_or(false)
 }
 
 fn push_debug_binding(
@@ -869,39 +600,10 @@ struct ForEachLoopAnalysis {
     memory_access: MemoryAccessPattern,
 }
 
-fn const_i32_expr_with_locals(
-    expr: &Expr,
-    local_constants: Option<&HashMap<String, i32>>,
-) -> Option<i32> {
+fn const_i32_expr(expr: &Expr) -> Option<i32> {
     match expr {
         Expr::Integer(value, _) if *value >= i32::MIN as i64 && *value <= i32::MAX as i64 => {
             Some(*value as i32)
-        }
-        Expr::Ident(id) => local_constants.and_then(|constants| constants.get(&id.name).copied()),
-        Expr::Neg(inner, _) => const_i32_expr_with_locals(inner, local_constants)?.checked_neg(),
-        Expr::Binary { lhs, op, rhs, .. } => {
-            let lhs = const_i32_expr_with_locals(lhs, local_constants)?;
-            let rhs = const_i32_expr_with_locals(rhs, local_constants)?;
-            match op {
-                BinOp::Add => lhs.checked_add(rhs),
-                BinOp::Sub => lhs.checked_sub(rhs),
-                BinOp::Mul => lhs.checked_mul(rhs),
-                BinOp::Div => {
-                    if rhs == 0 {
-                        None
-                    } else {
-                        lhs.checked_div(rhs)
-                    }
-                }
-                BinOp::Eq
-                | BinOp::Ne
-                | BinOp::Lt
-                | BinOp::Le
-                | BinOp::Gt
-                | BinOp::Ge
-                | BinOp::And
-                | BinOp::Or => None,
-            }
         }
         _ => None,
     }
@@ -928,14 +630,6 @@ fn compute_range_trip_count(start: i32, end: i32, step: i32, descending: bool) -
 }
 
 fn analyze_range_loop(induction_variable: &str, range: &Expr) -> Option<RangeLoopAnalysis> {
-    analyze_range_loop_with_locals(induction_variable, range, None)
-}
-
-fn analyze_range_loop_with_locals(
-    induction_variable: &str,
-    range: &Expr,
-    local_constants: Option<&HashMap<String, i32>>,
-) -> Option<RangeLoopAnalysis> {
     let Expr::Range {
         start,
         end,
@@ -948,15 +642,11 @@ fn analyze_range_loop_with_locals(
     };
 
     let constant_step = match step.as_deref() {
-        Some(step_expr) => const_i32_expr_with_locals(step_expr, local_constants),
+        Some(step_expr) => const_i32_expr(step_expr),
         None => Some(1),
     };
 
-    let trip_count = match (
-        const_i32_expr_with_locals(start, local_constants),
-        const_i32_expr_with_locals(end, local_constants),
-        constant_step,
-    ) {
+    let trip_count = match (const_i32_expr(start), const_i32_expr(end), constant_step) {
         (Some(start), Some(end), Some(step)) => {
             compute_range_trip_count(start, end, step, *descending).map(LoopTripCount::Constant)
         }
@@ -1025,30 +715,14 @@ struct ModuleCompiler<'a> {
     task_return_func_idx: Option<u32>,
     /// Index of the debugger line hook import
     debug_hook_idx: Option<u32>,
-    /// Index of the debugger pause-probe hook import
-    debug_pause_probe_idx: Option<u32>,
-    /// Index of the debugger pause hook import
-    debug_pause_idx: Option<u32>,
-    /// Index of the debugger cooperative yield hook import
-    debug_yield_idx: Option<u32>,
     /// Index of the debugger local snapshot hook import
     debug_value_hook_idx: Option<u32>,
     /// Index of the debugger frame-enter hook import
     debug_enter_hook_idx: Option<u32>,
     /// Index of the debugger frame-exit hook import
     debug_exit_hook_idx: Option<u32>,
-    /// Reserved debug-resume frame slots for functions/lambdas compiled with debugger hooks.
-    debug_resume_frames: Vec<DebugResumeFramePlan>,
-    /// Mutable globals storing resumable statement state for cooperative test pauses.
-    debug_resume_state_globals: HashMap<u32, u32>,
-    /// Active resumable function context while compiling a resumable test/helper body.
-    active_resumable_function_context: Option<ActiveResumableFunctionContext>,
-    /// Active resumable top-level statement context while compiling a resumable statement.
-    active_resumable_statement_context: Option<ActiveResumableStatementContext>,
     /// Active debug hook context while compiling a function/lambda body
     active_debug_hook_context: Option<ActiveDebugHookContext>,
-    /// Compile-time constant i32 locals visible in the current function/lambda scope
-    active_constant_locals: Option<HashMap<String, i32>>,
     /// Type index for task.return for each result type
     task_return_types: HashMap<Vec<ValType>, u32>,
     /// Callback function bodies for async functions: (entry_func_name, func, state_local_count)
@@ -1071,14 +745,6 @@ struct ModuleCompiler<'a> {
     loop_break_depth: Option<u32>,
     /// Continue target depth: how many wasm blocks to `br` past to reach the continue target.
     loop_continue_depth: Option<u32>,
-    /// Index of the contract fail import (ptr: i32, len: i32) -> ()
-    contract_fail_idx: Option<u32>,
-    /// Constrained type aliases: name -> (target_type, constraint)
-    type_aliases: HashMap<String, TypeAliasInfo>,
-}
-
-struct TypeAliasInfo {
-    constraint: Expr,
 }
 
 impl<'a> ModuleCompiler<'a> {
@@ -1106,18 +772,10 @@ impl<'a> ModuleCompiler<'a> {
             imported_interfaces: HashMap::new(),
             task_return_func_idx: None,
             debug_hook_idx: None,
-            debug_pause_probe_idx: None,
-            debug_pause_idx: None,
-            debug_yield_idx: None,
             debug_value_hook_idx: None,
             debug_enter_hook_idx: None,
             debug_exit_hook_idx: None,
-            debug_resume_frames: Vec::new(),
-            debug_resume_state_globals: HashMap::new(),
-            active_resumable_function_context: None,
-            active_resumable_statement_context: None,
             active_debug_hook_context: None,
-            active_constant_locals: None,
             task_return_types: HashMap::new(),
             callback_bodies: Vec::new(),
             waitable_set_new_idx: None,
@@ -1130,14 +788,9 @@ impl<'a> ModuleCompiler<'a> {
             shared_locals: std::collections::HashSet::new(),
             loop_break_depth: None,
             loop_continue_depth: None,
-            contract_fail_idx: None,
-            type_aliases: HashMap::new(),
         };
         if options.emit_debug_hooks {
             compiler.ensure_debug_hook_import();
-            compiler.ensure_debug_pause_probe_import();
-            compiler.ensure_debug_pause_import();
-            compiler.ensure_debug_yield_import();
             compiler.ensure_debug_value_hook_import();
             compiler.ensure_debug_enter_hook_import();
             compiler.ensure_debug_exit_hook_import();
@@ -1173,20 +826,6 @@ impl<'a> ModuleCompiler<'a> {
         func_idx
     }
 
-    fn ensure_debug_pause_probe_import(&mut self) -> u32 {
-        if let Some(idx) = self.debug_pause_probe_idx {
-            return idx;
-        }
-
-        let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[ValType::I32]);
-        let func_idx = self.import_count;
-        self.import_count += 1;
-        self.functions
-            .insert("$debug_should_pause".to_string(), (type_idx, func_idx, true));
-        self.debug_pause_probe_idx = Some(func_idx);
-        func_idx
-    }
-
     fn ensure_debug_enter_hook_import(&mut self) -> u32 {
         if let Some(idx) = self.debug_enter_hook_idx {
             return idx;
@@ -1199,44 +838,6 @@ impl<'a> ModuleCompiler<'a> {
             .insert("$debug_enter".to_string(), (type_idx, func_idx, true));
         self.debug_enter_hook_idx = Some(func_idx);
         func_idx
-    }
-
-    fn ensure_debug_pause_import(&mut self) -> u32 {
-        if let Some(idx) = self.debug_pause_idx {
-            return idx;
-        }
-
-        let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
-        let func_idx = self.import_count;
-        self.import_count += 1;
-        self.functions
-            .insert("$debug_pause".to_string(), (type_idx, func_idx, true));
-        self.debug_pause_idx = Some(func_idx);
-        func_idx
-    }
-
-    fn ensure_debug_yield_import(&mut self) -> u32 {
-        if let Some(idx) = self.debug_yield_idx {
-            return idx;
-        }
-
-        let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
-        let func_idx = self.import_count;
-        self.import_count += 1;
-        self.functions
-            .insert("$debug_yield".to_string(), (type_idx, func_idx, true));
-        self.debug_yield_idx = Some(func_idx);
-        func_idx
-    }
-
-    fn ensure_debug_resume_state_global(&mut self, func_idx: u32) -> u32 {
-        if let Some(&global_idx) = self.debug_resume_state_globals.get(&func_idx) {
-            return global_idx;
-        }
-
-        let global_idx = 1 + self.debug_resume_state_globals.len() as u32;
-        self.debug_resume_state_globals.insert(func_idx, global_idx);
-        global_idx
     }
 
     fn ensure_debug_exit_hook_import(&mut self) -> u32 {
@@ -1253,20 +854,6 @@ impl<'a> ModuleCompiler<'a> {
         func_idx
     }
 
-    fn ensure_contract_fail_import(&mut self) -> u32 {
-        if let Some(idx) = self.contract_fail_idx {
-            return idx;
-        }
-
-        let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
-        let func_idx = self.import_count;
-        self.import_count += 1;
-        self.functions
-            .insert("$contract_fail".to_string(), (type_idx, func_idx, true));
-        self.contract_fail_idx = Some(func_idx);
-        func_idx
-    }
-
     fn with_active_debug_hook_context<T>(
         &mut self,
         context: Option<ActiveDebugHookContext>,
@@ -1278,29 +865,7 @@ impl<'a> ModuleCompiler<'a> {
         result
     }
 
-    fn with_active_resumable_function_context<T>(
-        &mut self,
-        context: Option<ActiveResumableFunctionContext>,
-        build: impl FnOnce(&mut Self) -> Result<T, CompileError>,
-    ) -> Result<T, CompileError> {
-        let previous = std::mem::replace(&mut self.active_resumable_function_context, context);
-        let result = build(self);
-        self.active_resumable_function_context = previous;
-        result
-    }
-
-    fn with_active_resumable_statement_context<T>(
-        &mut self,
-        context: Option<ActiveResumableStatementContext>,
-        build: impl FnOnce(&mut Self) -> Result<T, CompileError>,
-    ) -> Result<T, CompileError> {
-        let previous = std::mem::replace(&mut self.active_resumable_statement_context, context);
-        let result = build(self);
-        self.active_resumable_statement_context = previous;
-        result
-    }
-
-    fn emit_debug_line_recording(&mut self, function: &mut Function, line: i64) {
+    fn emit_debug_line_hook(&mut self, function: &mut Function, line: i64) {
         if !self.options.emit_debug_hooks || line <= 0 {
             return;
         }
@@ -1309,46 +874,17 @@ impl<'a> ModuleCompiler<'a> {
             return;
         };
 
-        if let (Some(debug_value_hook_idx), Some(context)) =
-            (self.debug_value_hook_idx, self.active_debug_hook_context.as_ref())
-        {
-            function.instruction(&Instruction::I32Const(context.debug_resume_state_offset as i32));
-            function.instruction(&Instruction::I32Const(line as i32));
-            function.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
-                offset: 0,
-                align: 2,
-                memory_index: 0,
-            }));
-            function.instruction(&Instruction::I32Const(
-                (context.debug_resume_state_offset + 4) as i32,
-            ));
-            function.instruction(&Instruction::I32Const(1));
-            function.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
-                offset: 0,
-                align: 2,
-                memory_index: 0,
-            }));
-
-            for (slot_index, binding) in context
-                .visible_bindings
-                .iter()
-                .filter(|binding| binding.decl_line <= line as u64)
-                .enumerate()
-            {
+        if let (Some(debug_value_hook_idx), Some(context)) = (
+            self.debug_value_hook_idx,
+            self.active_debug_hook_context.as_ref(),
+        ) {
+            for binding in context.bindings.iter().filter(|binding| {
+                binding.decl_line <= line as u64
+                    && context.snapshottable_locals.contains(&binding.local_index)
+            }) {
                 function.instruction(&Instruction::I32Const(binding.local_index as i32));
                 function.instruction(&Instruction::LocalGet(binding.local_index));
                 function.instruction(&Instruction::Call(debug_value_hook_idx));
-
-                let slot_offset = context.debug_resume_state_offset
-                    + DEBUG_RESUME_HEADER_BYTES
-                    + (slot_index as u32 * 4);
-                function.instruction(&Instruction::I32Const(slot_offset as i32));
-                function.instruction(&Instruction::LocalGet(binding.local_index));
-                function.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
-                    offset: 0,
-                    align: 2,
-                    memory_index: 0,
-                }));
             }
             function.instruction(&Instruction::I32Const(context.subprogram_start_line as i32));
         } else {
@@ -1356,153 +892,6 @@ impl<'a> ModuleCompiler<'a> {
         }
         function.instruction(&Instruction::I32Const(line as i32));
         function.instruction(&Instruction::Call(debug_hook_idx));
-    }
-
-    fn emit_default_resume_return(
-        &mut self,
-        function: &mut Function,
-        func: &Func,
-    ) -> Result<(), CompileError> {
-        if func.is_async && self.options.wasip3 {
-            function.instruction(&Instruction::I32Const(0));
-            function.instruction(&Instruction::Return);
-            return Ok(());
-        }
-
-        if let Some(result_ty) = func.result.as_ref() {
-            match self.ty_to_valtype(result_ty)? {
-                ValType::I32 => {
-                    function.instruction(&Instruction::I32Const(0));
-                }
-                ValType::I64 => {
-                    function.instruction(&Instruction::I64Const(0));
-                }
-                other => {
-                    return Err(CompileError {
-                        message: format!(
-                            "cooperative debug resume does not support {:?} test returns yet",
-                            other
-                        ),
-                        span: Some(func.span.clone()),
-                    })
-                }
-            }
-        }
-        function.instruction(&Instruction::Return);
-        Ok(())
-    }
-
-    fn emit_default_resume_return_for_active_function(
-        &mut self,
-        function: &mut Function,
-    ) -> Result<(), CompileError> {
-        let Some(context) = self.active_resumable_function_context.clone() else {
-            return Ok(());
-        };
-
-        if context.is_async && self.options.wasip3 {
-            function.instruction(&Instruction::I32Const(0));
-            function.instruction(&Instruction::Return);
-            return Ok(());
-        }
-
-        if let Some(result_ty) = context.result_ty.as_ref() {
-            match self.ty_to_valtype(result_ty)? {
-                ValType::I32 => {
-                    function.instruction(&Instruction::I32Const(0));
-                }
-                ValType::I64 => {
-                    function.instruction(&Instruction::I64Const(0));
-                }
-                other => {
-                    return Err(CompileError {
-                        message: format!(
-                            "cooperative helper resume does not support {:?} caller returns yet",
-                            other
-                        ),
-                        span: Some(context.span),
-                    })
-                }
-            }
-        }
-
-        function.instruction(&Instruction::Return);
-        Ok(())
-    }
-
-    fn emit_restore_resumable_test_locals(
-        &mut self,
-        function: &mut Function,
-        state_global_idx: u32,
-    ) {
-        let Some(context) = self.active_debug_hook_context.as_ref() else {
-            return;
-        };
-
-        function.instruction(&Instruction::GlobalGet(state_global_idx));
-        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        for (slot_index, binding) in context.visible_bindings.iter().enumerate() {
-            let slot_offset = context.debug_resume_state_offset
-                + DEBUG_RESUME_HEADER_BYTES
-                + (slot_index as u32 * 4);
-            function.instruction(&Instruction::I32Const(slot_offset as i32));
-            function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                offset: 0,
-                align: 2,
-                memory_index: 0,
-            }));
-            function.instruction(&Instruction::LocalSet(binding.local_index));
-        }
-        function.instruction(&Instruction::End);
-    }
-
-    fn emit_resumable_test_statement_hook(
-        &mut self,
-        function: &mut Function,
-        func: &Func,
-        line: i64,
-        resumable_test: ResumableTestContext,
-        statement_pc: u32,
-    ) -> Result<(), CompileError> {
-        self.emit_debug_line_recording(function, line);
-
-        if let (Some(debug_pause_probe_idx), Some(debug_yield_idx)) =
-            (self.debug_pause_probe_idx, self.debug_yield_idx)
-        {
-            function.instruction(&Instruction::I32Const(line as i32));
-            function.instruction(&Instruction::I32Const(1));
-            function.instruction(&Instruction::Call(debug_pause_probe_idx));
-            function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-            function.instruction(&Instruction::I32Const(statement_pc as i32));
-            function.instruction(&Instruction::GlobalSet(resumable_test.state_global_idx));
-            function.instruction(&Instruction::I32Const(line as i32));
-            function.instruction(&Instruction::I32Const(1));
-            function.instruction(&Instruction::Call(debug_yield_idx));
-            self.emit_default_resume_return(function, func)?;
-            function.instruction(&Instruction::End);
-        }
-
-        Ok(())
-    }
-
-    fn emit_debug_line_hook(&mut self, function: &mut Function, line: i64) {
-        if !self.options.emit_debug_hooks || line <= 0 {
-            return;
-        }
-        self.emit_debug_line_recording(function, line);
-
-        if let (Some(debug_pause_probe_idx), Some(debug_pause_idx)) =
-            (self.debug_pause_probe_idx, self.debug_pause_idx)
-        {
-            function.instruction(&Instruction::I32Const(line as i32));
-            function.instruction(&Instruction::I32Const(1));
-            function.instruction(&Instruction::Call(debug_pause_probe_idx));
-            function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-            function.instruction(&Instruction::I32Const(line as i32));
-            function.instruction(&Instruction::I32Const(1));
-            function.instruction(&Instruction::Call(debug_pause_idx));
-            function.instruction(&Instruction::End);
-        }
     }
 
     fn emit_debug_line_hook_for_expr(&mut self, function: &mut Function, expr: &Expr) {
@@ -1541,308 +930,6 @@ impl<'a> ModuleCompiler<'a> {
         function.instruction(&Instruction::Call(debug_exit_hook_idx));
     }
 
-    fn is_resumable_test_function(&self, func: &Func) -> bool {
-        self.options.emit_debug_hooks
-            && func.gates.iter().any(|gate| matches!(gate, Gate::Test))
-            && !func.is_async
-    }
-
-    fn is_resumable_helper_function(&self, func: &Func) -> bool {
-        self.options.emit_debug_hooks
-            && !func.gates.iter().any(|gate| matches!(gate, Gate::Test))
-            && !func.is_async
-            && function_supports_resumable_helper(func)
-    }
-
-    fn resumable_helper_state_global_for_call(
-        &mut self,
-        callee_name: &str,
-        callee_func_idx: u32,
-        callee_type_idx: u32,
-        args: &[Expr],
-    ) -> Option<u32> {
-        let active_function = self.active_resumable_function_context.as_ref()?;
-        let _active_statement = self.active_resumable_statement_context.as_ref()?;
-        if !active_function.allows_helper_calls {
-            return None;
-        }
-
-        if !args
-            .iter()
-            .all(expr_is_restart_safe_for_resumable_helper_call)
-        {
-            return None;
-        }
-
-        let (_, results) = self.types.get(callee_type_idx as usize)?;
-        if !matches!(results.as_slice(), [] | [ValType::I32]) {
-            return None;
-        }
-
-        let func = self
-            .func_bodies
-            .iter()
-            .find_map(|(_, func)| (func.name.name == callee_name).then_some(func))?;
-        if !self.is_resumable_helper_function(func) {
-            return None;
-        }
-
-        Some(self.ensure_debug_resume_state_global(callee_func_idx))
-    }
-
-    fn emit_resumable_helper_call_boundary(
-        &mut self,
-        function: &mut Function,
-        helper_state_global_idx: u32,
-        result_local_idx: Option<u32>,
-    ) -> Result<(), CompileError> {
-        let Some(active_function) = self.active_resumable_function_context.as_ref() else {
-            return Ok(());
-        };
-        let Some(active_statement) = self.active_resumable_statement_context else {
-            return Ok(());
-        };
-
-        if let Some(result_local_idx) = result_local_idx {
-            function.instruction(&Instruction::LocalSet(result_local_idx));
-        }
-
-        function.instruction(&Instruction::GlobalGet(helper_state_global_idx));
-        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        function.instruction(&Instruction::I32Const(active_statement.statement_pc as i32));
-        function.instruction(&Instruction::GlobalSet(active_function.state_global_idx));
-        self.emit_default_resume_return_for_active_function(function)?;
-        function.instruction(&Instruction::End);
-
-        if let Some(result_local_idx) = result_local_idx {
-            function.instruction(&Instruction::LocalGet(result_local_idx));
-        }
-
-        Ok(())
-    }
-
-    fn emit_resumable_statement_guard(
-        &mut self,
-        function: &mut Function,
-        resumable_test: ResumableTestContext,
-        statement_pc: u32,
-    ) {
-        function.instruction(&Instruction::GlobalGet(resumable_test.state_global_idx));
-        function.instruction(&Instruction::I32Const(statement_pc as i32));
-        function.instruction(&Instruction::I32LeU);
-        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-    }
-
-    fn emit_resumable_pause_if_needed(
-        &mut self,
-        function: &mut Function,
-        func: &Func,
-        line: i64,
-        resumable_test: ResumableTestContext,
-        statement_pc: u32,
-    ) -> Result<(), CompileError> {
-        function.instruction(&Instruction::GlobalGet(resumable_test.state_global_idx));
-        function.instruction(&Instruction::I32Const(statement_pc as i32));
-        function.instruction(&Instruction::I32Ne);
-        function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        self.emit_resumable_test_statement_hook(
-            function,
-            func,
-            line,
-            resumable_test,
-            statement_pc,
-        )?;
-        function.instruction(&Instruction::End);
-        Ok(())
-    }
-
-    fn compile_top_level_statement_with_resume(
-        &mut self,
-        function: &mut Function,
-        func: &Func,
-        stmt: &Statement,
-        statement_pc: u32,
-        resumable_test: Option<ResumableTestContext>,
-        locals: &HashMap<String, u32>,
-        locals_types: &mut HashMap<String, RecordTypeInfo>,
-    ) -> Result<(), CompileError> {
-        if let Some(resumable_test) = resumable_test {
-            let Some(source) = self.options.debug_source.as_deref() else {
-                return self.compile_statement_with_locals(function, stmt, locals, locals_types);
-            };
-            self.emit_resumable_statement_guard(function, resumable_test, statement_pc);
-            self.emit_resumable_pause_if_needed(
-                function,
-                func,
-                statement_start_line(stmt, source),
-                resumable_test,
-                statement_pc,
-            )?;
-            self.compile_statement_with_locals_inner(function, stmt, locals, locals_types, false)?;
-            function.instruction(&Instruction::End);
-            return Ok(());
-        }
-
-        self.compile_statement_with_locals(function, stmt, locals, locals_types)
-    }
-
-    fn compile_function_last_statement(
-        &mut self,
-        function: &mut Function,
-        func: &Func,
-        stmt: &Statement,
-        statement_pc: u32,
-        resumable_test: Option<ResumableTestContext>,
-        locals: &HashMap<String, u32>,
-        locals_types: &mut HashMap<String, RecordTypeInfo>,
-    ) -> Result<(), CompileError> {
-        if let Some(resumable_test) = resumable_test {
-            if let Some(source) = self.options.debug_source.as_deref() {
-                self.emit_resumable_pause_if_needed(
-                    function,
-                    func,
-                    statement_start_line(stmt, source),
-                    resumable_test,
-                    statement_pc,
-                )?;
-            }
-        } else {
-            self.emit_debug_line_hook_for_statement(function, stmt);
-        }
-
-        match stmt {
-            Statement::CompoundAssign { name, op, value } => {
-                if let Some(&idx) = locals.get(&name.name) {
-                    function.instruction(&Instruction::LocalGet(idx));
-                }
-                self.compile_expr_with_locals(function, value, locals, locals_types)?;
-                match op {
-                    BinOp::Add => function.instruction(&Instruction::I32Add),
-                    BinOp::Sub => function.instruction(&Instruction::I32Sub),
-                    _ => function.instruction(&Instruction::I32Add),
-                };
-                if let Some(&idx) = locals.get(&name.name) {
-                    function.instruction(&Instruction::LocalSet(idx));
-                }
-                function.instruction(&Instruction::I32Const(0));
-            }
-            Statement::Expr(expr) => {
-                self.compile_expr_with_locals(function, expr, locals, locals_types)?;
-
-                if func.is_async && self.options.wasip3 {
-                    if let Some(ref result_ty) = func.result {
-                        let result_valtype = self.ty_to_valtype(result_ty)?;
-                        let task_return_idx = self.ensure_task_return_import(&[result_valtype]);
-                        function.instruction(&Instruction::Call(task_return_idx));
-                    }
-                    function.instruction(&Instruction::I32Const(0));
-                }
-            }
-            Statement::Return(Some(expr)) => {
-                self.compile_expr_with_locals(function, expr, locals, locals_types)?;
-
-                if let Some(resumable_test) = resumable_test {
-                    function.instruction(&Instruction::I32Const(0));
-                    function.instruction(&Instruction::GlobalSet(resumable_test.state_global_idx));
-                }
-
-                if func.is_async && self.options.wasip3 {
-                    if let Some(ref result_ty) = func.result {
-                        let result_valtype = self.ty_to_valtype(result_ty)?;
-                        let task_return_idx = self.ensure_task_return_import(&[result_valtype]);
-                        function.instruction(&Instruction::Call(task_return_idx));
-                    }
-                    function.instruction(&Instruction::I32Const(0));
-                    function.instruction(&Instruction::Return);
-                } else {
-                    function.instruction(&Instruction::Return);
-                }
-            }
-            Statement::Return(None) => {
-                if let Some(resumable_test) = resumable_test {
-                    function.instruction(&Instruction::I32Const(0));
-                    function.instruction(&Instruction::GlobalSet(resumable_test.state_global_idx));
-                }
-                if func.is_async && self.options.wasip3 {
-                    let task_return_idx = self.ensure_task_return_import(&[]);
-                    function.instruction(&Instruction::Call(task_return_idx));
-                    function.instruction(&Instruction::I32Const(0));
-                }
-                function.instruction(&Instruction::Return);
-            }
-            Statement::Let { name, value } => {
-                if let Expr::RecordLiteral { fields, .. } = value {
-                    let field_info: Vec<_> = fields
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (field_name, _))| (field_name.name.clone(), i * 4))
-                        .collect();
-                    locals_types.insert(name.name.clone(), RecordTypeInfo::from_fields(&field_info));
-                }
-                self.compile_expr_with_locals(function, value, locals, locals_types)?;
-                if let Some(&idx) = locals.get(&name.name) {
-                    function.instruction(&Instruction::LocalSet(idx));
-                }
-                if (func.is_async && self.options.wasip3) || func.result.is_some() {
-                    function.instruction(&Instruction::I32Const(0));
-                }
-            }
-            Statement::Assign { name, value } => {
-                self.compile_expr_with_locals(function, value, locals, locals_types)?;
-                if let Some(&idx) = locals.get(&name.name) {
-                    function.instruction(&Instruction::LocalSet(idx));
-                }
-                if (func.is_async && self.options.wasip3) || func.result.is_some() {
-                    function.instruction(&Instruction::I32Const(0));
-                }
-            }
-            Statement::Break { .. } | Statement::Continue { .. } => {
-                if (func.is_async && self.options.wasip3) || func.result.is_some() {
-                    function.instruction(&Instruction::I32Const(0));
-                }
-            }
-            Statement::SharedLet { .. } => {
-                if (func.is_async && self.options.wasip3) || func.result.is_some() {
-                    function.instruction(&Instruction::I32Const(0));
-                }
-            }
-            Statement::GuardLet {
-                name,
-                value,
-                else_body,
-            } => {
-                self.compile_guard_let_statement_with_locals(
-                    function,
-                    name,
-                    value,
-                    else_body,
-                    locals,
-                    locals_types,
-                )?;
-                if (func.is_async && self.options.wasip3) || func.result.is_some() {
-                    function.instruction(&Instruction::I32Const(0));
-                }
-            }
-            Statement::Guard {
-                condition,
-                else_body,
-            } => {
-                self.compile_guard_statement_with_locals(
-                    function,
-                    condition,
-                    else_body,
-                    locals,
-                    locals_types,
-                )?;
-                if (func.is_async && self.options.wasip3) || func.result.is_some() {
-                    function.instruction(&Instruction::I32Const(0));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     fn function_snapshottable_locals(
         &self,
         func: &Func,
@@ -1864,29 +951,8 @@ impl<'a> ModuleCompiler<'a> {
         Ok(indices)
     }
 
-    fn persisted_debug_bindings(
-        &self,
-        bindings: &[DebugBinding],
-        snapshottable_locals: &std::collections::HashSet<u32>,
-    ) -> Vec<DebugBinding> {
-        let mut persisted = bindings
-            .iter()
-            .filter(|binding| snapshottable_locals.contains(&binding.local_index))
-            .cloned()
-            .collect::<Vec<_>>();
-        persisted.sort_by_key(|binding| binding.local_index);
-        persisted
-    }
-
-    fn alloc_debug_resume_state(&mut self, binding_count: u32) -> u32 {
-        let state_offset = self.string_offset;
-        self.string_offset += DEBUG_RESUME_HEADER_BYTES + (binding_count * 4);
-        state_offset
-    }
-
     fn active_debug_hook_context_for_function(
-        &mut self,
-        func_idx: u32,
+        &self,
         func: &Func,
         debug_info: &FunctionDebugInfo,
         locals: &HashMap<String, u32>,
@@ -1896,27 +962,15 @@ impl<'a> ModuleCompiler<'a> {
             return Ok(None);
         };
 
-        let snapshottable_locals = self.function_snapshottable_locals(func, locals, v128_locals)?;
-        let visible_bindings =
-            self.persisted_debug_bindings(&debug_info.bindings, &snapshottable_locals);
-        let Some(debug_resume_state_offset) = self.register_debug_resume_frame(
-            func_idx,
-            func.name.name.clone(),
-            offset_to_line(source, func.span.start) as i64,
-            visible_bindings.clone(),
-        ) else {
-            return Ok(None);
-        };
-
         Ok(Some(ActiveDebugHookContext {
             subprogram_start_line: offset_to_line(source, func.span.start) as i64,
-            visible_bindings,
-            debug_resume_state_offset,
+            bindings: debug_info.bindings.clone(),
+            snapshottable_locals: self.function_snapshottable_locals(func, locals, v128_locals)?,
         }))
     }
 
     fn active_debug_hook_context_for_lambda(
-        &mut self,
+        &self,
         func_idx: u32,
         body: &Expr,
         debug_info: &FunctionDebugInfo,
@@ -1928,223 +982,16 @@ impl<'a> ModuleCompiler<'a> {
             .find(|(idx, _)| *idx == func_idx)
             .map(|(_, span)| offset_to_line(source, span.start) as i64)
             .unwrap_or_else(|| expr_start_line(body, source));
-        let snapshottable_locals = debug_info
-            .bindings
-            .iter()
-            .map(|binding| binding.local_index)
-            .collect::<std::collections::HashSet<_>>();
-        let visible_bindings =
-            self.persisted_debug_bindings(&debug_info.bindings, &snapshottable_locals);
-        let debug_resume_state_offset = self.register_debug_resume_frame(
-            func_idx,
-            self.func_debug_names
-                .get(&func_idx)
-                .cloned()
-                .unwrap_or_else(|| format!("lambda#{}", func_idx)),
-            subprogram_start_line,
-            visible_bindings.clone(),
-        )?;
 
         Some(ActiveDebugHookContext {
             subprogram_start_line,
-            visible_bindings,
-            debug_resume_state_offset,
+            bindings: debug_info.bindings.clone(),
+            snapshottable_locals: debug_info
+                .bindings
+                .iter()
+                .map(|binding| binding.local_index)
+                .collect(),
         })
-    }
-
-    fn register_debug_resume_frame(
-        &mut self,
-        func_idx: u32,
-        name: String,
-        start_line: i64,
-        bindings: Vec<DebugBinding>,
-    ) -> Option<u32> {
-        if !self.options.emit_debug_hooks || bindings.is_empty() {
-            return None;
-        }
-
-        if let Some(frame) = self
-            .debug_resume_frames
-            .iter()
-            .find(|frame| frame.func_idx == func_idx)
-        {
-            return Some(frame.state_offset);
-        }
-
-        let state_offset = self.alloc_debug_resume_state(bindings.len() as u32);
-        self.debug_resume_frames.push(DebugResumeFramePlan {
-            func_idx,
-            name,
-            start_line,
-            bindings,
-            state_offset,
-        });
-        Some(state_offset)
-    }
-
-    fn emit_debug_resume_section(&self, module: &mut Module) {
-        if self.debug_resume_frames.is_empty() {
-            return;
-        }
-
-        let mut json = String::from("{\"version\":1,\"frameHeaderBytes\":");
-        json.push_str(&DEBUG_RESUME_HEADER_BYTES.to_string());
-        json.push_str(",\"frames\":[");
-
-        for (index, frame) in self.debug_resume_frames.iter().enumerate() {
-            if index > 0 {
-                json.push(',');
-            }
-
-            let state_offset = frame.state_offset;
-            let byte_size = DEBUG_RESUME_HEADER_BYTES + (frame.bindings.len() as u32 * 4);
-            json.push_str(&format!(
-                "{{\"funcIndex\":{},\"name\":\"{}\",\"startLine\":{},\"stateOffset\":{},\"byteSize\":{},\"slotCount\":{},\"bindings\":[",
-                frame.func_idx,
-                frame.name.replace('\\', "\\\\").replace('"', "\\\""),
-                frame.start_line,
-                state_offset,
-                byte_size,
-                frame.bindings.len()
-            ));
-
-            for (binding_index, binding) in frame.bindings.iter().enumerate() {
-                if binding_index > 0 {
-                    json.push(',');
-                }
-                let kind = match binding.kind {
-                    DebugBindingKind::Parameter => "parameter",
-                    DebugBindingKind::Variable => "variable",
-                };
-                json.push_str(&format!(
-                    "{{\"name\":\"{}\",\"localIndex\":{},\"declLine\":{},\"kind\":\"{}\"}}",
-                    binding.name.replace('\\', "\\\\").replace('"', "\\\""),
-                    binding.local_index,
-                    binding.decl_line,
-                    kind
-                ));
-            }
-
-            json.push_str("]}");
-        }
-
-        json.push_str("]}");
-        let section = CustomSection {
-            name: "kettu-debug-resume".into(),
-            data: Cow::Owned(json.into_bytes()),
-        };
-        module.section(&section);
-    }
-
-    fn emit_embedded_debug_source_sections(&self, module: &mut Module) {
-        if !self.options.emit_dwarf {
-            return;
-        }
-
-        let Some(source) = self.options.debug_source.as_deref() else {
-            return;
-        };
-
-        let source_section = CustomSection {
-            name: "kettu-debug-source".into(),
-            data: Cow::Owned(source.as_bytes().to_vec()),
-        };
-        module.section(&source_section);
-
-        if let Some(path) = self.options.debug_path.as_deref() {
-            let path_section = CustomSection {
-                name: "kettu-debug-path".into(),
-                data: Cow::Owned(path.as_bytes().to_vec()),
-            };
-            module.section(&path_section);
-        }
-    }
-
-    fn emit_contracts_section(&self, module: &mut Module, file: &WitFile) {
-        let mut json = String::from("{\"version\":1,\"functions\":{");
-
-        let mut first_func = true;
-        for item in &file.items {
-            if let TopLevelItem::Interface(iface) = item {
-                for iface_item in &iface.items {
-                    if let InterfaceItem::Func(func) = iface_item {
-                        let constrained_params: Vec<&Param> = func
-                            .params
-                            .iter()
-                            .filter(|p| p.constraint.is_some())
-                            .collect();
-                        if constrained_params.is_empty() {
-                            continue;
-                        }
-
-                        if !first_func {
-                            json.push(',');
-                        }
-                        first_func = false;
-
-                        json.push_str(&format!("\"{}\":[", func.name.name));
-                        let mut first_param = true;
-                        for param in &constrained_params {
-                            if !first_param {
-                                json.push(',');
-                            }
-                            first_param = false;
-                            let constraint_str =
-                                self.fmt_constraint_expr(param.constraint.as_ref().unwrap());
-                            json.push_str(&format!(
-                                "{{\"name\":\"{}\",\"type\":\"{}\",\"constraint\":\"{}\"}}",
-                                param.name.name,
-                                self.fmt_ty(&param.ty),
-                                constraint_str.replace('\\', "\\\\").replace('"', "\\\"")
-                            ));
-                        }
-                        json.push(']');
-                    }
-                }
-            }
-        }
-
-        json.push_str("}}");
-
-        if !first_func {
-            let section = CustomSection {
-                name: "kettu-contracts".into(),
-                data: std::borrow::Cow::Owned(json.into_bytes()),
-            };
-            module.section(&section);
-        }
-    }
-
-    fn fmt_ty(&self, ty: &Ty) -> String {
-        match ty {
-            Ty::Primitive(p, _) => match p {
-                PrimitiveTy::U8 => "u8",
-                PrimitiveTy::U16 => "u16",
-                PrimitiveTy::U32 => "u32",
-                PrimitiveTy::U64 => "u64",
-                PrimitiveTy::S8 => "s8",
-                PrimitiveTy::S16 => "s16",
-                PrimitiveTy::S32 => "s32",
-                PrimitiveTy::S64 => "s64",
-                PrimitiveTy::F32 => "f32",
-                PrimitiveTy::F64 => "f64",
-                PrimitiveTy::Bool => "bool",
-                PrimitiveTy::Char => "char",
-                PrimitiveTy::String => "string",
-                PrimitiveTy::V128 => "v128",
-            }
-            .to_string(),
-            Ty::Named(id) => id.name.clone(),
-            Ty::List { .. } => "list".to_string(),
-            Ty::Option { .. } => "option".to_string(),
-            Ty::Result { .. } => "result".to_string(),
-            Ty::Tuple { .. } => "tuple".to_string(),
-            Ty::Future { .. } => "future".to_string(),
-            Ty::Stream { .. } => "stream".to_string(),
-            Ty::Generic { name, .. } => name.name.clone(),
-            Ty::Own { resource, .. } => format!("own<{}>", resource.name),
-            Ty::Borrow { resource, .. } => format!("borrow<{}>", resource.name),
-        }
     }
 
     fn emit_name_section(&self, module: &mut Module) {
@@ -2457,45 +1304,6 @@ impl<'a> ModuleCompiler<'a> {
         // Phase 0: Pre-register async imports (must be before collect_definitions)
         self.preregister_async_imports(file)?;
 
-        // Phase 0b: Pre-register contract fail import if any function has constraints
-        // Must be before collect_definitions so import_count is correct for function indices
-        let has_constraints = file.items.iter().any(|item| {
-            if let TopLevelItem::Interface(iface) = item {
-                let has_alias_constraints = iface.items.iter().any(|ii| {
-                    if let InterfaceItem::TypeDef(TypeDef {
-                        kind:
-                            TypeDefKind::Alias {
-                                constraint: Some(_),
-                                ..
-                            },
-                        ..
-                    }) = ii
-                    {
-                        true
-                    } else {
-                        false
-                    }
-                });
-                let has_param_constraints = iface.items.iter().any(|ii| {
-                    if let InterfaceItem::Func(func) = ii {
-                        func.params.iter().any(|p| p.constraint.is_some())
-                            || func
-                                .result
-                                .as_ref()
-                                .map_or(false, |r| matches!(r, Ty::Named(_)))
-                    } else {
-                        false
-                    }
-                });
-                has_alias_constraints || has_param_constraints
-            } else {
-                false
-            }
-        });
-        if has_constraints {
-            self.ensure_contract_fail_import();
-        }
-
         // Phase 1: Collect definitions (function signatures, imports)
         self.collect_definitions(file)?;
 
@@ -2505,13 +1313,12 @@ impl<'a> ModuleCompiler<'a> {
         self.ensure_arena_reset_func();
 
         // Phase 3: Pre-compile all function bodies (discovers lambdas)
-        let bodies = std::mem::take(&mut self.func_bodies);
+        let bodies = self.func_bodies.clone();
         let mut compiled_funcs: Vec<Function> = Vec::new();
         for (_, func) in &bodies {
             let function = self.compile_function(func)?;
             compiled_funcs.push(function);
         }
-        self.func_bodies = bodies;
         let initial_heap_offset = self.string_offset;
 
         // Phase 4: Compile lambda bodies
@@ -2561,17 +1368,15 @@ impl<'a> ModuleCompiler<'a> {
                     None
                 };
                 self.with_active_debug_hook_context(debug_context, |compiler| {
-                    compiler.with_active_constant_locals(Some(HashMap::new()), |compiler| {
-                        if let Some(key) = debug_runtime_key {
-                            compiler.emit_debug_enter_hook(&mut func, key);
-                        }
-                        compiler.emit_debug_line_hook_for_expr(&mut func, body);
-                        compiler.compile_expr_with_locals(&mut func, body, &locals, &locals_types)?;
-                        if let Some(key) = debug_runtime_key {
-                            compiler.emit_debug_exit_hook(&mut func, key);
-                        }
-                        Ok(())
-                    })
+                    if let Some(key) = debug_runtime_key {
+                        compiler.emit_debug_enter_hook(&mut func, key);
+                    }
+                    compiler.emit_debug_line_hook_for_expr(&mut func, body);
+                    compiler.compile_expr_with_locals(&mut func, body, &locals, &locals_types)?;
+                    if let Some(key) = debug_runtime_key {
+                        compiler.emit_debug_exit_hook(&mut func, key);
+                    }
+                    Ok(())
                 })?;
                 func.instruction(&Instruction::End);
                 compiled_lambdas.push(func);
@@ -2585,9 +1390,9 @@ impl<'a> ModuleCompiler<'a> {
         let has_lambdas = !compiled_lambdas.is_empty();
 
         // Phase 4b: Compile async callback bodies
-        let callback_bodies = std::mem::take(&mut self.callback_bodies);
+        let callback_bodies_clone = self.callback_bodies.clone();
         let mut compiled_callbacks: Vec<Function> = Vec::new();
-        for (func_name, _original_func, num_locals) in &callback_bodies {
+        for (func_name, _original_func, num_locals) in &callback_bodies_clone {
             // Callback signature: (event: i32, p1: i32, p2: i32) -> i32
             // For now, callbacks just return DONE status
             // Full implementation would restore state and resume execution
@@ -2607,7 +1412,6 @@ impl<'a> ModuleCompiler<'a> {
             callback.instruction(&Instruction::End);
             compiled_callbacks.push(callback);
         }
-        self.callback_bodies = callback_bodies;
         let _has_callbacks = !compiled_callbacks.is_empty();
 
         // Phase 4c: Compile spawn bodies
@@ -2617,40 +1421,37 @@ impl<'a> ModuleCompiler<'a> {
             let mut locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();
             let locals: HashMap<String, u32> = HashMap::new();
             let mut func = Function::new(vec![(16, ValType::I32)]);
-            self.with_active_constant_locals(Some(HashMap::new()), |compiler| {
-                for stmt in body_stmts {
-                    compiler.emit_debug_line_hook_for_statement(&mut func, stmt);
-                    match stmt {
-                        Statement::Expr(e) => {
-                            compiler.compile_expr_with_locals(&mut func, e, &locals, &locals_types)?;
-                            func.instruction(&Instruction::Drop);
-                        }
-                        Statement::Let { name: _, value, .. } => {
-                            compiler.compile_expr_with_locals(&mut func, value, &locals, &locals_types)?;
-                            func.instruction(&Instruction::Drop);
-                        }
-                        Statement::GuardLet {
-                            value, else_body, ..
-                        } => {
-                            compiler.compile_guard_let_statement(&mut func, value, else_body)?;
-                        }
-                        Statement::Guard {
+            for stmt in body_stmts {
+                self.emit_debug_line_hook_for_statement(&mut func, stmt);
+                match stmt {
+                    Statement::Expr(e) => {
+                        self.compile_expr_with_locals(&mut func, e, &locals, &locals_types)?;
+                        func.instruction(&Instruction::Drop);
+                    }
+                    Statement::Let { name: _, value, .. } => {
+                        self.compile_expr_with_locals(&mut func, value, &locals, &locals_types)?;
+                        func.instruction(&Instruction::Drop);
+                    }
+                    Statement::GuardLet {
+                        value, else_body, ..
+                    } => {
+                        self.compile_guard_let_statement(&mut func, value, else_body)?;
+                    }
+                    Statement::Guard {
+                        condition,
+                        else_body,
+                    } => {
+                        self.compile_guard_statement_with_locals(
+                            &mut func,
                             condition,
                             else_body,
-                        } => {
-                            compiler.compile_guard_statement_with_locals(
-                                &mut func,
-                                condition,
-                                else_body,
-                                &locals,
-                                &mut locals_types,
-                            )?;
-                        }
-                        _ => {}
+                            &locals,
+                            &mut locals_types,
+                        )?;
                     }
+                    _ => {}
                 }
-                Ok(())
-            })?;
+            }
             func.instruction(&Instruction::End);
             compiled_spawns.push(func);
         }
@@ -2676,18 +1477,6 @@ impl<'a> ModuleCompiler<'a> {
             let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
             imports.import("kettu:debug", "line", EntityType::Function(type_idx));
         }
-        if self.debug_pause_probe_idx.is_some() {
-            let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[ValType::I32]);
-            imports.import("kettu:debug", "should_pause", EntityType::Function(type_idx));
-        }
-        if self.debug_pause_idx.is_some() {
-            let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
-            imports.import("kettu:debug", "pause", EntityType::Function(type_idx));
-        }
-        if self.debug_yield_idx.is_some() {
-            let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
-            imports.import("kettu:debug", "yield", EntityType::Function(type_idx));
-        }
         if self.debug_value_hook_idx.is_some() {
             let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
             imports.import("kettu:debug", "local", EntityType::Function(type_idx));
@@ -2699,10 +1488,6 @@ impl<'a> ModuleCompiler<'a> {
         if self.debug_exit_hook_idx.is_some() {
             let type_idx = self.get_or_create_type(&[ValType::I32], &[]);
             imports.import("kettu:debug", "exit", EntityType::Function(type_idx));
-        }
-        if self.contract_fail_idx.is_some() {
-            let type_idx = self.get_or_create_type(&[ValType::I32, ValType::I32], &[]);
-            imports.import("kettu:contract", "fail", EntityType::Function(type_idx));
         }
 
         // Add interface function imports
@@ -2829,7 +1614,7 @@ impl<'a> ModuleCompiler<'a> {
         // Callback signature: (event: i32, p1: i32, p2: i32) -> i32
         let callback_type_idx =
             self.get_or_create_type(&[ValType::I32, ValType::I32, ValType::I32], &[ValType::I32]);
-        for _ in &self.callback_bodies {
+        for _ in &callback_bodies_clone {
             funcs.function(callback_type_idx);
         }
         // Spawn body function types
@@ -2843,7 +1628,7 @@ impl<'a> ModuleCompiler<'a> {
         }
         if self.local_func_count > 0
             || has_lambdas
-            || !self.callback_bodies.is_empty()
+            || !callback_bodies_clone.is_empty()
             || has_spawns
         {
             module.section(&funcs);
@@ -2884,16 +1669,6 @@ impl<'a> ModuleCompiler<'a> {
             },
             &wasm_encoder::ConstExpr::i32_const(self.string_offset as i32),
         );
-        for _ in 0..self.debug_resume_state_globals.len() {
-            globals.global(
-                GlobalType {
-                    val_type: ValType::I32,
-                    mutable: true,
-                    shared: false,
-                },
-                &wasm_encoder::ConstExpr::i32_const(0),
-            );
-        }
         module.section(&globals);
 
         // 7. Export section
@@ -2906,7 +1681,7 @@ impl<'a> ModuleCompiler<'a> {
             let wts_idx = self.import_count
                 + self.local_func_count
                 + self.lambda_bodies.len() as u32
-                + self.callback_bodies.len() as u32
+                + callback_bodies_clone.len() as u32
                 + self.spawn_bodies.len() as u32;
             exports.export("wasi_thread_start", ExportKind::Func, wts_idx);
         }
@@ -2953,7 +1728,7 @@ impl<'a> ModuleCompiler<'a> {
         for func in compiled_callbacks {
             code.function(&func);
         }
-        if self.local_func_count > 0 || has_lambdas || !self.callback_bodies.is_empty() {
+        if self.local_func_count > 0 || has_lambdas || !callback_bodies_clone.is_empty() {
             module.section(&code);
         }
 
@@ -2974,16 +1749,6 @@ impl<'a> ModuleCompiler<'a> {
         if self.options.keep_names || self.options.emit_dwarf {
             self.emit_name_section(&mut module);
         }
-
-        // 12. Contract metadata custom section
-        self.emit_contracts_section(&mut module, file);
-
-        // 13. Debug-resume metadata custom section
-        self.emit_debug_resume_section(&mut module);
-
-        // 14. Embedded debug source/path sections for artifact-first DAP launches
-        self.emit_embedded_debug_source_sections(&mut module);
-
         if self.options.emit_dwarf {
             let mut wasm = module.finish();
             self.emit_debug_sections(&mut wasm)?;
@@ -3016,31 +1781,6 @@ impl<'a> ModuleCompiler<'a> {
                 format!("{}:{}", namespace, name)
             })
             .unwrap_or_else(|| "local:component".to_string());
-
-        // Collect constrained type aliases
-        for item in &file.items {
-            if let TopLevelItem::Interface(iface) = item {
-                for iface_item in &iface.items {
-                    if let InterfaceItem::TypeDef(TypeDef {
-                        kind:
-                            TypeDefKind::Alias {
-                                name,
-                                constraint: Some(constraint),
-                                ..
-                            },
-                        ..
-                    }) = iface_item
-                    {
-                        self.type_aliases.insert(
-                            name.name.clone(),
-                            TypeAliasInfo {
-                                constraint: constraint.clone(),
-                            },
-                        );
-                    }
-                }
-            }
-        }
 
         for item in &file.items {
             if let TopLevelItem::Interface(iface) = item {
@@ -3112,9 +1852,6 @@ impl<'a> ModuleCompiler<'a> {
                                     // Register in functions map
                                     self.functions
                                         .insert(internal_name.clone(), (type_idx, func_idx, false));
-                                    self.functions
-                                        .entry(resource_name.clone())
-                                        .or_insert((type_idx, func_idx, false));
                                     let export_name = format!(
                                         "{}/{}#[constructor]{}",
                                         package_path, iface.name.name, resource_name
@@ -3140,7 +1877,6 @@ impl<'a> ModuleCompiler<'a> {
                                             span: func.name.span.clone(),
                                         },
                                         ty: Ty::Primitive(PrimitiveTy::S32, func.name.span.clone()),
-                                        constraint: None,
                                     }];
                                     params_with_self.extend(func.params.clone());
 
@@ -4371,54 +3107,15 @@ impl<'a> ModuleCompiler<'a> {
         let debug_context = if let Some(source) = self.options.debug_source.as_deref() {
             let debug_info = build_function_debug_info(func, &locals, source);
             self.func_debug_info.insert(func_idx, debug_info.clone());
-            self.active_debug_hook_context_for_function(
-                func_idx,
-                func,
-                &debug_info,
-                &locals,
-                &v128_locals,
-            )?
+            self.active_debug_hook_context_for_function(func, &debug_info, &locals, &v128_locals)?
         } else {
             None
         };
-        let resumable_test = if debug_context.is_some()
-            && (self.is_resumable_test_function(func) || self.is_resumable_helper_function(func))
-        {
-            Some(ResumableTestContext {
-                state_global_idx: self.ensure_debug_resume_state_global(func_idx),
-            })
-        } else {
-            None
-        };
-        let resumable_function_context = resumable_test.map(|context| ActiveResumableFunctionContext {
-            state_global_idx: context.state_global_idx,
-            allows_helper_calls: self.is_resumable_test_function(func),
-            is_async: func.is_async,
-            result_ty: func.result.clone(),
-            span: func.span.clone(),
-        });
 
         // Declare locals with correct types (v128 for SIMD, i32 for everything else)
         // +1 for temp record pointer
         // +3 for match expressions (scrutinee + binding + spare)
-        let has_return_constraint = func
-            .result
-            .as_ref()
-            .map(|ty| self.resolve_type_constraint(ty).is_some())
-            .unwrap_or(false);
-        let is_result_return = func
-            .result
-            .as_ref()
-            .map_or(false, |ty| matches!(ty, Ty::Result { .. }));
-        let extra_locals = 4 + if has_return_constraint {
-            if is_result_return {
-                2
-            } else {
-                1
-            }
-        } else {
-            0
-        };
+        let extra_locals = 4;
         let total_declared = let_count + extra_locals + num_string_conversions;
         let local_types: Vec<_> = (0..total_declared)
             .map(|i| {
@@ -4474,82 +3171,181 @@ impl<'a> ModuleCompiler<'a> {
             function.instruction(&Instruction::LocalSet(synth_idx));
         }
 
-        // Emit constraint checks for parameters with where clauses
-        self.emit_constraint_checks(&mut function, func, &locals);
-
         // Track type info for record variables
         let mut locals_types: HashMap<String, RecordTypeInfo> = HashMap::new();
 
         self.with_active_debug_hook_context(debug_context, |compiler| {
-            compiler.with_active_constant_locals(Some(HashMap::new()), |compiler| {
-                compiler.with_active_resumable_function_context(
-                    resumable_function_context,
-                    |compiler| {
-                        if let Some(resumable_test) = resumable_test {
-                            compiler.emit_restore_resumable_test_locals(
-                                &mut function,
-                                resumable_test.state_global_idx,
-                            );
-                        }
-                        if let Some(ref body) = func.body {
-                            let stmts = &body.statements;
-                            if !stmts.is_empty() {
-                                for (statement_index, stmt) in
-                                    stmts[..stmts.len() - 1].iter().enumerate()
-                                {
-                                    let statement_pc = (statement_index + 1) as u32;
-                                    compiler.with_active_resumable_statement_context(
-                                        resumable_test.map(|_| ActiveResumableStatementContext {
-                                            statement_pc,
-                                        }),
-                                        |compiler| {
-                                            compiler.compile_top_level_statement_with_resume(
-                                                &mut function,
-                                                func,
-                                                stmt,
-                                                statement_pc,
-                                                resumable_test,
-                                                &locals,
-                                                &mut locals_types,
-                                            )
-                                        },
-                                    )?;
-                                }
-
-                                let last = &stmts[stmts.len() - 1];
-                                let statement_pc = stmts.len() as u32;
-                                compiler.with_active_resumable_statement_context(
-                                    resumable_test.map(|_| ActiveResumableStatementContext {
-                                        statement_pc,
-                                    }),
-                                    |compiler| {
-                                        compiler.compile_function_last_statement(
-                                            &mut function,
-                                            func,
-                                            last,
-                                            statement_pc,
-                                            resumable_test,
-                                            &locals,
-                                            &mut locals_types,
-                                        )
-                                    },
-                                )?;
+            if let Some(ref body) = func.body {
+                let stmts = &body.statements;
+                if !stmts.is_empty() {
+                    // Compile all but last statement normally
+                    for stmt in &stmts[..stmts.len() - 1] {
+                        compiler.compile_statement_with_locals(
+                            &mut function,
+                            stmt,
+                            &locals,
+                            &mut locals_types,
+                        )?;
+                    }
+                    // Last statement: if it's an expression, leave value on stack for return
+                    let last = &stmts[stmts.len() - 1];
+                    compiler.emit_debug_line_hook_for_statement(&mut function, last);
+                    match last {
+                        Statement::CompoundAssign { name, op, value } => {
+                            // Compile as: local.get + value + op + local.set
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalGet(idx));
                             }
-                        } else if (func.is_async && compiler.options.wasip3)
-                            || func.result.is_some()
-                        {
+                            compiler.compile_expr_with_locals(
+                                &mut function,
+                                value,
+                                &locals,
+                                &locals_types,
+                            )?;
+                            match op {
+                                BinOp::Add => function.instruction(&Instruction::I32Add),
+                                BinOp::Sub => function.instruction(&Instruction::I32Sub),
+                                _ => function.instruction(&Instruction::I32Add),
+                            };
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalSet(idx));
+                            }
                             function.instruction(&Instruction::I32Const(0));
                         }
-                        if let Some(resumable_test) = resumable_test {
-                            function.instruction(&Instruction::I32Const(0));
-                            function.instruction(&Instruction::GlobalSet(
-                                resumable_test.state_global_idx,
-                            ));
+                        Statement::Expr(expr) => {
+                            compiler.compile_expr_with_locals(
+                                &mut function,
+                                expr,
+                                &locals,
+                                &locals_types,
+                            )?;
+
+                            if func.is_async && compiler.options.wasip3 {
+                                if let Some(ref result_ty) = func.result {
+                                    let result_valtype = compiler.ty_to_valtype(result_ty)?;
+                                    let task_return_idx =
+                                        compiler.ensure_task_return_import(&[result_valtype]);
+                                    function.instruction(&Instruction::Call(task_return_idx));
+                                }
+                                function.instruction(&Instruction::I32Const(0));
+                            }
                         }
-                        Ok(())
-                    },
-                )
-            })
+                        Statement::Return(Some(expr)) => {
+                            compiler.compile_expr_with_locals(
+                                &mut function,
+                                expr,
+                                &locals,
+                                &locals_types,
+                            )?;
+
+                            if func.is_async && compiler.options.wasip3 {
+                                if let Some(ref result_ty) = func.result {
+                                    let result_valtype = compiler.ty_to_valtype(result_ty)?;
+                                    let task_return_idx =
+                                        compiler.ensure_task_return_import(&[result_valtype]);
+                                    function.instruction(&Instruction::Call(task_return_idx));
+                                }
+                                function.instruction(&Instruction::I32Const(0));
+                                function.instruction(&Instruction::Return);
+                            } else {
+                                function.instruction(&Instruction::Return);
+                            }
+                        }
+                        Statement::Return(None) => {
+                            if func.is_async && compiler.options.wasip3 {
+                                let task_return_idx = compiler.ensure_task_return_import(&[]);
+                                function.instruction(&Instruction::Call(task_return_idx));
+                                function.instruction(&Instruction::I32Const(0));
+                            }
+                            function.instruction(&Instruction::Return);
+                        }
+                        Statement::Let { name, value } => {
+                            if let Expr::RecordLiteral { fields, .. } = value {
+                                let field_info: Vec<_> = fields
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, (field_name, _))| (field_name.name.clone(), i * 4))
+                                    .collect();
+                                locals_types.insert(
+                                    name.name.clone(),
+                                    RecordTypeInfo::from_fields(&field_info),
+                                );
+                            }
+                            compiler.compile_expr_with_locals(
+                                &mut function,
+                                value,
+                                &locals,
+                                &locals_types,
+                            )?;
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalSet(idx));
+                            }
+                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
+                                function.instruction(&Instruction::I32Const(0));
+                            }
+                        }
+                        Statement::Assign { name, value } => {
+                            compiler.compile_expr_with_locals(
+                                &mut function,
+                                value,
+                                &locals,
+                                &locals_types,
+                            )?;
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalSet(idx));
+                            }
+                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
+                                function.instruction(&Instruction::I32Const(0));
+                            }
+                        }
+                        Statement::Break { .. } | Statement::Continue { .. } => {
+                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
+                                function.instruction(&Instruction::I32Const(0));
+                            }
+                        }
+                        Statement::SharedLet { .. } => {
+                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
+                                function.instruction(&Instruction::I32Const(0));
+                            }
+                        }
+                        Statement::GuardLet {
+                            name,
+                            value,
+                            else_body,
+                        } => {
+                            compiler.compile_guard_let_statement_with_locals(
+                                &mut function,
+                                name,
+                                value,
+                                else_body,
+                                &locals,
+                                &mut locals_types,
+                            )?;
+                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
+                                function.instruction(&Instruction::I32Const(0));
+                            }
+                        }
+                        Statement::Guard {
+                            condition,
+                            else_body,
+                        } => {
+                            compiler.compile_guard_statement_with_locals(
+                                &mut function,
+                                condition,
+                                else_body,
+                                &locals,
+                                &mut locals_types,
+                            )?;
+                            if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
+                                function.instruction(&Instruction::I32Const(0));
+                            }
+                        }
+                    }
+                } else if (func.is_async && compiler.options.wasip3) || func.result.is_some() {
+                    function.instruction(&Instruction::I32Const(0));
+                }
+            }
+            Ok(())
         })?;
 
         // If this async function has await points, register a callback export
@@ -4560,20 +3356,6 @@ impl<'a> ModuleCompiler<'a> {
                 self.emit_async_callback(&func.name.name, func, _state_offset, num_locals)?;
             // The entry function compilation already handles await with blocking wait
             // The callback will be invoked for non-blocking resumption (future work)
-        }
-
-        // Return constraint check for tail expression returns
-        if let Some(ref result_ty) = func.result {
-            if self.resolve_type_constraint(result_ty).is_some() {
-                if let Some(ref body) = func.body {
-                    if !body.statements.is_empty() {
-                        let last = &body.statements[body.statements.len() - 1];
-                        if matches!(last, Statement::Expr(_)) {
-                            self.emit_return_constraint_check(&mut function, func, &locals);
-                        }
-                    }
-                }
-            }
         }
 
         // Ensure function ends properly
@@ -4665,12 +3447,9 @@ impl<'a> ModuleCompiler<'a> {
         function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         self.enter_nested_control_block();
         let mut guard_locals_types = locals_types.clone();
-        self.with_active_constant_locals(self.active_constant_locals.clone(), |compiler| {
-            for stmt in else_body {
-                compiler.compile_statement_with_locals(function, stmt, locals, &mut guard_locals_types)?;
-            }
-            Ok(())
-        })?;
+        for stmt in else_body {
+            self.compile_statement_with_locals(function, stmt, locals, &mut guard_locals_types)?;
+        }
         self.exit_nested_control_block();
         function.instruction(&Instruction::Else);
         function.instruction(&Instruction::LocalGet(binding_idx));
@@ -4697,12 +3476,9 @@ impl<'a> ModuleCompiler<'a> {
         function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         self.enter_nested_control_block();
         let mut guard_locals_types = locals_types.clone();
-        self.with_active_constant_locals(self.active_constant_locals.clone(), |compiler| {
-            for stmt in else_body {
-                compiler.compile_statement_with_locals(function, stmt, locals, &mut guard_locals_types)?;
-            }
-            Ok(())
-        })?;
+        for stmt in else_body {
+            self.compile_statement_with_locals(function, stmt, locals, &mut guard_locals_types)?;
+        }
         self.exit_nested_control_block();
         function.instruction(&Instruction::End);
         Ok(())
@@ -4779,395 +3555,6 @@ impl<'a> ModuleCompiler<'a> {
         Ok(())
     }
 
-    fn emit_constraint_checks(
-        &mut self,
-        function: &mut Function,
-        func: &Func,
-        locals: &HashMap<String, u32>,
-    ) {
-        let mut any = false;
-        for param in &func.params {
-            if param.constraint.is_some() || self.resolve_type_constraint(&param.ty).is_some() {
-                any = true;
-                break;
-            }
-        }
-        if !any {
-            return;
-        }
-
-        let is_result_return = func
-            .result
-            .as_ref()
-            .map_or(false, |ty| matches!(ty, Ty::Result { .. }));
-
-        let contract_fail_idx = self.ensure_contract_fail_import();
-
-        for param in &func.params {
-            if let Some(constraint) = &param.constraint {
-                let msg = format!(
-                    "{} does not satisfy the constraint \"{}\"",
-                    param.name.name,
-                    self.fmt_constraint_expr(constraint)
-                );
-                let (msg_ptr, msg_len) = self.register_string(&msg);
-                self.compile_constraint_expr(function, constraint, locals);
-                function.instruction(&Instruction::I32Eqz);
-                function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-                if is_result_return {
-                    self.emit_result_err_return(function, msg_ptr, msg_len);
-                } else {
-                    function.instruction(&Instruction::I32Const(msg_ptr as i32));
-                    function.instruction(&Instruction::I32Const(msg_len as i32));
-                    function.instruction(&Instruction::Call(contract_fail_idx));
-                    function.instruction(&Instruction::Unreachable);
-                }
-                function.instruction(&Instruction::End);
-            }
-
-            if let Some(alias_constraint) = self.resolve_type_constraint(&param.ty) {
-                let substituted =
-                    Self::substitute_expr_ident(&alias_constraint, "it", &param.name.name);
-                let msg = format!(
-                    "{} does not satisfy the constraint \"{}\"",
-                    param.name.name,
-                    self.fmt_constraint_expr(&substituted)
-                );
-                let (msg_ptr, msg_len) = self.register_string(&msg);
-                self.compile_constraint_expr(function, &substituted, locals);
-                function.instruction(&Instruction::I32Eqz);
-                function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-                if is_result_return {
-                    self.emit_result_err_return(function, msg_ptr, msg_len);
-                } else {
-                    function.instruction(&Instruction::I32Const(msg_ptr as i32));
-                    function.instruction(&Instruction::I32Const(msg_len as i32));
-                    function.instruction(&Instruction::Call(contract_fail_idx));
-                    function.instruction(&Instruction::Unreachable);
-                }
-                function.instruction(&Instruction::End);
-            }
-        }
-    }
-
-    fn emit_result_err_return(&mut self, function: &mut Function, msg_ptr: u32, _msg_len: u32) {
-        let alloc_idx = self
-            .alloc_func_idx
-            .unwrap_or_else(|| self.ensure_alloc_func());
-        let err_discriminant = Self::variant_discriminant("err");
-
-        function.instruction(&Instruction::I32Const(0));
-        function.instruction(&Instruction::I32Const(0));
-        function.instruction(&Instruction::I32Const(0));
-        function.instruction(&Instruction::I32Const(8));
-        function.instruction(&Instruction::Call(alloc_idx));
-
-        function.instruction(&Instruction::LocalTee(0));
-        function.instruction(&Instruction::I32Const(err_discriminant));
-        function.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
-            offset: 0,
-            align: 2,
-            memory_index: 0,
-        }));
-
-        function.instruction(&Instruction::LocalGet(0));
-        function.instruction(&Instruction::I32Const(msg_ptr as i32));
-        function.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
-            offset: 4,
-            align: 2,
-            memory_index: 0,
-        }));
-
-        function.instruction(&Instruction::LocalGet(0));
-        function.instruction(&Instruction::Return);
-    }
-
-    fn compile_constraint_expr(
-        &mut self,
-        function: &mut Function,
-        expr: &Expr,
-        locals: &HashMap<String, u32>,
-    ) {
-        match expr {
-            Expr::Ident(id) => {
-                if let Some(&idx) = locals.get(&id.name) {
-                    function.instruction(&Instruction::LocalGet(idx));
-                } else {
-                    function.instruction(&Instruction::I32Const(0));
-                }
-            }
-            Expr::Integer(n, _) => {
-                function.instruction(&Instruction::I32Const(*n as i32));
-            }
-            Expr::Binary { lhs, op, rhs, .. } => {
-                self.compile_constraint_expr(function, lhs, locals);
-                self.compile_constraint_expr(function, rhs, locals);
-                match op {
-                    BinOp::Gt => {
-                        function.instruction(&Instruction::I32GtS);
-                    }
-                    BinOp::Ge => {
-                        function.instruction(&Instruction::I32GeS);
-                    }
-                    BinOp::Lt => {
-                        function.instruction(&Instruction::I32LtS);
-                    }
-                    BinOp::Le => {
-                        function.instruction(&Instruction::I32LeS);
-                    }
-                    BinOp::Eq => {
-                        function.instruction(&Instruction::I32Eq);
-                    }
-                    BinOp::Ne => {
-                        function.instruction(&Instruction::I32Ne);
-                    }
-                    BinOp::And => {
-                        function.instruction(&Instruction::I32And);
-                    }
-                    BinOp::Or => {
-                        function.instruction(&Instruction::I32Or);
-                    }
-                    BinOp::Add => {
-                        function.instruction(&Instruction::I32Add);
-                    }
-                    BinOp::Sub => {
-                        function.instruction(&Instruction::I32Sub);
-                    }
-                    BinOp::Mul => {
-                        function.instruction(&Instruction::I32Mul);
-                    }
-                    BinOp::Div => {
-                        function.instruction(&Instruction::I32DivS);
-                    }
-                }
-            }
-            Expr::Not(inner, _) => {
-                self.compile_constraint_expr(function, inner, locals);
-                function.instruction(&Instruction::I32Eqz);
-            }
-            Expr::Neg(inner, _) => {
-                function.instruction(&Instruction::I32Const(0));
-                self.compile_constraint_expr(function, inner, locals);
-                function.instruction(&Instruction::I32Sub);
-            }
-            Expr::Bool(b, _) => {
-                function.instruction(&Instruction::I32Const(if *b { 1 } else { 0 }));
-            }
-            _ => {
-                function.instruction(&Instruction::I32Const(1));
-            }
-        }
-    }
-
-    fn fmt_constraint_expr(&self, expr: &Expr) -> String {
-        match expr {
-            Expr::Binary { lhs, op, rhs, .. } => {
-                format!(
-                    "{} {} {}",
-                    self.fmt_constraint_expr(lhs),
-                    match op {
-                        BinOp::Eq => "==",
-                        BinOp::Ne => "!=",
-                        BinOp::Lt => "<",
-                        BinOp::Le => "<=",
-                        BinOp::Gt => ">",
-                        BinOp::Ge => ">=",
-                        BinOp::And => "&&",
-                        BinOp::Or => "||",
-                        BinOp::Add => "+",
-                        BinOp::Sub => "-",
-                        BinOp::Mul => "*",
-                        BinOp::Div => "/",
-                    },
-                    self.fmt_constraint_expr(rhs)
-                )
-            }
-            Expr::Ident(id) => id.name.clone(),
-            Expr::Integer(n, _) => n.to_string(),
-            Expr::Not(inner, _) => format!("!{}", self.fmt_constraint_expr(inner)),
-            _ => "?".to_string(),
-        }
-    }
-
-    fn substitute_expr_ident(expr: &Expr, from: &str, to: &str) -> Expr {
-        match expr {
-            Expr::Ident(id) if id.name == from => Expr::Ident(Id {
-                name: to.to_string(),
-                span: id.span.clone(),
-            }),
-            Expr::Binary { lhs, op, rhs, span } => Expr::Binary {
-                lhs: Box::new(Self::substitute_expr_ident(lhs, from, to)),
-                op: *op,
-                rhs: Box::new(Self::substitute_expr_ident(rhs, from, to)),
-                span: span.clone(),
-            },
-            Expr::Not(inner, span) => Expr::Not(
-                Box::new(Self::substitute_expr_ident(inner, from, to)),
-                span.clone(),
-            ),
-            Expr::Neg(inner, span) => Expr::Neg(
-                Box::new(Self::substitute_expr_ident(inner, from, to)),
-                span.clone(),
-            ),
-            other => other.clone(),
-        }
-    }
-
-    fn emit_return_constraint_check(
-        &mut self,
-        function: &mut Function,
-        func: &Func,
-        locals: &HashMap<String, u32>,
-    ) {
-        let result_ty = match &func.result {
-            Some(ty) => ty,
-            None => return,
-        };
-
-        let constraint = self.resolve_type_constraint(result_ty);
-        let Some(constraint) = constraint else { return };
-
-        let is_result = matches!(result_ty, Ty::Result { .. });
-
-        let msg = format!(
-            "return value does not satisfy the constraint \"{}\"",
-            self.fmt_constraint_expr(&constraint)
-        );
-        let (msg_ptr, msg_len) = self.register_string(&msg);
-
-        let result_local = locals.values().copied().max().unwrap_or(0) + 1;
-        function.instruction(&Instruction::LocalSet(result_local));
-
-        if is_result {
-            function.instruction(&Instruction::LocalGet(result_local));
-            function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                offset: 0,
-                align: 2,
-                memory_index: 0,
-            }));
-            function.instruction(&Instruction::I32Eqz);
-            function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-
-            function.instruction(&Instruction::LocalGet(result_local));
-            function.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                offset: 4,
-                align: 2,
-                memory_index: 0,
-            }));
-            let payload_local = result_local + 1;
-            function.instruction(&Instruction::LocalSet(payload_local));
-            self.compile_return_constraint_expr(function, &constraint, payload_local);
-            function.instruction(&Instruction::I32Eqz);
-            function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-            self.emit_result_err_return(function, msg_ptr, msg_len);
-            function.instruction(&Instruction::End);
-
-            function.instruction(&Instruction::End);
-        } else {
-            self.compile_return_constraint_expr(function, &constraint, result_local);
-            function.instruction(&Instruction::I32Eqz);
-            function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-            let contract_fail_idx = self.ensure_contract_fail_import();
-            function.instruction(&Instruction::I32Const(msg_ptr as i32));
-            function.instruction(&Instruction::I32Const(msg_len as i32));
-            function.instruction(&Instruction::Call(contract_fail_idx));
-            function.instruction(&Instruction::Unreachable);
-            function.instruction(&Instruction::End);
-        }
-
-        function.instruction(&Instruction::LocalGet(result_local));
-    }
-
-    fn resolve_type_constraint(&self, ty: &Ty) -> Option<Expr> {
-        match ty {
-            Ty::Named(id) => {
-                let type_info = self.type_aliases.get(&id.name)?;
-                Some(type_info.constraint.clone())
-            }
-            Ty::Result { ok, .. } => {
-                if let Some(ok_ty) = ok {
-                    self.resolve_type_constraint(ok_ty)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn compile_return_constraint_expr(
-        &mut self,
-        function: &mut Function,
-        expr: &Expr,
-        result_local: u32,
-    ) {
-        match expr {
-            Expr::Ident(id) if id.name == "it" => {
-                function.instruction(&Instruction::LocalGet(result_local));
-            }
-            Expr::Binary { lhs, op, rhs, .. } => {
-                self.compile_return_constraint_expr(function, lhs, result_local);
-                self.compile_return_constraint_expr(function, rhs, result_local);
-                match op {
-                    BinOp::Gt => {
-                        function.instruction(&Instruction::I32GtS);
-                    }
-                    BinOp::Ge => {
-                        function.instruction(&Instruction::I32GeS);
-                    }
-                    BinOp::Lt => {
-                        function.instruction(&Instruction::I32LtS);
-                    }
-                    BinOp::Le => {
-                        function.instruction(&Instruction::I32LeS);
-                    }
-                    BinOp::Eq => {
-                        function.instruction(&Instruction::I32Eq);
-                    }
-                    BinOp::Ne => {
-                        function.instruction(&Instruction::I32Ne);
-                    }
-                    BinOp::And => {
-                        function.instruction(&Instruction::I32And);
-                    }
-                    BinOp::Or => {
-                        function.instruction(&Instruction::I32Or);
-                    }
-                    BinOp::Add => {
-                        function.instruction(&Instruction::I32Add);
-                    }
-                    BinOp::Sub => {
-                        function.instruction(&Instruction::I32Sub);
-                    }
-                    BinOp::Mul => {
-                        function.instruction(&Instruction::I32Mul);
-                    }
-                    BinOp::Div => {
-                        function.instruction(&Instruction::I32DivS);
-                    }
-                }
-            }
-            Expr::Integer(n, _) => {
-                function.instruction(&Instruction::I32Const(*n as i32));
-            }
-            Expr::Not(inner, _) => {
-                self.compile_return_constraint_expr(function, inner, result_local);
-                function.instruction(&Instruction::I32Eqz);
-            }
-            Expr::Neg(inner, _) => {
-                function.instruction(&Instruction::I32Const(0));
-                self.compile_return_constraint_expr(function, inner, result_local);
-                function.instruction(&Instruction::I32Sub);
-            }
-            Expr::Bool(b, _) => {
-                function.instruction(&Instruction::I32Const(if *b { 1 } else { 0 }));
-            }
-            _ => {
-                function.instruction(&Instruction::I32Const(1));
-            }
-        }
-    }
-
     fn compile_statement_with_locals(
         &mut self,
         function: &mut Function,
@@ -5175,20 +3562,7 @@ impl<'a> ModuleCompiler<'a> {
         locals: &HashMap<String, u32>,
         locals_types: &mut HashMap<String, RecordTypeInfo>,
     ) -> Result<(), CompileError> {
-        self.compile_statement_with_locals_inner(function, stmt, locals, locals_types, true)
-    }
-
-    fn compile_statement_with_locals_inner(
-        &mut self,
-        function: &mut Function,
-        stmt: &Statement,
-        locals: &HashMap<String, u32>,
-        locals_types: &mut HashMap<String, RecordTypeInfo>,
-        emit_debug_hook: bool,
-    ) -> Result<(), CompileError> {
-        if emit_debug_hook {
-            self.emit_debug_line_hook_for_statement(function, stmt);
-        }
+        self.emit_debug_line_hook_for_statement(function, stmt);
         match stmt {
             Statement::Expr(expr) => {
                 self.compile_expr_with_locals(function, expr, locals, locals_types)?;
@@ -5322,7 +3696,6 @@ impl<'a> ModuleCompiler<'a> {
                 )?;
             }
         }
-        self.apply_constant_statement_effect(stmt);
         Ok(())
     }
 
@@ -5800,7 +4173,7 @@ impl<'a> ModuleCompiler<'a> {
                 for (i, (_, expr)) in fields.iter().enumerate() {
                     // Duplicate pointer
                     function.instruction(&Instruction::LocalTee(0)); // Assume local 0 for temp
-                                                                     // Compile field value
+                    // Compile field value
                     self.compile_expr(function, expr)?;
                     // Store at offset
                     function.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
@@ -6588,23 +4961,9 @@ impl<'a> ModuleCompiler<'a> {
                     self.compile_expr_with_locals(function, arg, locals, locals_types)?;
                 }
                 if let Expr::Ident(id) = callee.as_ref() {
-                    if let Some((type_idx, func_idx, _)) = self.functions.get(&id.name).copied() {
-                        let resumable_helper_state_global_idx = self
-                            .resumable_helper_state_global_for_call(&id.name, func_idx, type_idx, args);
-                        let helper_result_local_idx = resumable_helper_state_global_idx.and_then(|_| {
-                            self.types
-                                .get(type_idx as usize)
-                                .and_then(|(_, results)| (!results.is_empty()).then_some(locals.len() as u32))
-                        });
+                    if let Some(&(_, func_idx, _)) = self.functions.get(&id.name) {
                         // Direct function call
                         function.instruction(&Instruction::Call(func_idx));
-                        if let Some(helper_state_global_idx) = resumable_helper_state_global_idx {
-                            self.emit_resumable_helper_call_boundary(
-                                function,
-                                helper_state_global_idx,
-                                helper_result_local_idx,
-                            )?;
-                        }
                     } else if let Some(&local_idx) = locals.get(&id.name) {
                         // Local variable holding a closure cell pointer
                         // Check if we know captures for this variable at compile time
@@ -7507,8 +5866,7 @@ impl<'a> ModuleCompiler<'a> {
                 //   )
                 // )
 
-                let analysis =
-                    analyze_range_loop_with_locals(&variable.name, range.as_ref(), self.active_constant_locals.as_ref());
+                let analysis = analyze_range_loop(&variable.name, range.as_ref());
                 if matches!(
                     analysis
                         .as_ref()
@@ -7570,17 +5928,15 @@ impl<'a> ModuleCompiler<'a> {
                     self.loop_continue_depth = Some(0);
 
                     // Compile body statements
-                    self.with_active_constant_locals(self.active_constant_locals.clone(), |compiler| {
-                        compiler.apply_constant_binding(&analysis.induction_variable, None);
-                        for stmt in body {
-                            compiler.emit_debug_line_hook_for_statement(function, stmt);
-                            match stmt {
+                    for stmt in body {
+                        self.emit_debug_line_hook_for_statement(function, stmt);
+                        match stmt {
                             Statement::Expr(e) => {
-                                compiler.compile_expr_with_locals(function, e, locals, locals_types)?;
+                                self.compile_expr_with_locals(function, e, locals, locals_types)?;
                                 function.instruction(&Instruction::Drop);
                             }
                             Statement::Assign { name, value } => {
-                                compiler.compile_expr_with_locals(
+                                self.compile_expr_with_locals(
                                     function,
                                     value,
                                     locals,
@@ -7589,13 +5945,12 @@ impl<'a> ModuleCompiler<'a> {
                                 if let Some(&idx) = locals.get(&name.name) {
                                     function.instruction(&Instruction::LocalSet(idx));
                                 }
-                                compiler.apply_constant_statement_effect(stmt);
                             }
                             Statement::CompoundAssign { name, op, value } => {
                                 if let Some(&idx) = locals.get(&name.name) {
                                     function.instruction(&Instruction::LocalGet(idx));
                                 }
-                                compiler.compile_expr_with_locals(
+                                self.compile_expr_with_locals(
                                     function,
                                     value,
                                     locals,
@@ -7615,10 +5970,9 @@ impl<'a> ModuleCompiler<'a> {
                                 if let Some(&idx) = locals.get(&name.name) {
                                     function.instruction(&Instruction::LocalSet(idx));
                                 }
-                                compiler.apply_constant_statement_effect(stmt);
                             }
                             Statement::Let { name, value } => {
-                                compiler.compile_expr_with_locals(
+                                self.compile_expr_with_locals(
                                     function,
                                     value,
                                     locals,
@@ -7627,11 +5981,10 @@ impl<'a> ModuleCompiler<'a> {
                                 if let Some(&idx) = locals.get(&name.name) {
                                     function.instruction(&Instruction::LocalSet(idx));
                                 }
-                                compiler.apply_constant_statement_effect(stmt);
                             }
                             Statement::Return(opt_e) => {
                                 if let Some(e) = opt_e {
-                                    compiler.compile_expr_with_locals(
+                                    self.compile_expr_with_locals(
                                         function,
                                         e,
                                         locals,
@@ -7643,7 +5996,7 @@ impl<'a> ModuleCompiler<'a> {
                             Statement::Break { condition } => {
                                 // break -> br 2 (exit outer block, exit loop)
                                 if let Some(cond) = condition {
-                                    compiler.compile_expr_with_locals(
+                                    self.compile_expr_with_locals(
                                         function,
                                         cond,
                                         locals,
@@ -7657,7 +6010,7 @@ impl<'a> ModuleCompiler<'a> {
                             Statement::Continue { condition } => {
                                 // continue -> br 0 (exit body block, fall through to increment)
                                 if let Some(cond) = condition {
-                                    compiler.compile_expr_with_locals(
+                                    self.compile_expr_with_locals(
                                         function,
                                         cond,
                                         locals,
@@ -7674,7 +6027,7 @@ impl<'a> ModuleCompiler<'a> {
                                 value,
                                 else_body,
                             } => {
-                                compiler.compile_guard_let_statement_with_locals(
+                                self.compile_guard_let_statement_with_locals(
                                     function,
                                     name,
                                     value,
@@ -7682,13 +6035,12 @@ impl<'a> ModuleCompiler<'a> {
                                     locals,
                                     locals_types,
                                 )?;
-                                compiler.apply_constant_statement_effect(stmt);
                             }
                             Statement::Guard {
                                 condition,
                                 else_body,
                             } => {
-                                compiler.compile_guard_statement_with_locals(
+                                self.compile_guard_statement_with_locals(
                                     function,
                                     condition,
                                     else_body,
@@ -7697,9 +6049,7 @@ impl<'a> ModuleCompiler<'a> {
                                 )?;
                             }
                         }
-                        }
-                        Ok(())
-                    })?;
+                    }
 
                     function.instruction(&Instruction::End); // end body block
 
@@ -8125,27 +6475,24 @@ impl<'a> ModuleCompiler<'a> {
                 function.instruction(&Instruction::LocalSet(elem_local));
 
                 // Compile body statements
-                self.with_active_constant_locals(self.active_constant_locals.clone(), |compiler| {
-                    compiler.apply_constant_binding(&analysis.induction_variable, None);
-                    for stmt in body {
-                        compiler.emit_debug_line_hook_for_statement(function, stmt);
-                        match stmt {
+                for stmt in body {
+                    self.emit_debug_line_hook_for_statement(function, stmt);
+                    match stmt {
                         Statement::Expr(e) => {
-                            compiler.compile_expr_with_locals(function, e, locals, locals_types)?;
+                            self.compile_expr_with_locals(function, e, locals, locals_types)?;
                             function.instruction(&Instruction::Drop);
                         }
                         Statement::Assign { name, value } => {
-                            compiler.compile_expr_with_locals(function, value, locals, locals_types)?;
+                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
                             if let Some(&idx) = locals.get(&name.name) {
                                 function.instruction(&Instruction::LocalSet(idx));
                             }
-                            compiler.apply_constant_statement_effect(stmt);
                         }
                         Statement::CompoundAssign { name, op, value } => {
                             if let Some(&idx) = locals.get(&name.name) {
                                 function.instruction(&Instruction::LocalGet(idx));
                             }
-                            compiler.compile_expr_with_locals(function, value, locals, locals_types)?;
+                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
                             match op {
                                 BinOp::Add => {
                                     function.instruction(&Instruction::I32Add);
@@ -8160,24 +6507,22 @@ impl<'a> ModuleCompiler<'a> {
                             if let Some(&idx) = locals.get(&name.name) {
                                 function.instruction(&Instruction::LocalSet(idx));
                             }
-                            compiler.apply_constant_statement_effect(stmt);
                         }
                         Statement::Let { name, value } => {
-                            compiler.compile_expr_with_locals(function, value, locals, locals_types)?;
+                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
                             if let Some(&idx) = locals.get(&name.name) {
                                 function.instruction(&Instruction::LocalSet(idx));
                             }
-                            compiler.apply_constant_statement_effect(stmt);
                         }
                         Statement::Return(opt_e) => {
                             if let Some(e) = opt_e {
-                                compiler.compile_expr_with_locals(function, e, locals, locals_types)?;
+                                self.compile_expr_with_locals(function, e, locals, locals_types)?;
                             }
                             function.instruction(&Instruction::Return);
                         }
                         Statement::Break { condition } => {
                             if let Some(cond) = condition {
-                                compiler.compile_expr_with_locals(
+                                self.compile_expr_with_locals(
                                     function,
                                     cond,
                                     locals,
@@ -8190,7 +6535,7 @@ impl<'a> ModuleCompiler<'a> {
                         }
                         Statement::Continue { condition } => {
                             if let Some(cond) = condition {
-                                compiler.compile_expr_with_locals(
+                                self.compile_expr_with_locals(
                                     function,
                                     cond,
                                     locals,
@@ -8207,7 +6552,7 @@ impl<'a> ModuleCompiler<'a> {
                             value,
                             else_body,
                         } => {
-                            compiler.compile_guard_let_statement_with_locals(
+                            self.compile_guard_let_statement_with_locals(
                                 function,
                                 name,
                                 value,
@@ -8215,13 +6560,12 @@ impl<'a> ModuleCompiler<'a> {
                                 locals,
                                 locals_types,
                             )?;
-                            compiler.apply_constant_statement_effect(stmt);
                         }
                         Statement::Guard {
                             condition,
                             else_body,
                         } => {
-                            compiler.compile_guard_statement_with_locals(
+                            self.compile_guard_statement_with_locals(
                                 function,
                                 condition,
                                 else_body,
@@ -8230,9 +6574,7 @@ impl<'a> ModuleCompiler<'a> {
                             )?;
                         }
                     }
-                    }
-                    Ok(())
-                })?;
+                }
 
                 // Increment index
                 function.instruction(&Instruction::LocalGet(idx_local));
@@ -8636,94 +6978,86 @@ impl<'a> ModuleCompiler<'a> {
 
                 // Compile body statements: last expression's v128 result stays on stack
                 let mut has_result = false;
-                self.with_active_constant_locals(self.active_constant_locals.clone(), |compiler| {
-                    compiler.apply_constant_binding(&variable.name, None);
-                    for (i, stmt) in body.iter().enumerate() {
-                        compiler.emit_debug_line_hook_for_statement(function, stmt);
-                        match stmt {
-                            Statement::Expr(e) => {
-                                compiler.compile_expr_with_locals(function, e, locals, locals_types)?;
-                                if i < body.len() - 1 {
-                                    function.instruction(&Instruction::Drop);
-                                } else {
-                                    has_result = true;
+                for (i, stmt) in body.iter().enumerate() {
+                    self.emit_debug_line_hook_for_statement(function, stmt);
+                    match stmt {
+                        Statement::Expr(e) => {
+                            self.compile_expr_with_locals(function, e, locals, locals_types)?;
+                            if i < body.len() - 1 {
+                                function.instruction(&Instruction::Drop);
+                            } else {
+                                has_result = true;
+                            }
+                        }
+                        Statement::Assign { name, value } => {
+                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalSet(idx));
+                            }
+                        }
+                        Statement::Let { name, value } => {
+                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalSet(idx));
+                            }
+                        }
+                        Statement::CompoundAssign { name, op, value } => {
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalGet(idx));
+                            }
+                            self.compile_expr_with_locals(function, value, locals, locals_types)?;
+                            match op {
+                                BinOp::Add => {
+                                    function.instruction(&Instruction::I32Add);
+                                }
+                                BinOp::Sub => {
+                                    function.instruction(&Instruction::I32Sub);
+                                }
+                                _ => {
+                                    function.instruction(&Instruction::I32Add);
                                 }
                             }
-                            Statement::Assign { name, value } => {
-                                compiler.compile_expr_with_locals(function, value, locals, locals_types)?;
-                                if let Some(&idx) = locals.get(&name.name) {
-                                    function.instruction(&Instruction::LocalSet(idx));
-                                }
-                                compiler.apply_constant_statement_effect(stmt);
+                            if let Some(&idx) = locals.get(&name.name) {
+                                function.instruction(&Instruction::LocalSet(idx));
                             }
-                            Statement::Let { name, value } => {
-                                compiler.compile_expr_with_locals(function, value, locals, locals_types)?;
-                                if let Some(&idx) = locals.get(&name.name) {
-                                    function.instruction(&Instruction::LocalSet(idx));
-                                }
-                                compiler.apply_constant_statement_effect(stmt);
+                        }
+                        Statement::Return(opt_e) => {
+                            if let Some(e) = opt_e {
+                                self.compile_expr_with_locals(function, e, locals, locals_types)?;
                             }
-                            Statement::CompoundAssign { name, op, value } => {
-                                if let Some(&idx) = locals.get(&name.name) {
-                                    function.instruction(&Instruction::LocalGet(idx));
-                                }
-                                compiler.compile_expr_with_locals(function, value, locals, locals_types)?;
-                                match op {
-                                    BinOp::Add => {
-                                        function.instruction(&Instruction::I32Add);
-                                    }
-                                    BinOp::Sub => {
-                                        function.instruction(&Instruction::I32Sub);
-                                    }
-                                    _ => {
-                                        function.instruction(&Instruction::I32Add);
-                                    }
-                                }
-                                if let Some(&idx) = locals.get(&name.name) {
-                                    function.instruction(&Instruction::LocalSet(idx));
-                                }
-                                compiler.apply_constant_statement_effect(stmt);
-                            }
-                            Statement::Return(opt_e) => {
-                                if let Some(e) = opt_e {
-                                    compiler.compile_expr_with_locals(function, e, locals, locals_types)?;
-                                }
-                                function.instruction(&Instruction::Return);
-                            }
-                            Statement::Break { .. }
-                            | Statement::Continue { .. }
-                            | Statement::SharedLet { .. } => {}
-                            Statement::GuardLet {
+                            function.instruction(&Instruction::Return);
+                        }
+                        Statement::Break { .. }
+                        | Statement::Continue { .. }
+                        | Statement::SharedLet { .. } => {}
+                        Statement::GuardLet {
+                            name,
+                            value,
+                            else_body,
+                        } => {
+                            self.compile_guard_let_statement_with_locals(
+                                function,
                                 name,
                                 value,
                                 else_body,
-                            } => {
-                                compiler.compile_guard_let_statement_with_locals(
-                                    function,
-                                    name,
-                                    value,
-                                    else_body,
-                                    locals,
-                                    locals_types,
-                                )?;
-                                compiler.apply_constant_statement_effect(stmt);
-                            }
-                            Statement::Guard {
+                                locals,
+                                locals_types,
+                            )?;
+                        }
+                        Statement::Guard {
+                            condition,
+                            else_body,
+                        } => {
+                            self.compile_guard_statement_with_locals(
+                                function,
                                 condition,
                                 else_body,
-                            } => {
-                                compiler.compile_guard_statement_with_locals(
-                                    function,
-                                    condition,
-                                    else_body,
-                                    locals,
-                                    locals_types,
-                                )?;
-                            }
+                                locals,
+                                locals_types,
+                            )?;
                         }
                     }
-                    Ok(())
-                })?;
+                }
 
                 if has_result {
                     // v128.store(list_ptr + 4 + idx*4, result)
@@ -9471,64 +7805,6 @@ impl<'a> ModuleCompiler<'a> {
         }
         Ok(())
     }
-
-    fn with_active_constant_locals<T>(
-        &mut self,
-        locals: Option<HashMap<String, i32>>,
-        f: impl FnOnce(&mut Self) -> T,
-    ) -> T {
-        let previous = std::mem::replace(&mut self.active_constant_locals, locals);
-        let result = f(self);
-        self.active_constant_locals = previous;
-        result
-    }
-
-    fn apply_constant_binding(&mut self, name: &str, value: Option<i32>) {
-        if let Some(constants) = self.active_constant_locals.as_mut() {
-            if let Some(value) = value {
-                constants.insert(name.to_string(), value);
-            } else {
-                constants.remove(name);
-            }
-        }
-    }
-
-    fn constant_expr_value(&self, expr: &Expr) -> Option<i32> {
-        const_i32_expr_with_locals(expr, self.active_constant_locals.as_ref())
-    }
-
-    fn apply_constant_statement_effect(&mut self, stmt: &Statement) {
-        match stmt {
-            Statement::Let { name, value } | Statement::Assign { name, value } => {
-                let constant = self.constant_expr_value(value);
-                self.apply_constant_binding(&name.name, constant);
-            }
-            Statement::CompoundAssign { name, op, value } => {
-                let next = match (
-                    self.active_constant_locals
-                        .as_ref()
-                        .and_then(|constants| constants.get(&name.name).copied()),
-                    self.constant_expr_value(value),
-                ) {
-                    (Some(current), Some(rhs)) => match op {
-                        BinOp::Add => current.checked_add(rhs),
-                        BinOp::Sub => current.checked_sub(rhs),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                self.apply_constant_binding(&name.name, next);
-            }
-            Statement::SharedLet { name, .. } | Statement::GuardLet { name, .. } => {
-                self.apply_constant_binding(&name.name, None);
-            }
-            Statement::Expr(_)
-            | Statement::Return(_)
-            | Statement::Break { .. }
-            | Statement::Continue { .. }
-            | Statement::Guard { .. } => {}
-        }
-    }
 }
 
 #[cfg(test)]
@@ -9570,7 +7846,7 @@ mod tests {
     fn test_compile_simple_function() {
         let source = r#"
             package local:test;
-            
+
             interface host {
                 log: func(msg: string) {
                     println(msg)
@@ -9596,7 +7872,7 @@ mod tests {
     fn test_compile_with_locals() {
         let source = r#"
             package local:test;
-            
+
             interface math {
                 add-one: func(x: s32) -> s32 {
                     let y = x + 1;
@@ -9623,7 +7899,7 @@ mod tests {
     fn test_compile_binary_operators() {
         let source = r#"
             package local:test;
-            
+
             interface ops {
                 compute: func(a: s32, b: s32) -> s32 {
                     let sum = a + b;
@@ -10061,188 +8337,6 @@ mod tests {
     }
 
     #[test]
-    fn test_analyze_range_loop_computed_bounds_and_step() {
-        let expr = parse_first_expr_statement(
-            r#"
-            package local:test;
-
-            interface loops {
-                inspect: func() {
-                    for i in (1 + 2) to (20 / 2) step (1 + 1) {
-                        i;
-                    };
-                }
-            }
-        "#,
-        );
-
-        let Expr::For {
-            variable, range, ..
-        } = expr
-        else {
-            panic!("expected for loop");
-        };
-
-        let analysis =
-            analyze_range_loop(&variable.name, range.as_ref()).expect("expected range facts");
-        assert_eq!(analysis.constant_step, Some(2));
-        assert_eq!(analysis.trip_count, Some(LoopTripCount::Constant(4)));
-    }
-
-    #[test]
-    fn test_analyze_range_loop_negative_computed_bounds() {
-        let expr = parse_first_expr_statement(
-            r#"
-            package local:test;
-
-            interface loops {
-                inspect: func() {
-                    for i in -(2 + 1) to 3 {
-                        i;
-                    };
-                }
-            }
-        "#,
-        );
-
-        let Expr::For {
-            variable, range, ..
-        } = expr
-        else {
-            panic!("expected for loop");
-        };
-
-        let analysis =
-            analyze_range_loop(&variable.name, range.as_ref()).expect("expected range facts");
-        assert_eq!(analysis.constant_step, Some(1));
-        assert_eq!(analysis.trip_count, Some(LoopTripCount::Constant(7)));
-    }
-
-    #[test]
-    fn test_analyze_range_loop_with_constant_local_bounds() {
-        let expr = parse_first_expr_statement(
-            r#"
-            package local:test;
-
-            interface loops {
-                inspect: func() {
-                    for i in start to end step stride {
-                        i;
-                    };
-                }
-            }
-        "#,
-        );
-
-        let Expr::For {
-            variable, range, ..
-        } = expr
-        else {
-            panic!("expected for loop");
-        };
-
-        let constants = HashMap::from([
-            ("start".to_string(), 2),
-            ("end".to_string(), 8),
-            ("stride".to_string(), 3),
-        ]);
-
-        let analysis = analyze_range_loop_with_locals(
-            &variable.name,
-            range.as_ref(),
-            Some(&constants),
-        )
-        .expect("expected range facts");
-        assert_eq!(analysis.constant_step, Some(3));
-        assert_eq!(analysis.trip_count, Some(LoopTripCount::Constant(3)));
-    }
-
-    #[test]
-    fn test_analyze_range_loop_non_constant_local_bounds_fall_back() {
-        let expr = parse_first_expr_statement(
-            r#"
-            package local:test;
-
-            interface loops {
-                inspect: func() {
-                    for i in start to end {
-                        i;
-                    };
-                }
-            }
-        "#,
-        );
-
-        let Expr::For {
-            variable, range, ..
-        } = expr
-        else {
-            panic!("expected for loop");
-        };
-
-        let constants = HashMap::from([("start".to_string(), 2)]);
-
-        let analysis = analyze_range_loop_with_locals(
-            &variable.name,
-            range.as_ref(),
-            Some(&constants),
-        )
-        .expect("expected range facts");
-        assert_eq!(analysis.constant_step, Some(1));
-        assert_eq!(analysis.trip_count, None);
-    }
-
-    #[test]
-    fn test_compile_zero_trip_for_loop_with_computed_bounds() {
-        let source = r#"
-            package local:test;
-
-            interface loops {
-                inspect: func() -> s32 {
-                    for i in (4 + 1) to (3 - 1) {
-                        i;
-                    };
-                    0;
-                }
-            }
-        "#;
-
-        let (ast, errors) = parse_file(source);
-        assert!(errors.is_empty(), "parse errors: {errors:?}");
-        let ast = ast.expect("Should parse");
-
-        let wasm = compile_module(&ast, &CompileOptions::default())
-            .expect("computed zero-trip loop should compile");
-        assert!(!wasm.is_empty());
-    }
-
-    #[test]
-    fn test_compile_zero_trip_for_loop_with_constant_local_bounds() {
-        let source = r#"
-            package local:test;
-
-            interface loops {
-                inspect: func() -> s32 {
-                    let start = 4 + 1;
-                    let finish = 3 - 1;
-                    for i in start to finish {
-                        i;
-                    };
-                    0;
-                }
-            }
-        "#;
-
-        let (ast, errors) = parse_file(source);
-        assert!(errors.is_empty(), "parse errors: {errors:?}");
-        let ast = ast.expect("Should parse");
-
-        let wasm = compile_module(&ast, &CompileOptions::default())
-            .expect("constant-local zero-trip loop should compile");
-        assert!(!wasm.is_empty());
-    }
-
-    #[test]
     fn test_compile_zero_trip_for_loop() {
         let source = r#"
             package local:test;
@@ -10264,508 +8358,5 @@ mod tests {
         let wasm = compile_module(&ast, &CompileOptions::default())
             .expect("zero-trip for loop should compile");
         assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
-    }
-
-    #[test]
-    fn test_compile_constrained_function_emits_import() {
-        let source = r#"
-            package local:test;
-
-            interface test {
-                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
-                    result#ok(true)
-                }
-            }
-        "#;
-
-        let (ast, _) = parse_file(source);
-        let ast = ast.expect("Should parse");
-
-        let options = CompileOptions::default();
-        let wasm = compile_module(&ast, &options).expect("constrained func should compile");
-        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
-
-        let mut found_contract_import = false;
-        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
-            if let Ok(wasmparser::Payload::ImportSection(reads)) = payload {
-                for import_group in reads {
-                    let group = import_group.expect("import section");
-                    match group {
-                        wasmparser::Imports::Single(_, imp) => {
-                            if imp.module == "kettu:contract" && imp.name == "fail" {
-                                found_contract_import = true;
-                            }
-                        }
-                        wasmparser::Imports::Compact1 { module, .. } => {
-                            if module == "kettu:contract" {
-                                found_contract_import = true;
-                            }
-                        }
-                        wasmparser::Imports::Compact2 { module, .. } => {
-                            if module == "kettu:contract" {
-                                found_contract_import = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert!(
-            found_contract_import,
-            "expected kettu:contract/fail import for constrained function"
-        );
-    }
-
-    #[test]
-    fn test_compile_no_contract_import_without_constraints() {
-        let source = r#"
-            package local:test;
-
-            interface test {
-                plain: func(x: s32, y: s32) -> bool {
-                    true
-                }
-            }
-        "#;
-
-        let (ast, _) = parse_file(source);
-        let ast = ast.expect("Should parse");
-
-        let options = CompileOptions::default();
-        let wasm = compile_module(&ast, &options).expect("should compile");
-
-        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
-            if let Ok(wasmparser::Payload::ImportSection(reads)) = payload {
-                for import_group in reads {
-                    let group = import_group.expect("import section");
-                    let module_name = match &group {
-                        wasmparser::Imports::Single(_, imp) => imp.module,
-                        wasmparser::Imports::Compact1 { module, .. } => *module,
-                        wasmparser::Imports::Compact2 { module, .. } => *module,
-                    };
-                    assert!(
-                        module_name != "kettu:contract",
-                        "plain function should not emit contract import"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_compile_contracts_custom_section() {
-        let source = r#"
-            package local:test;
-
-            interface test {
-                positive: func(x: s32 where x > 0) -> result<bool, string> {
-                    result#ok(true)
-                }
-            }
-        "#;
-
-        let (ast, _) = parse_file(source);
-        let ast = ast.expect("Should parse");
-
-        let options = CompileOptions::default();
-        let wasm = compile_module(&ast, &options).expect("should compile");
-
-        let mut found_contracts_section = false;
-        let mut section_data = Vec::new();
-        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
-            if let Ok(wasmparser::Payload::CustomSection(reader)) = payload {
-                if reader.name() == "kettu-contracts" {
-                    found_contracts_section = true;
-                    section_data = reader.data().to_vec();
-                }
-            }
-        }
-        assert!(
-            found_contracts_section,
-            "expected kettu-contracts custom section"
-        );
-
-        let json_str = String::from_utf8(section_data).expect("section should be valid UTF-8");
-        assert!(
-            json_str.contains("\"version\":1"),
-            "JSON should have version"
-        );
-        assert!(
-            json_str.contains("\"positive\""),
-            "JSON should reference function name"
-        );
-        assert!(
-            json_str.contains("\"x > 0\""),
-            "JSON should contain constraint expression"
-        );
-    }
-
-    #[test]
-    fn test_compile_no_contracts_section_without_constraints() {
-        let source = r#"
-            package local:test;
-
-            interface test {
-                plain: func(x: s32) -> s32 {
-                    x
-                }
-            }
-        "#;
-
-        let (ast, _) = parse_file(source);
-        let ast = ast.expect("Should parse");
-
-        let options = CompileOptions::default();
-        let wasm = compile_module(&ast, &options).expect("should compile");
-
-        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
-            if let Ok(wasmparser::Payload::CustomSection(reader)) = payload {
-                assert!(
-                    reader.name() != "kettu-contracts",
-                    "plain functions should not emit contracts section"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_compile_contracts_section_multiple_constraints() {
-        let source = r#"
-            package local:test;
-
-            interface test {
-                bounded: func(small: s32, big: s32 where big > small) -> result<bool, string> {
-                    result#ok(true)
-                }
-                limited: func(count: s32 where count < 10) -> result<bool, string> {
-                    result#ok(true)
-                }
-            }
-        "#;
-
-        let (ast, _) = parse_file(source);
-        let ast = ast.expect("Should parse");
-
-        let options = CompileOptions::default();
-        let wasm = compile_module(&ast, &options).expect("should compile");
-
-        let mut section_data = Vec::new();
-        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
-            if let Ok(wasmparser::Payload::CustomSection(reader)) = payload {
-                if reader.name() == "kettu-contracts" {
-                    section_data = reader.data().to_vec();
-                }
-            }
-        }
-
-        let json_str = String::from_utf8(section_data).expect("section should be valid UTF-8");
-        assert!(
-            json_str.contains("\"bounded\""),
-            "JSON should contain bounded"
-        );
-        assert!(
-            json_str.contains("\"limited\""),
-            "JSON should contain limited"
-        );
-        assert!(
-            json_str.contains("\"big > small\""),
-            "JSON should contain big > small"
-        );
-        assert!(
-            json_str.contains("\"count < 10\""),
-            "JSON should contain count < 10"
-        );
-    }
-
-    #[test]
-    fn test_compile_debug_resume_section_for_function_bindings() {
-        let source = r#"
-            package local:test;
-
-            interface test {
-                inspect: func(x: s32) -> s32 {
-                    let y = x + 1;
-                    y
-                }
-            }
-        "#;
-
-        let (ast, errors) = parse_file(source);
-        assert!(errors.is_empty(), "parse errors: {errors:?}");
-        let ast = ast.expect("Should parse");
-
-        let wasm = compile_module(
-            &ast,
-            &CompileOptions {
-                emit_debug_hooks: true,
-                debug_source: Some(source.to_string()),
-                ..CompileOptions::default()
-            },
-        )
-        .expect("should compile");
-
-        let mut section_data = Vec::new();
-        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
-            if let Ok(wasmparser::Payload::CustomSection(reader)) = payload {
-                if reader.name() == "kettu-debug-resume" {
-                    section_data = reader.data().to_vec();
-                }
-            }
-        }
-
-        let json_str = String::from_utf8(section_data).expect("section should be valid UTF-8");
-        assert!(
-            json_str.contains("\"frameHeaderBytes\":8"),
-            "debug resume metadata should include frame header size"
-        );
-        assert!(
-            json_str.contains("\"inspect\""),
-            "debug resume metadata should include function name"
-        );
-        assert!(
-            json_str.contains("\"slotCount\":2"),
-            "debug resume metadata should reserve one slot per debug binding"
-        );
-        assert!(
-            json_str.contains("\"name\":\"x\""),
-            "debug resume metadata should include parameter bindings"
-        );
-        assert!(
-            json_str.contains("\"name\":\"y\""),
-            "debug resume metadata should include local bindings"
-        );
-        assert!(
-            json_str.contains("\"byteSize\":16"),
-            "debug resume metadata should reserve header plus binding slots"
-        );
-    }
-
-    #[test]
-    fn test_compile_debug_resume_section_for_lambda_bindings() {
-        let source = r#"
-            package local:test;
-
-            interface test {
-                inspect: func() -> s32 {
-                    let base = 10;
-                    let add = |n| n + base;
-                    add(2)
-                }
-            }
-        "#;
-
-        let (ast, errors) = parse_file(source);
-        assert!(errors.is_empty(), "parse errors: {errors:?}");
-        let ast = ast.expect("Should parse");
-
-        let wasm = compile_module(
-            &ast,
-            &CompileOptions {
-                emit_debug_hooks: true,
-                debug_source: Some(source.to_string()),
-                ..CompileOptions::default()
-            },
-        )
-        .expect("should compile");
-
-        let mut section_data = Vec::new();
-        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
-            if let Ok(wasmparser::Payload::CustomSection(reader)) = payload {
-                if reader.name() == "kettu-debug-resume" {
-                    section_data = reader.data().to_vec();
-                }
-            }
-        }
-
-        let json_str = String::from_utf8(section_data).expect("section should be valid UTF-8");
-        assert!(
-            json_str.contains("\"inspect\""),
-            "debug resume metadata should include the enclosing function"
-        );
-        assert!(
-            json_str.contains("\"lambda#0\""),
-            "debug resume metadata should include lambda frames"
-        );
-        assert!(
-            json_str.contains("\"name\":\"base\""),
-            "debug resume metadata should include captured bindings"
-        );
-        assert!(
-            json_str.contains("\"name\":\"n\""),
-            "debug resume metadata should include lambda parameters"
-        );
-    }
-
-    #[test]
-    fn test_compile_result_tail_validates() {
-        let source = r#"
-            package local:test;
-
-            interface test {
-                check: func(x: s32) -> result<bool, string> {
-                    result#ok(true)
-                }
-            }
-        "#;
-
-        let (ast, _) = parse_file(source);
-        let ast = ast.expect("Should parse");
-
-        let options = CompileOptions::default();
-        let wasm = compile_module(&ast, &options).expect("should compile");
-
-        let validation_result = wasmparser::validate(&wasm);
-        if let Err(e) = validation_result {
-            panic!("generated WASM should validate: {}", e);
-        }
-    }
-
-    #[test]
-    fn test_compile_constrained_function_valid_wasm() {
-        let source = r#"
-            package local:test;
-
-            interface test {
-                check: func(x: s32 where x > 0) -> result<bool, string> {
-                    return result#ok(true);
-                }
-            }
-        "#;
-
-        let (ast, _) = parse_file(source);
-        let ast = ast.expect("Should parse");
-
-        let options = CompileOptions::default();
-        let wasm = compile_module(&ast, &options).expect("constrained func should compile");
-
-        let validation_result = wasmparser::validate(&wasm);
-        if let Err(e) = validation_result {
-            panic!("generated WASM should validate: {}", e);
-        }
-    }
-
-    #[test]
-    fn test_compile_multi_constraint_function_validates() {
-        let source = r#"
-            package local:test;
-
-            interface test {
-                check: func(x: s32 where x > 0, y: s32 where y < 100) -> result<bool, string> {
-                    return result#ok(true);
-                }
-            }
-        "#;
-
-        let (ast, _) = parse_file(source);
-        let ast = ast.expect("Should parse");
-
-        let options = CompileOptions::default();
-        let wasm = compile_module(&ast, &options).expect("should compile");
-
-        let validation_result = wasmparser::validate(&wasm);
-        if let Err(e) = validation_result {
-            panic!("multi-constraint WASM should validate: {}", e);
-        }
-    }
-
-    #[test]
-    fn test_compile_type_alias_constraint_function() {
-        let source = r#"
-            package local:test;
-
-            interface test {
-                type positive = s32 where it > 0;
-                make-pos: func(x: s32) -> positive {
-                    return x;
-                }
-            }
-        "#;
-
-        let (ast, _) = parse_file(source);
-        let ast = ast.expect("Should parse");
-
-        let options = CompileOptions::default();
-        let wasm = compile_module(&ast, &options).expect("should compile");
-
-        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
-
-        let validation_result = wasmparser::validate(&wasm);
-        if let Err(e) = validation_result {
-            panic!("type alias constraint WASM should validate: {}", e);
-        }
-    }
-
-    #[test]
-    fn test_compile_type_alias_param_runtime_assertion() {
-        let source = r#"
-            package local:test;
-
-            interface test {
-                type shoesize = u32 where it > 6;
-                set-shoesize: func(size: shoesize) {
-                    return;
-                }
-            }
-        "#;
-
-        let (ast, _) = parse_file(source);
-        let ast = ast.expect("Should parse");
-
-        let options = CompileOptions::default();
-        let wasm = compile_module(&ast, &options).expect("should compile");
-
-        // Must have the contract fail import
-        let mut found_import = false;
-        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
-            if let Ok(wasmparser::Payload::ImportSection(reads)) = payload {
-                for import_group in reads {
-                    let group = import_group.expect("import section");
-                    match &group {
-                        wasmparser::Imports::Single(_, imp) => {
-                            if imp.module == "kettu:contract" && imp.name == "fail" {
-                                found_import = true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        assert!(
-            found_import,
-            "expected kettu:contract/fail import for type alias param"
-        );
-
-        let validation_result = wasmparser::validate(&wasm);
-        if let Err(e) = validation_result {
-            panic!("WASM should validate: {}", e);
-        }
-    }
-
-    #[test]
-    fn test_compile_result_constrained_return_type() {
-        let source = r#"
-            package local:test;
-
-            interface test {
-                type shoesize = u32 where it > 6;
-                make-size: func(x: u32) -> result<shoesize, string> {
-                    return result#ok(x);
-                }
-            }
-        "#;
-
-        let (ast, _) = parse_file(source);
-        let ast = ast.expect("Should parse");
-
-        let options = CompileOptions::default();
-        let wasm = compile_module(&ast, &options).expect("should compile");
-
-        assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]));
-
-        let validation_result = wasmparser::validate(&wasm);
-        if let Err(e) = validation_result {
-            panic!("result<constrained_type> WASM should validate: {}", e);
-        }
     }
 }
