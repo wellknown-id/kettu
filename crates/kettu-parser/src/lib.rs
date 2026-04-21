@@ -96,3 +96,60 @@ pub fn parse(source: &str) -> (Option<ast::WitFile>, Vec<ParseError>) {
 pub fn parse_file(source: &str) -> (Option<ast::WitFile>, Vec<ParseError>) {
     parse(source)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_comment_ranges() {
+        assert_eq!(find_comment_ranges(""), Vec::<std::ops::Range<usize>>::new());
+        assert_eq!(find_comment_ranges("let x = 5;"), Vec::<std::ops::Range<usize>>::new());
+
+        // Single-line comments
+        assert_eq!(find_comment_ranges("// comment"), vec![0..10]);
+        assert_eq!(find_comment_ranges("let x = 5; // comment"), vec![11..21]);
+        assert_eq!(find_comment_ranges("// comment\nlet x = 5;"), vec![0..10]);
+
+        // Multi-line comments
+        assert_eq!(find_comment_ranges("/* comment */"), vec![0..13]);
+        assert_eq!(find_comment_ranges("let x = /* comment */ 5;"), vec![8..21]);
+        assert_eq!(find_comment_ranges("/* \n comment \n */"), vec![0..17]);
+
+        // Comments inside strings
+        assert_eq!(find_comment_ranges(r#""// not a comment""#), Vec::<std::ops::Range<usize>>::new());
+        assert_eq!(find_comment_ranges(r#""/* not a comment */""#), Vec::<std::ops::Range<usize>>::new());
+
+        // Strings inside comments
+        assert_eq!(find_comment_ranges("// \"string in comment\""), vec![0..22]);
+        assert_eq!(find_comment_ranges("/* \"string in comment\" */"), vec![0..25]);
+
+        // Escaped strings
+        assert_eq!(find_comment_ranges(r#""string with \" escaped quotes""#), Vec::<std::ops::Range<usize>>::new());
+        assert_eq!(find_comment_ranges(r#""string with \\" // comment"#), vec![17..27]);
+    }
+
+    #[test]
+    fn test_strip_comments_preserve_layout() {
+        assert_eq!(strip_comments_preserve_layout(""), "");
+        assert_eq!(strip_comments_preserve_layout("let x = 5;"), "let x = 5;");
+
+        // Single-line comments
+        assert_eq!(strip_comments_preserve_layout("// comment"), "          ");
+        assert_eq!(strip_comments_preserve_layout("let x = 5; // comment"), "let x = 5;           ");
+        assert_eq!(strip_comments_preserve_layout("// comment\nlet x = 5;"), "          \nlet x = 5;");
+
+        // Multi-line comments
+        assert_eq!(strip_comments_preserve_layout("/* comment */"), "             ");
+        assert_eq!(strip_comments_preserve_layout("let x = /* comment */ 5;"), "let x =               5;");
+        assert_eq!(strip_comments_preserve_layout("/* \n comment \n */"), "   \n         \n   ");
+
+        // Comments inside strings
+        assert_eq!(strip_comments_preserve_layout(r#""// not a comment""#), r#""// not a comment""#);
+        assert_eq!(strip_comments_preserve_layout(r#""/* not a comment */""#), r#""/* not a comment */""#);
+
+        // Strings inside comments
+        assert_eq!(strip_comments_preserve_layout("// \"string in comment\""), "                      ");
+        assert_eq!(strip_comments_preserve_layout("/* \"string in comment\" */"), "                         ");
+    }
+}
