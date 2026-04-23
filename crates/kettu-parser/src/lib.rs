@@ -96,3 +96,71 @@ pub fn parse(source: &str) -> (Option<ast::WitFile>, Vec<ParseError>) {
 pub fn parse_file(source: &str) -> (Option<ast::WitFile>, Vec<ParseError>) {
     parse(source)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_valid_kettu_code() {
+        let source = "package test:pkg;\n\ninterface i {\n  f: func();\n}\n";
+        let (ast, errors) = parse(source);
+        assert!(ast.is_some(), "AST should be present for valid code");
+        assert!(errors.is_empty(), "There should be no errors for valid code");
+    }
+
+    #[test]
+    fn test_parse_invalid_kettu_code() {
+        let source = "this is not valid kettu code";
+        let (_ast, errors) = parse(source);
+        // Even for invalid code, parser usually returns Some(ast) with error recovery
+        assert!(!errors.is_empty(), "There should be errors for invalid code");
+    }
+
+    #[test]
+    fn test_parse_with_comments() {
+        let source = r#"
+            // This is a single line comment
+            package test:pkg; /* This is a
+            multi-line comment */
+            interface i {
+                // Another comment
+                f: func(); /* inline comment */
+            }
+        "#;
+        let (ast, errors) = parse(source);
+        assert!(ast.is_some(), "AST should be present for code with comments");
+        assert!(errors.is_empty(), "There should be no errors for valid code with comments");
+    }
+
+    #[test]
+    fn test_strip_comments_preserve_layout_internals() {
+        // Test single line comments
+        assert_eq!(
+            strip_comments_preserve_layout("a // comment\nb"),
+            "a           \nb"
+        );
+
+        // Test multi-line comments
+        assert_eq!(
+            strip_comments_preserve_layout("a /* multi\nline */ b"),
+            "a         \n        b"
+        );
+
+        // Test string literals (comments inside strings should not be stripped)
+        assert_eq!(
+            strip_comments_preserve_layout(r#"let x = "// not a comment"; // real comment"#),
+            r#"let x = "// not a comment";                "#
+        );
+        assert_eq!(
+            strip_comments_preserve_layout(r#"let x = "/* not a comment */"; /* real comment */"#),
+            r#"let x = "/* not a comment */";                   "#
+        );
+
+        // Test string literals with escaped quotes
+        assert_eq!(
+            strip_comments_preserve_layout(r#"let x = "\"// not a comment\""; // real comment"#),
+            r#"let x = "\"// not a comment\"";                "#
+        );
+    }
+}
